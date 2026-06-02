@@ -5,7 +5,9 @@
 //! * `udp://1.1.1.1`                     — plain DNS over UDP
 //! * `tcp://1.1.1.1`                     — plain DNS over TCP
 //! * `tls://dns.google`                  — DNS-over-TLS (default port 853)
-//! * `https://dns.google/dns-query`      — DNS-over-HTTPS
+//! * `https://dns.google/dns-query`      — DNS-over-HTTPS; HTTP/1.1 + HTTP/2,
+//!   auto-upgrading to HTTP/3 via Alt-Svc
+//! * `h3://dns.google/dns-query`         — DNS-over-HTTPS forced over HTTP/3
 //! * `quic://dns.adguard.com`            — DNS-over-QUIC (default port 853)
 //!
 //! The host may be an IP literal or a hostname; hostnames are resolved via the
@@ -82,6 +84,10 @@ pub struct UpstreamSpec {
     pub port: u16,
     /// HTTP path for DoH (e.g. `/dns-query`).
     pub path: String,
+    /// Force DoH over HTTP/3 (the `h3://` scheme). When false, a `https://`
+    /// upstream uses HTTP/1.1 + HTTP/2 and may auto-upgrade to HTTP/3 via
+    /// Alt-Svc. Only meaningful when `kind == TransportKind::Https`.
+    pub force_http3: bool,
     /// The original spec string, used for display.
     pub display: String,
 }
@@ -94,19 +100,20 @@ impl UpstreamSpec {
             return Err(UpstreamError::InvalidSpec("empty".into()));
         }
 
-        let (kind, rest) = match s.split_once("://") {
-            Some(("udp", r)) => (TransportKind::Udp, r),
-            Some(("tcp", r)) => (TransportKind::Tcp, r),
-            Some(("tls", r)) => (TransportKind::Tls, r),
-            Some(("https", r)) => (TransportKind::Https, r),
-            Some(("h3", r)) => (TransportKind::Https, r),
-            Some(("quic", r)) => (TransportKind::Quic, r),
+        let (kind, force_http3, rest) = match s.split_once("://") {
+            Some(("udp", r)) => (TransportKind::Udp, false, r),
+            Some(("tcp", r)) => (TransportKind::Tcp, false, r),
+            Some(("tls", r)) => (TransportKind::Tls, false, r),
+            Some(("https", r)) => (TransportKind::Https, false, r),
+            // `h3://` is DoH pinned to HTTP/3, skipping Alt-Svc discovery.
+            Some(("h3", r)) => (TransportKind::Https, true, r),
+            Some(("quic", r)) => (TransportKind::Quic, false, r),
             Some((scheme, _)) => {
                 return Err(UpstreamError::InvalidSpec(format!(
                     "unknown scheme {scheme}"
                 )))
             }
-            None => (TransportKind::Udp, s),
+            None => (TransportKind::Udp, false, s),
         };
 
         // Split off an HTTP path (DoH).
@@ -122,6 +129,7 @@ impl UpstreamSpec {
             host,
             port,
             path,
+            force_http3,
             display: s.to_string(),
         })
     }
@@ -210,6 +218,22 @@ mod tests {
         assert_eq!(s.kind, TransportKind::Https);
         assert_eq!(s.port, 443);
         assert_eq!(s.path, "/dns-query");
+    }
+
+    #[test]
+    fn parse_doh_no_force_http3() {
+        let s = UpstreamSpec::parse("https://dns.google/dns-query").unwrap();
+        assert!(!s.force_http3);
+    }
+
+    #[test]
+    fn parse_doh3_forced() {
+        let s = UpstreamSpec::parse("h3://dns.google/dns-query").unwrap();
+        // h3:// is DoH (HTTPS transport) but pinned to HTTP/3.
+        assert_eq!(s.kind, TransportKind::Https);
+        assert_eq!(s.port, 443);
+        assert_eq!(s.path, "/dns-query");
+        assert!(s.force_http3);
     }
 
     #[test]
