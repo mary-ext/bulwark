@@ -136,6 +136,7 @@ fn try_parse_hosts(line: &str) -> Option<Vec<Rule>> {
             rewrite,
             list_id: 0,
             signature: format!("hosts|{domain}|{}", if block { "block" } else { "rewrite" }),
+            index_tokens: Vec::new(),
         });
     }
     Some(rules)
@@ -173,11 +174,12 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
     // Build the canonical signature (for $badfilter pairing) before consuming.
     let signature = make_signature(action, pattern_str, mods_str);
 
+    let (pattern, index_tokens) = parse_pattern(pattern_str)?;
     let mut rule = Rule {
         id: 0,
         raw: line.to_string(),
         action,
-        pattern: parse_pattern(pattern_str)?,
+        pattern,
         dnstype: None,
         client: None,
         ctag: None,
@@ -187,6 +189,7 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
         rewrite: None,
         list_id: 0,
         signature,
+        index_tokens,
     };
 
     if let Some(mods) = mods_str {
@@ -251,13 +254,15 @@ fn make_signature(action: Action, pattern: &str, mods: Option<&str>) -> String {
     )
 }
 
-fn parse_pattern(p: &str) -> Result<Pattern, ParseError> {
-    // Regex rule.
+/// Parse a pattern into a [`Pattern`] plus the safe reverse-index tokens (only
+/// non-empty for wildcard patterns).
+fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
+    // Regex rule (always falls back to a linear scan — no safe literal tokens).
     if p.starts_with('/') && p.ends_with('/') && p.len() >= 2 {
         let inner = &p[1..p.len() - 1];
         let re =
             Regex::new(&format!("(?i){inner}")).map_err(|e| ParseError::Regex(e.to_string()))?;
-        return Ok(Pattern::Regex(re));
+        return Ok((Pattern::Regex(re), Vec::new()));
     }
 
     let mut s = p;
@@ -282,7 +287,8 @@ fn parse_pattern(p: &str) -> Result<Pattern, ParseError> {
 
     if s.contains('*') || s.contains('^') {
         let re = build_wildcard_regex(s, subdomain_anchor, start_anchor, end_anchor)?;
-        return Ok(Pattern::Wildcard(re));
+        let tokens = crate::token::tokenize_pattern_safe(&s.to_ascii_lowercase());
+        return Ok((Pattern::Wildcard(re), tokens));
     }
 
     let domain = norm_domain(s);
@@ -291,10 +297,10 @@ fn parse_pattern(p: &str) -> Result<Pattern, ParseError> {
     }
     if start_anchor {
         // `|example.com|` — exact host match.
-        Ok(Pattern::Exact(domain))
+        Ok((Pattern::Exact(domain), Vec::new()))
     } else {
         // `||example.com^` or bare `example.com` — domain + subdomains.
-        Ok(Pattern::Subdomain(domain))
+        Ok((Pattern::Subdomain(domain), Vec::new()))
     }
 }
 

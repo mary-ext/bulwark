@@ -243,6 +243,46 @@ fn multi_list_stats_and_priority() {
 }
 
 #[test]
+fn wildcard_reverse_index_correctness() {
+    // Mix of wildcard rules; the token index must not change results vs a scan.
+    let e = compile_one(
+        "||*.doubleclick.net^\n*.ads.example.com\n||cdn-*.tracker.io^\n/^evil[0-9]+\\./",
+    );
+    assert!(e.check("x.doubleclick.net", "A", &ci()).is_blocked());
+    assert!(e.check("a.b.ads.example.com", "A", &ci()).is_blocked());
+    assert!(e.check("cdn-1.tracker.io", "A", &ci()).is_blocked());
+    assert!(e.check("evil42.example.org", "A", &ci()).is_blocked()); // regex (fallback)
+                                                                     // Non-matches.
+    assert!(!e.check("doubleclick.net.evil.com", "A", &ci()).is_blocked());
+    assert!(!e.check("safe.example.org", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn many_wildcards_match_fast() {
+    // 20k wildcard rules; the reverse index should keep lookups quick while
+    // remaining correct (a naive scan would check all 20k every query).
+    let mut text = String::new();
+    for i in 0..20_000 {
+        text.push_str(&format!("||*.evilcdn{i}.example^\n"));
+    }
+    let e = compile_one(&text);
+    let start = std::time::Instant::now();
+    for i in 0..5_000 {
+        let host = format!("node.evilcdn{}.example", i % 20_000);
+        assert!(e.check(&host, "A", &ci()).is_blocked());
+    }
+    let elapsed = start.elapsed();
+    // With the token index each lookup checks ~1 regex. A linear scan over 20k
+    // rules would be ~20k regex evals per query (minutes); the index keeps this
+    // well under the budget even in a debug build.
+    assert!(
+        elapsed.as_secs() < 10,
+        "wildcard lookups too slow: {elapsed:?}"
+    );
+    assert!(!e.check("node.safe.example", "A", &ci()).is_blocked());
+}
+
+#[test]
 fn large_list_matches_fast() {
     // Sanity: build 50k rules and ensure lookups are correct & quick.
     let mut text = String::new();

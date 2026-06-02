@@ -196,3 +196,30 @@ Gotchas:
 - Test-harness notes: foreground `sleep` is blocked (use `curl --retry`);
   `pkill -f target/debug/bulwark` matches the shell's own command line and kills
   it — use `pkill -x bulwark`.
+
+## Phase 9 — filtering optimization (from adblock-rust) — DONE
+
+Studied Brave's `adblock-rust` (cloned to /tmp): it tokenizes filters and the
+request, bucketing each filter under one rare token in a reverse index, then
+only checks candidates that share a token with the request.
+
+Applied the idea to our **wildcard/regex bucket** (previously scanned linearly
+for every query; exact/subdomain were already O(labels) via hash maps):
+- New `token` module: FNV-1a hashing; `tokenize_query` (all alphanumeric runs
+  ≥3 chars of the query name) and `tokenize_pattern_safe` (only **interior**
+  literal runs — bounded by real separators, never a `*` edge — so any matching
+  domain is guaranteed to contain them as complete tokens).
+- Each wildcard rule carries `index_tokens`; at build time we bucket it under
+  its **rarest** token (`scan_index: token → rule ids`). Wildcard rules with no
+  safe token and **all regex rules** go to `scan_fallback` (always scanned), so
+  correctness is never sacrificed for speed.
+- Lookup tokenizes the query once and only regex-checks the rarest-token bucket
+  plus the (small) fallback list.
+
+Result: 20k wildcard rules, 5k lookups complete well under budget; a linear
+scan would be ~20k regex evals per query. Correctness covered by
+`wildcard_reverse_index_correctness` (mixed wildcard + regex, positive &
+negative) and the existing AdGuard-semantics tests — all green.
+
+Future ideas not yet taken from adblock-rust: flatbuffer/compact rule layout for
+very large lists, and compile-time rule de-duplication/fusing.

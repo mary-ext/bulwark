@@ -21,6 +21,7 @@ pub mod engine;
 pub mod list;
 pub mod parser;
 pub mod rule;
+pub mod token;
 
 pub use engine::{FilterEngine, MatchInfo, Verdict};
 pub use list::{compile_one, Compiler, ListStats};

@@ -186,7 +186,7 @@ The query-processing pipeline & observability.
 - [x] README with quick start, Tailscale notes, config reference.
 - [x] Final pass: clippy, fmt, deny warnings where reasonable.
 
-### Phase 9 — Filtering optimization (learn from adblock-rust)  `[ ]`
+### Phase 9 — Filtering optimization (learn from adblock-rust)  `[x]` — DONE
 Study Brave's [`adblock-rust`](https://github.com/brave/adblock-rust) to sharpen
 our request-filtering engine. Areas to mine for ideas:
 - **Tokenization / reverse-index**: adblock-rust buckets network rules by an

@@ -43,8 +43,12 @@ pub struct FilterEngine {
     subdomain: HashMap<String, Vec<u32>, ahash::RandomState>,
     /// domain -> rule ids (exact match only).
     exact: HashMap<String, Vec<u32>, ahash::RandomState>,
-    /// Wildcard + regex rule ids, scanned for every query.
-    scan: Vec<u32>,
+    /// Reverse index: token hash -> wildcard rule ids bucketed under that token.
+    /// Only queries sharing a token need check these rules.
+    scan_index: HashMap<u32, Vec<u32>, ahash::RandomState>,
+    /// Wildcard rules without a safe token + all regex rules: scanned for every
+    /// query (kept small in practice).
+    scan_fallback: Vec<u32>,
 }
 
 /// Returns true if `domain` equals `base` or is a subdomain of it.
@@ -63,8 +67,12 @@ impl FilterEngine {
         let hasher = ahash::RandomState::new();
         let mut subdomain: HashMap<String, Vec<u32>, ahash::RandomState> =
             HashMap::with_hasher(hasher.clone());
-        let mut exact: HashMap<String, Vec<u32>, ahash::RandomState> = HashMap::with_hasher(hasher);
-        let mut scan = Vec::new();
+        let mut exact: HashMap<String, Vec<u32>, ahash::RandomState> =
+            HashMap::with_hasher(hasher.clone());
+        let mut scan_index: HashMap<u32, Vec<u32>, ahash::RandomState> =
+            HashMap::with_hasher(hasher);
+        let mut scan_fallback = Vec::new();
+        let mut scan_rules: Vec<u32> = Vec::new();
 
         for (i, rule) in rules.iter_mut().enumerate() {
             let id = i as u32;
@@ -72,7 +80,27 @@ impl FilterEngine {
             match &rule.pattern {
                 Pattern::Subdomain(d) => subdomain.entry(d.clone()).or_default().push(id),
                 Pattern::Exact(d) => exact.entry(d.clone()).or_default().push(id),
-                Pattern::Wildcard(_) | Pattern::Regex(_) => scan.push(id),
+                Pattern::Wildcard(_) | Pattern::Regex(_) => scan_rules.push(id),
+            }
+        }
+
+        // Count token frequency across scan rules so each rule can be bucketed
+        // under its *rarest* token, minimizing candidate set sizes.
+        let mut token_freq: HashMap<u32, u32, ahash::RandomState> = HashMap::default();
+        for &id in &scan_rules {
+            for &t in &rules[id as usize].index_tokens {
+                *token_freq.entry(t).or_default() += 1;
+            }
+        }
+        for &id in &scan_rules {
+            let best = rules[id as usize]
+                .index_tokens
+                .iter()
+                .min_by_key(|t| token_freq.get(t).copied().unwrap_or(0))
+                .copied();
+            match best {
+                Some(tok) => scan_index.entry(tok).or_default().push(id),
+                None => scan_fallback.push(id),
             }
         }
 
@@ -80,7 +108,8 @@ impl FilterEngine {
             rules,
             subdomain,
             exact,
-            scan,
+            scan_index,
+            scan_fallback,
         }
     }
 
@@ -107,13 +136,27 @@ impl FilterEngine {
                 None => break,
             }
         }
-        for &id in &self.scan {
+
+        // Wildcard/regex rules: always-scan fallback + token-indexed candidates.
+        let check = |id: u32, out: &mut Vec<u32>| {
             let matched = match &self.rules[id as usize].pattern {
                 Pattern::Wildcard(re) | Pattern::Regex(re) => re.is_match(domain),
                 _ => false,
             };
             if matched {
                 out.push(id);
+            }
+        };
+        for &id in &self.scan_fallback {
+            check(id, out);
+        }
+        if !self.scan_index.is_empty() {
+            for tok in crate::token::tokenize_query(domain) {
+                if let Some(ids) = self.scan_index.get(&tok) {
+                    for &id in ids {
+                        check(id, out);
+                    }
+                }
             }
         }
     }

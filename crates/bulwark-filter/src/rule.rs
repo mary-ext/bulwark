@@ -178,6 +178,9 @@ pub struct Rule {
     /// Canonical signature (pattern + sorted modifiers minus badfilter), used to
     /// pair `$badfilter` rules with the rules they disable.
     pub signature: String,
+    /// Safe interior token hashes for the wildcard reverse index (empty for
+    /// exact/subdomain/regex rules). See [`crate::token`].
+    pub index_tokens: Vec<u32>,
 }
 
 impl Rule {
