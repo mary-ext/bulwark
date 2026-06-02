@@ -14,8 +14,8 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
     // rand_core version, which can clash with the rand crate's).
     let mut salt_bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut salt_bytes);
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| anyhow::anyhow!("salt error: {e}"))?;
+    let salt =
+        SaltString::encode_b64(&salt_bytes).map_err(|e| anyhow::anyhow!("salt error: {e}"))?;
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)
         .map_err(|e| anyhow::anyhow!("hash error: {e}"))?;

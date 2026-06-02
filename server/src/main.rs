@@ -30,7 +30,9 @@ async fn main() -> anyhow::Result<()> {
     let mut config = Config::load_or_default(&paths.config).context("loading config")?;
     app::apply_env_overrides(&mut config);
     if !paths.config.exists() {
-        config.save(&paths.config).context("writing initial config")?;
+        config
+            .save(&paths.config)
+            .context("writing initial config")?;
     }
 
     tracing::info!(data_dir = %paths.data_dir.display(), "starting bulwark");
@@ -43,7 +45,8 @@ async fn main() -> anyhow::Result<()> {
         persist::load_stats(&paths.stats, &engine);
     }
     if config.query_log.persist {
-        let entries = persist::load_and_prune_querylog(&paths.querylog, config.query_log.retention_days);
+        let entries =
+            persist::load_and_prune_querylog(&paths.querylog, config.query_log.retention_days);
         engine.log().preload(entries);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         engine.log().set_sink(tx);
@@ -114,10 +117,7 @@ fn init_tracing() {
 }
 
 /// Periodically run polite background latency probes against all upstreams.
-fn spawn_probe_loop(
-    engine: Arc<bulwark_engine::Engine>,
-    config: Arc<tokio::sync::RwLock<Config>>,
-) {
+fn spawn_probe_loop(engine: Arc<bulwark_engine::Engine>, config: Arc<tokio::sync::RwLock<Config>>) {
     tokio::spawn(async move {
         loop {
             let interval = config.read().await.upstreams.probe_interval_secs;

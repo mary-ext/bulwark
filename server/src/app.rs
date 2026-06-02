@@ -1,6 +1,5 @@
 //! Shared application state and the config → engine build/apply logic.
 
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +59,10 @@ pub fn read_list_text(paths: &Paths, id: u32) -> String {
 
 /// Compile the filter engine from custom rules + enabled lists on disk.
 /// Returns the engine plus per-list rule counts (list_id → rule count).
-pub fn compile_filters(cfg: &Config, paths: &Paths) -> (bulwark_filter::FilterEngine, Vec<(u32, usize)>) {
+pub fn compile_filters(
+    cfg: &Config,
+    paths: &Paths,
+) -> (bulwark_filter::FilterEngine, Vec<(u32, usize)>) {
     let mut c = Compiler::new();
     // Custom user rules are list id 0.
     c.add_list(0, "Custom rules", &cfg.filtering.custom_rules);

@@ -181,10 +181,10 @@ The query-processing pipeline & observability.
 - [x] Talks to REST API; live-ish updates via polling (polite).
 - [x] `pnpm build` → static assets embedded in the binary (Chart.js for charts).
 
-### Phase 8 — Integration, polish, docs  `[ ]`
-- [ ] End-to-end smoke test (spin server, real query through hickory/python).
-- [ ] README with quick start, Tailscale notes, config reference.
-- [ ] Final pass: clippy, fmt, deny warnings where reasonable.
+### Phase 8 — Integration, polish, docs  `[x]` — DONE
+- [x] End-to-end smoke test (spin server, real query through hickory/python).
+- [x] README with quick start, Tailscale notes, config reference.
+- [x] Final pass: clippy, fmt, deny warnings where reasonable.
 
 ### Phase 9 — Filtering optimization (learn from adblock-rust)  `[ ]`
 Study Brave's [`adblock-rust`](https://github.com/brave/adblock-rust) to sharpen

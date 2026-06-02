@@ -62,7 +62,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/filters/custom", put(put_custom_rules))
         .route("/api/filters/check", post(check_domain))
         .route("/api/filters/lists", post(add_list))
-        .route("/api/filters/lists/{id}", put(update_list).delete(delete_list))
+        .route(
+            "/api/filters/lists/{id}",
+            put(update_list).delete(delete_list),
+        )
         .route("/api/filters/lists/{id}/refresh", post(refresh_list))
         .route("/api/clients", get(get_clients).put(put_clients))
         .route("/api/stats", get(get_stats))
@@ -127,7 +130,10 @@ fn session_cookie(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")
 }
 
-async fn setup(State(state): State<AppState>, Json(creds): Json<Credentials>) -> ApiResult<Response> {
+async fn setup(
+    State(state): State<AppState>,
+    Json(creds): Json<Credentials>,
+) -> ApiResult<Response> {
     {
         let cfg = state.config.read().await;
         if !cfg.auth.needs_setup() {
@@ -151,7 +157,10 @@ async fn setup(State(state): State<AppState>, Json(creds): Json<Credentials>) ->
     Ok((headers, Json(json!({ "ok": true }))).into_response())
 }
 
-async fn login(State(state): State<AppState>, Json(creds): Json<Credentials>) -> ApiResult<Response> {
+async fn login(
+    State(state): State<AppState>,
+    Json(creds): Json<Credentials>,
+) -> ApiResult<Response> {
     let cfg = state.config.read().await;
     let ok = cfg.auth.username == creds.username
         && cfg
@@ -176,7 +185,9 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let mut out = HeaderMap::new();
     out.insert(
         header::SET_COOKIE,
-        format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0").parse().unwrap(),
+        format!("{SESSION_COOKIE}=; HttpOnly; Path=/; Max-Age=0")
+            .parse()
+            .unwrap(),
     );
     (out, Json(json!({ "ok": true }))).into_response()
 }
@@ -198,7 +209,9 @@ async fn put_upstreams(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.upstreams = body;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -208,7 +221,9 @@ async fn put_cache(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.cache = body;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -231,7 +246,9 @@ async fn put_filtering(
     cfg.filtering.custom_block_ipv4 = body.custom_block_ipv4;
     cfg.filtering.custom_block_ipv6 = body.custom_block_ipv6;
     cfg.filtering.blocked_ttl_secs = body.blocked_ttl_secs;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -241,7 +258,9 @@ async fn put_server(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.server = body;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     // Note: dns_bind / http_bind changes take effect on restart.
     Ok(Json(json!({ "ok": true, "restart_required": true })))
 }
@@ -252,7 +271,9 @@ async fn put_querylog(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.query_log = body;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -262,7 +283,9 @@ async fn put_stats_cfg(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.stats = body;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -291,7 +314,9 @@ async fn put_custom_rules(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.filtering.custom_rules = body.rules;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -324,9 +349,14 @@ async fn fetch_list(url: &str) -> Result<String, ApiError> {
         .await
         .map_err(|e| ApiError::BadRequest(format!("fetch failed: {e}")))?;
     if !resp.status().is_success() {
-        return Err(ApiError::BadRequest(format!("fetch status {}", resp.status())));
+        return Err(ApiError::BadRequest(format!(
+            "fetch status {}",
+            resp.status()
+        )));
     }
-    resp.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))
+    resp.text()
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
 async fn add_list(
@@ -352,7 +382,9 @@ async fn add_list(
         rule_count: 0,
         last_updated: Some(now_ms()),
     });
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
@@ -384,7 +416,9 @@ async fn update_list(
     if let Some(e) = body.enabled {
         list.enabled = e;
     }
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -396,11 +430,16 @@ async fn delete_list(State(state): State<AppState>, Path(id): Path<u32>) -> ApiR
         return Err(ApiError::NotFound(format!("list {id}")));
     }
     let _ = std::fs::remove_file(state.paths.list_file(id));
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
-async fn refresh_list(State(state): State<AppState>, Path(id): Path<u32>) -> ApiResult<Json<Value>> {
+async fn refresh_list(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> ApiResult<Json<Value>> {
     let url = {
         let cfg = state.config.read().await;
         let list = cfg
@@ -421,7 +460,9 @@ async fn refresh_list(State(state): State<AppState>, Path(id): Path<u32>) -> Api
     if let Some(list) = cfg.filtering.lists.iter_mut().find(|l| l.id == id) {
         list.last_updated = Some(now_ms());
     }
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -438,7 +479,10 @@ async fn check_domain(
 ) -> Json<Value> {
     let filter = state.engine.filter_snapshot();
     let domain = body.domain.trim_end_matches('.').to_ascii_lowercase();
-    let qtype = body.qtype.unwrap_or_else(|| "A".into()).to_ascii_uppercase();
+    let qtype = body
+        .qtype
+        .unwrap_or_else(|| "A".into())
+        .to_ascii_uppercase();
     let ci = ClientInfo::default();
     let verdict = filter.check(&domain, &qtype, &ci);
     let v = match verdict {
@@ -475,7 +519,9 @@ async fn put_clients(
 ) -> ApiResult<Json<Value>> {
     let mut cfg = state.config.read().await.clone();
     cfg.clients = clients;
-    apply_config(&state, cfg).await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -535,7 +581,10 @@ async fn get_querylog(State(state): State<AppState>, Query(q): Query<LogQuery>) 
         client: q.client,
         blocked_only: q.blocked_only,
     };
-    let page = state.engine.log().query(&filter, q.offset, q.limit.min(1000));
+    let page = state
+        .engine
+        .log()
+        .query(&filter, q.offset, q.limit.min(1000));
     Json(json!({ "entries": page.entries, "total": page.total }))
 }
 
