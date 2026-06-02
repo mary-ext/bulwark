@@ -1,11 +1,18 @@
 <script lang="ts">
-  import { api, type UpstreamStat, type UpstreamsCfg, type UpstreamCfg } from "../lib/api";
+  import {
+    api,
+    type UpstreamStat,
+    type UpstreamsCfg,
+    type UpstreamCfg,
+    type LatencyPercentiles,
+  } from "../lib/api";
   import { toaster } from "../lib/toast.svelte";
   import { ms, num } from "../lib/format";
   import Chart from "../lib/Chart.svelte";
   import type { ChartConfiguration } from "chart.js/auto";
 
   let stats = $state<UpstreamStat[]>([]);
+  let pct = $state<Record<string, LatencyPercentiles>>({});
   let cfg = $state<UpstreamsCfg | null>(null);
 
   // Add form
@@ -16,7 +23,9 @@
 
   async function loadStats() {
     try {
-      stats = await api.getUpstreams();
+      const [up, summary] = await Promise.all([api.getUpstreams(), api.getStats()]);
+      stats = up;
+      pct = summary.upstream_latency_pct ?? {};
     } catch (e: any) {
       if (e.status !== 401) toaster.show("Failed to load upstreams", true);
     }
@@ -96,7 +105,7 @@
   <h3 style="margin-top:0">Status & latency</h3>
   <table>
     <thead>
-      <tr><th>Name</th><th>Type</th><th>Status</th><th>Avg RTT</th><th>Last</th><th>Queries</th><th>Fails</th><th></th></tr>
+      <tr><th>Name</th><th>Type</th><th>Status</th><th>Avg RTT</th><th>Last</th><th>p50</th><th>p90</th><th>p99</th><th>Queries</th><th>Fails</th><th></th></tr>
     </thead>
     <tbody>
       {#each stats as s}
@@ -106,13 +115,16 @@
           <td><span class="badge {s.up ? 'up' : 'down'}">{s.up ? "up" : "down"}</span></td>
           <td>{ms(s.avg_rtt_ms)}</td>
           <td class="muted">{ms(s.last_rtt_ms)}</td>
+          <td class="muted">{ms(pct[s.name]?.p50)}</td>
+          <td class="muted">{ms(pct[s.name]?.p90)}</td>
+          <td class="muted">{ms(pct[s.name]?.p99)}</td>
           <td>{num(s.total_queries)}</td>
           <td class="muted">{num(s.total_failures)}</td>
           <td style="text-align:right"><button onclick={() => testSpec(s.spec)} disabled={testing}>Test</button></td>
         </tr>
       {/each}
       {#if stats.length === 0}
-        <tr><td colspan="8" class="muted" style="text-align:center;padding:1.5rem">No upstreams configured.</td></tr>
+        <tr><td colspan="11" class="muted" style="text-align:center;padding:1.5rem">No upstreams configured.</td></tr>
       {/if}
     </tbody>
   </table>

@@ -79,6 +79,12 @@ export interface SeriesPoint {
   cached: number;
 }
 
+export interface LatencyPercentiles {
+  p50: number;
+  p90: number;
+  p99: number;
+}
+
 export interface StatsSummary {
   total: number;
   blocked: number;
@@ -95,6 +101,7 @@ export interface StatsSummary {
   top_upstreams: TopEntry[];
   qtypes: TopEntry[];
   upstream_avg_rtt_ms: Record<string, number>;
+  upstream_latency_pct: Record<string, LatencyPercentiles>;
   series: SeriesPoint[];
   cache_hits: number;
   cache_misses: number;
