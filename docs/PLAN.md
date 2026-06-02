@@ -102,7 +102,7 @@ engine also depends on upstream + filter + config
 - [x] `docs/PLAN.md` + `docs/NOTES.md`.
 - [x] Commit.
 
-### Phase 1 — `bulwark-filter`  `[x]`
+### Phase 1 — `bulwark-filter`  `[x]` — DONE
 The filtering engine. Pure, no I/O, fully unit-tested.
 - [x] Rule model: blocking, exception, hosts, rewrite, with modifiers.
 - [x] Parsers:
@@ -137,8 +137,13 @@ Upstream resolution layer.
 - [x] Tests with a local mock UDP DNS server; failover, dedup, selection.
 
 ### Phase 3 — caching  `[x]` (in `bulwark-engine`)
-- [x] TTL-respecting positive & negative cache (RFC 2308), min/max TTL clamps.
-- [x] Optimistic / serve-stale with background refresh (polite, dedup'd).
+- [x] TTL-respecting positive & negative cache (RFC 2308).
+- [x] **User-configurable minimum & maximum TTL** clamps (override upstream TTLs
+      within `[min_ttl, max_ttl]`), settable from the web UI.
+- [x] **Optional optimistic caching** (serve-stale, RFC 8767): a config toggle;
+      when on, expired entries are served immediately while a single polite,
+      de-duplicated background refresh is kicked off.
+- [x] Cache enable/disable toggle and configurable cache size.
 - [x] Cache keyed by (name, qtype, qclass); LRU bound.
 - [x] Tests.
 

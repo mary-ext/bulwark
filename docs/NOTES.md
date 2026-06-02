@@ -34,9 +34,35 @@ that's an orthogonal optimisation that further reduces upstream load.
 
 ---
 
-## Phase 1 — filter engine
+## Phase 1 — filter engine — DONE
 
-(notes added during implementation)
+Design:
+- `rule.rs` — `Rule`, `Pattern` (Subdomain / Exact / Wildcard / Regex), action
+  (Block/Allow/Rewrite), and the DNS modifier types (`$dnstype`, `$client`,
+  `$ctag`, `$denyallow`, `$dnsrewrite`, `$important`, `$badfilter`).
+- `parser.rs` — one entry point `parse_line`. Detects hosts-file lines (IP +
+  hostnames; `0.0.0.0`/`127.0.0.1`/`::`/`::1` → block, other IP → rewrite),
+  AdBlock rules, and `/regex/` rules. Hosts "noise" names (localhost, ip6-*,
+  broadcasthost) are skipped so we never blackhole loopback.
+- `engine.rs` — `FilterEngine`. Exact + subdomain rules bucket into ahash maps;
+  wildcard/regex scanned linearly. Lookup walks domain suffixes for subdomain
+  rules. Winner chosen by `priority()` score.
+- `list.rs` — `Compiler` accumulates rules across lists, collects `$badfilter`
+  signatures, and drops cancelled rules at `build()`.
+
+Decisions / faithful-to-AdGuard choices:
+- **Bare domain** (`example.org`) ⇒ treated as `||example.org^` (domain +
+  subdomains), which is what blocklists expect.
+- **Hosts entries** are *exact* (no subdomain match), matching /etc/hosts
+  semantics — blocklists list each subdomain explicitly.
+- **Priority**: `score = (allow?2:1) + (important?100:0)`; highest wins ⇒
+  important > exception > block, and allow beats block at equal importance.
+- **`$badfilter`** pairs by a canonical signature (`@@`? + lowercased pattern +
+  sorted modifiers minus `badfilter`), so it cancels exactly the twin rule.
+- **`$denyallow`** makes a blocking rule *not* apply to the listed domains.
+- **Unsupported (HTTP-only) modifiers** (`$third-party`, `$script`, …) ⇒ the
+  whole rule is skipped (counted as `unsupported`) rather than mis-matched.
+- 50k-rule build + 10k lookups complete in well under the 2s test budget.
 
 ## Phase 2 — upstream
 

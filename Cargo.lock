@@ -271,6 +271,7 @@ name = "bulwark-filter"
 version = "0.1.0"
 dependencies = [
  "ahash",
+ "ipnet",
  "regex",
  "serde",
  "serde_json",
