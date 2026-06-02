@@ -1,0 +1,6 @@
+# reqwest's HTTP/3 support is gated behind an "unstable" cfg in addition to the
+# `http3` cargo feature (see crates/bulwark-upstream). This applies to the whole
+# workspace build; it is required for DoH-over-HTTP/3 (`h3://` and Alt-Svc
+# auto-upgrade) to compile.
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]
