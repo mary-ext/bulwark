@@ -621,6 +621,183 @@ fn sf_count_filter() -> Arc<FilterEngine> {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4: stats.record() contention — old single global mutex vs new shards.
+//
+// This isolates the statistics bottleneck from upstream I/O: every query in a
+// real resolver calls record(), so its scaling with core count is what matters.
+// `OldStats` is a faithful copy of the pre-optimization record() (one mutex,
+// string allocations performed *inside* the lock); the new side calls the real
+// sharded `bulwark_engine::stats::Stats`.
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+use bulwark_engine::querylog::{QueryAction, QueryLogEntry};
+
+fn old_bump(map: &mut HashMap<String, u64>, key: &str, by: u64) {
+    if let Some(v) = map.get_mut(key) {
+        *v += by;
+    } else if map.len() < 50_000 {
+        map.insert(key.to_string(), by);
+    }
+}
+
+#[derive(Default)]
+struct OldInner {
+    total: u64,
+    blocked: u64,
+    cached: u64,
+    proc_time_sum_ms: f64,
+    proc_time_count: u64,
+    latency_hist: Vec<u64>,
+    domains: HashMap<String, u64>,
+    blocked_domains: HashMap<String, u64>,
+    clients: HashMap<String, u64>,
+    qtypes: HashMap<String, u64>,
+    upstreams: HashMap<String, u64>,
+    upstream_rtt_sum: HashMap<String, f64>,
+    upstream_rtt_count: HashMap<String, u64>,
+}
+
+struct OldStats {
+    inner: parking_lot::Mutex<OldInner>,
+}
+
+impl OldStats {
+    fn new() -> Self {
+        let mut inner = OldInner::default();
+        inner.latency_hist = vec![0; 11];
+        Self { inner: parking_lot::Mutex::new(inner) }
+    }
+
+    // Mirror of the original record(): single lock, allocations inside it.
+    fn record(&self, entry: &QueryLogEntry) {
+        let mut s = self.inner.lock();
+        s.total += 1;
+        let blocked = entry.is_blocked();
+        match entry.action {
+            QueryAction::Cached => s.cached += 1,
+            _ => {}
+        }
+        if blocked {
+            s.blocked += 1;
+        }
+        s.proc_time_sum_ms += entry.elapsed_ms;
+        s.proc_time_count += 1;
+        let idx = (entry.elapsed_ms as usize).min(10);
+        s.latency_hist[idx] += 1;
+
+        let domain = entry.question.trim_end_matches('.').to_string();
+        old_bump(&mut s.domains, &domain, 1);
+        if blocked {
+            old_bump(&mut s.blocked_domains, &domain, 1);
+        }
+        let client = entry
+            .client_name
+            .clone()
+            .unwrap_or_else(|| entry.client_ip.clone());
+        old_bump(&mut s.clients, &client, 1);
+        old_bump(&mut s.qtypes, &entry.qtype, 1);
+        if let Some(up) = &entry.upstream {
+            old_bump(&mut s.upstreams, up, 1);
+            *s.upstream_rtt_sum.entry(up.clone()).or_insert(0.0) += entry.elapsed_ms;
+            *s.upstream_rtt_count.entry(up.clone()).or_insert(0) += 1;
+        }
+    }
+}
+
+fn entry_for(domain: &str, blocked: bool) -> QueryLogEntry {
+    QueryLogEntry {
+        id: 0,
+        time_ms: 1_700_000_000_000,
+        client_ip: "192.168.1.50".into(),
+        client_name: Some("laptop".into()),
+        question: format!("{domain}."),
+        qtype: "A".into(),
+        action: if blocked { QueryAction::Blocked } else { QueryAction::Forwarded },
+        allowlisted: false,
+        rcode: "NOERROR".into(),
+        answers: vec![],
+        rule: None,
+        list_id: None,
+        upstream: if blocked { None } else { Some("mock".into()) },
+        elapsed_ms: 1.5,
+        cached: false,
+    }
+}
+
+fn phase4_stats_contention(blocked: &[String]) {
+    println!("\n== Phase 4: stats.record() scaling, old single-mutex vs new sharded ==");
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let per_thread = 400_000usize;
+
+    // Shared, pre-built entries (~70% blocked, mirroring a filtering resolver).
+    let entries: Arc<Vec<QueryLogEntry>> = Arc::new(
+        (0..4096)
+            .map(|i| entry_for(&blocked[i % blocked.len()], i % 10 < 7))
+            .collect(),
+    );
+
+    let thread_counts: Vec<usize> = [1usize, 2, 4, cores]
+        .into_iter()
+        .filter(|&c| c <= cores)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    println!("  {:<8} {:>14} {:>14} {:>10}", "threads", "old (rec/s)", "new (rec/s)", "speedup");
+    for &c in &thread_counts {
+        let old = Arc::new(OldStats::new());
+        let old_rate = run_record_bench(c, per_thread, entries.clone(), {
+            let old = old.clone();
+            move |e| old.record(e)
+        });
+
+        let new = Arc::new(Stats::new(true, 24));
+        let new_rate = run_record_bench(c, per_thread, entries.clone(), {
+            let new = new.clone();
+            move |e| new.record(e)
+        });
+
+        println!(
+            "  {c:<8} {old_rate:>14.0} {new_rate:>14.0} {:>9.1}x",
+            new_rate / old_rate.max(1.0)
+        );
+    }
+}
+
+/// Spawn `threads` OS threads, each replaying `per_thread` records, and return
+/// aggregate records/second.
+fn run_record_bench(
+    threads: usize,
+    per_thread: usize,
+    entries: Arc<Vec<QueryLogEntry>>,
+    record: impl Fn(&QueryLogEntry) + Send + Sync + Clone + 'static,
+) -> f64 {
+    let barrier = Arc::new(std::sync::Barrier::new(threads));
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let entries = entries.clone();
+        let record = record.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let mut i = t;
+            for _ in 0..per_thread {
+                record(&entries[i & (entries.len() - 1)]);
+                i = i.wrapping_add(1);
+            }
+        }));
+    }
+    let start = Instant::now();
+    // Threads block on the barrier; start the clock and let them run.
+    for h in handles {
+        let _ = h.join();
+    }
+    let elapsed = start.elapsed();
+    (threads * per_thread) as f64 / elapsed.as_secs_f64()
+}
+
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -642,6 +819,7 @@ async fn main() {
     phase1_stage_profile(&filter, &blocked);
     phase2_scenarios(filter.clone(), &blocked, upstream, n).await;
     phase3_concurrency(filter.clone(), &blocked, upstream, n.max(50_000), concurrency).await;
+    phase4_stats_contention(&blocked);
 
     println!("\n== done ==");
 }
