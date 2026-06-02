@@ -101,6 +101,11 @@ impl Engine {
         self.state.load().pool.clone()
     }
 
+    /// A snapshot of the current compiled filter (for the "check domain" tool).
+    pub fn filter_snapshot(&self) -> Arc<FilterEngine> {
+        self.state.load().filter.clone()
+    }
+
     /// Process a query and return the response, recording log + stats.
     pub async fn handle(&self, query: Message, client_ip: IpAddr) -> Message {
         let start = Instant::now();

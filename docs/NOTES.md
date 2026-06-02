@@ -139,6 +139,37 @@ so partial YAML works. Durations stored as `*_secs`/`*_days` for simple
 UI/JSON editing. Atomic save (temp + rename), validation, schema version.
 Password stored as an Argon2 hash (set by the server during the setup flow).
 
-## Phase 6 — server
+## Phase 6 — server — DONE
+
+`server/` binary. Modules: `app` (state + config→engine build/apply, hot-reload),
+`auth` (Argon2 hashing + in-memory sessions), `persist` (query-log JSONL
+append/load/prune + stats snapshot), `api` (Axum REST), `assets` (embedded SPA),
+`main` (wiring + background tasks + graceful shutdown).
+
+- **Config apply** rebuilds the hot-swappable `EngineState` and reconfigures
+  cache/log/stats in place — no traffic dropped, accumulated data kept.
+- **Auth**: setup flow creates the admin (Argon2id); login issues an HttpOnly
+  session cookie; a middleware gates all `/api/*` except status/setup/login.
+  Salt generated from `rand` bytes via `SaltString::encode_b64` (avoids a
+  rand_core version clash with password_hash).
+- **Persistence**: query log appended to `querylog.jsonl` by a background writer
+  fed via the log's sink; preloaded + pruned on startup; hourly pruner honours
+  `query_log.retention_days`. Stats snapshotted to `stats.json` every 60s and on
+  shutdown; restored on startup; `stats.retention_days` bounds the series.
+- **Background tasks**: upstream probe loop (interval from config), stats
+  snapshotter, query-log pruner.
+- DNS bind failure (e.g. needing root for :53) is non-fatal — the web UI still
+  starts so the user can reconfigure. `BULWARK_DNS_BIND` / `BULWARK_HTTP_BIND`
+  env overrides ease testing on unprivileged ports.
+
+Verified end-to-end (server on :15353/:13000): setup, real resolution via
+upstream failover, custom-rule + hosts-list blocking → NXDOMAIN, check tool,
+upstream test, live stats, query log, auth 401 gating, and persistence across a
+restart.
+
+API surface: `/api/status|setup|login|logout`, `/api/config` (+ section PUTs
+`upstreams|cache|filtering|server|querylog|stats`), `/api/filters` (+ `custom`,
+`check`, `lists` CRUD + `refresh`), `/api/clients`, `/api/stats` (+ `reset`),
+`/api/querylog` (GET/DELETE), `/api/upstreams` (+ `test`).
 
 ## Phase 7 — web UI

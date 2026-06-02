@@ -165,7 +165,7 @@ The query-processing pipeline & observability.
 - [x] Validation with helpful errors.
 - [x] Tests.
 
-### Phase 6 — `server` binary + REST API  `[x]`
+### Phase 6 — `server` binary + REST API  `[x]` — DONE
 - [x] Axum app: config CRUD, filter lists CRUD + refresh, clients CRUD,
       custom rules, stats endpoints, query-log endpoint, control (test upstream).
 - [x] Wires engine + config + filter manager; applies hot-reload on change.
