@@ -67,15 +67,22 @@ impl Compiler {
     }
 
     /// Consume the compiler, producing the engine and the gathered stats.
+    ///
+    /// Rules cancelled by `$badfilter` are dropped, and exact-duplicate rules
+    /// (same signature — pattern + modifiers + action) are de-duplicated, which
+    /// matters a lot for overlapping blocklists. The first occurrence wins (so
+    /// its source list keeps the attribution).
     pub fn build(self) -> (FilterEngine, Vec<ListStats>) {
         let Compiler {
             rules,
             badfilter_sigs,
             stats,
         } = self;
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let active: Vec<Rule> = rules
             .into_iter()
             .filter(|r| !badfilter_sigs.contains(&r.signature))
+            .filter(|r| seen.insert(r.signature.clone()))
             .collect();
         (FilterEngine::from_rules(active), stats)
     }

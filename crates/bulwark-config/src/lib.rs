@@ -145,6 +145,12 @@ pub struct CacheConfig {
     /// refreshing in the background.
     #[serde(default)]
     pub optimistic: bool,
+    /// When optimistic caching is on, the maximum number of seconds **past
+    /// expiry** that a stale entry may still be served before a fresh resolve is
+    /// required. Bounds staleness (entries are never served unbounded); 0
+    /// disables serve-stale even if `optimistic` is true.
+    #[serde(default = "default_stale_max_age")]
+    pub optimistic_max_age_secs: u32,
 }
 
 impl Default for CacheConfig {
@@ -155,6 +161,7 @@ impl Default for CacheConfig {
             min_ttl_secs: 0,
             max_ttl_secs: default_max_ttl(),
             optimistic: false,
+            optimistic_max_age_secs: default_stale_max_age(),
         }
     }
 }

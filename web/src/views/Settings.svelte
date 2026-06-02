@@ -96,6 +96,15 @@
           <label style="margin:0" title="Serve stale answers while refreshing in the background">Optimistic caching</label>
           <label class="switch"><input type="checkbox" bind:checked={cache.optimistic} /><span class="slider"></span></label>
         </div>
+        {#if cache.optimistic}
+          <div class="field">
+            <label for="sa">Max serve-stale age (s past expiry)</label>
+            <input id="sa" type="number" min="0" bind:value={cache.optimistic_max_age_secs} />
+            <p class="muted" style="font-size:0.78rem;margin:0.3rem 0 0">
+              Bounds how stale an answer can be (0 disables serve-stale).
+            </p>
+          </div>
+        {/if}
         <div class="field"><label for="cs">Max entries</label><input id="cs" type="number" min="1" bind:value={cache.size} /></div>
         <div class="grid cols-2">
           <div class="field"><label>Min TTL (s)</label><input type="number" min="0" bind:value={cache.min_ttl_secs} /></div>

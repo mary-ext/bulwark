@@ -25,7 +25,7 @@ query logs.
   - Latency is tracked from real traffic plus a gentle background probe.
 - **Caching** — TTL-respecting positive & negative cache, configurable min/max
   TTL clamps, and optional **optimistic caching** (serve-stale with a single
-  background refresh).
+  background refresh and a **configurable bound on staleness**).
 - **Filtering** — host-file lists and the DNS-relevant subset of **AdGuard rule
   syntax** (`||domain^`, `@@` exceptions, wildcards, `/regex/`, and the
   `$important`, `$badfilter`, `$dnstype`, `$dnsrewrite`, `$client`, `$ctag`,

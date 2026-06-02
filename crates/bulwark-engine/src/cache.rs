@@ -7,16 +7,13 @@
 //! * LRU-bounded, keyed by `(name, type, class)`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bulwark_upstream::QueryKey;
 use hickory_proto::op::{Message, ResponseCode};
 use lru::LruCache;
 use parking_lot::Mutex;
 
-/// How long past expiry a stale entry may still be served when optimistic
-/// caching is enabled.
-const STALE_WINDOW: Duration = Duration::from_secs(30 * 3600);
 /// Default negative-cache TTL when no SOA is present.
 const DEFAULT_NEGATIVE_TTL: u32 = 30;
 /// TTL (seconds) applied to records when serving a stale answer.
@@ -54,6 +51,9 @@ pub struct CacheConfig {
     /// 0 means "no upper clamp".
     pub max_ttl: AtomicU32,
     pub optimistic: AtomicBool,
+    /// Max seconds past expiry a stale entry may still be served (optimistic
+    /// caching). Bounds how stale an answer can be; 0 disables serve-stale.
+    pub stale_max_age: AtomicU32,
 }
 
 /// A TTL-aware DNS cache.
@@ -66,7 +66,13 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
-    pub fn new(capacity: usize, min_ttl: u32, max_ttl: u32, optimistic: bool) -> Self {
+    pub fn new(
+        capacity: usize,
+        min_ttl: u32,
+        max_ttl: u32,
+        optimistic: bool,
+        stale_max_age: u32,
+    ) -> Self {
         let cap = capacity.max(1);
         Self {
             map: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(cap).unwrap())),
@@ -75,6 +81,7 @@ impl DnsCache {
                 min_ttl: AtomicU32::new(min_ttl),
                 max_ttl: AtomicU32::new(max_ttl),
                 optimistic: AtomicBool::new(optimistic),
+                stale_max_age: AtomicU32::new(stale_max_age),
             },
             capacity: AtomicUsize::new(cap),
             hits: AtomicU64::new(0),
@@ -90,11 +97,15 @@ impl DnsCache {
         min_ttl: u32,
         max_ttl: u32,
         optimistic: bool,
+        stale_max_age: u32,
     ) {
         self.cfg.enabled.store(enabled, Ordering::Relaxed);
         self.cfg.min_ttl.store(min_ttl, Ordering::Relaxed);
         self.cfg.max_ttl.store(max_ttl, Ordering::Relaxed);
         self.cfg.optimistic.store(optimistic, Ordering::Relaxed);
+        self.cfg
+            .stale_max_age
+            .store(stale_max_age, Ordering::Relaxed);
         let cap = capacity.max(1);
         if cap != self.capacity.swap(cap, Ordering::Relaxed) {
             if let Some(nz) = std::num::NonZeroUsize::new(cap) {
@@ -152,8 +163,12 @@ impl DnsCache {
             });
         }
 
-        // Expired. Optionally serve stale within the stale window.
-        if optimistic && entry.stored_at.elapsed() < STALE_WINDOW {
+        // Expired. Optionally serve stale within the configured window. The
+        // window is measured from expiry, so `ttl + stale_max_age` is the total
+        // lifetime of a stale-servable entry.
+        let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
+        let within_window = entry.age_secs().saturating_sub(entry.ttl) < stale_max_age;
+        if optimistic && stale_max_age > 0 && within_window {
             let message = adjust_ttls(&entry.message, STALE_SERVE_TTL);
             self.hits.fetch_add(1, Ordering::Relaxed);
             return Some(CacheHit {
@@ -283,7 +298,7 @@ mod tests {
 
     #[test]
     fn caches_and_returns_with_decreasing_ttl() {
-        let cache = DnsCache::new(100, 0, 0, false);
+        let cache = DnsCache::new(100, 0, 0, false, 0);
         cache.insert(key("a.com."), &answer("a.com.", 100));
         let hit = cache.get(&key("a.com.")).unwrap();
         assert!(!hit.stale);
@@ -293,7 +308,7 @@ mod tests {
 
     #[test]
     fn min_ttl_clamp_raises_short_ttls() {
-        let cache = DnsCache::new(100, 60, 0, false);
+        let cache = DnsCache::new(100, 60, 0, false, 0);
         cache.insert(key("b.com."), &answer("b.com.", 5));
         let hit = cache.get(&key("b.com.")).unwrap();
         assert!(hit.message.answers[0].ttl >= 59);
@@ -301,7 +316,7 @@ mod tests {
 
     #[test]
     fn max_ttl_clamp_caps_long_ttls() {
-        let cache = DnsCache::new(100, 0, 100, false);
+        let cache = DnsCache::new(100, 0, 100, false, 0);
         cache.insert(key("c.com."), &answer("c.com.", 100_000));
         let hit = cache.get(&key("c.com.")).unwrap();
         assert!(hit.message.answers[0].ttl <= 100);
@@ -309,7 +324,7 @@ mod tests {
 
     #[test]
     fn expired_entry_is_a_miss_without_optimistic() {
-        let cache = DnsCache::new(100, 0, 0, false);
+        let cache = DnsCache::new(100, 0, 0, false, 0);
         // TTL 0 won't cache; use a 1s ttl but simulate expiry via min/max=... we
         // instead insert with ttl then force expiry by zero remaining.
         cache.insert(key("d.com."), &answer("d.com.", 1));
@@ -320,7 +335,7 @@ mod tests {
 
     #[test]
     fn does_not_cache_servfail() {
-        let cache = DnsCache::new(100, 0, 0, false);
+        let cache = DnsCache::new(100, 0, 0, false, 0);
         let mut m = answer("e.com.", 100);
         m.answers.clear();
         m.metadata.response_code = ResponseCode::ServFail;
@@ -330,7 +345,7 @@ mod tests {
 
     #[test]
     fn negative_response_uses_default_ttl() {
-        let cache = DnsCache::new(100, 0, 0, false);
+        let cache = DnsCache::new(100, 0, 0, false, 0);
         let mut m = answer("f.com.", 100);
         m.answers.clear();
         m.metadata.response_code = ResponseCode::NXDomain;
@@ -341,11 +356,49 @@ mod tests {
 
     #[test]
     fn reconfigure_disables_and_clears() {
-        let cache = DnsCache::new(100, 0, 0, false);
+        let cache = DnsCache::new(100, 0, 0, false, 0);
         cache.insert(key("g.com."), &answer("g.com.", 100));
         assert_eq!(cache.len(), 1);
-        cache.reconfigure(false, 100, 0, 0, false);
+        cache.reconfigure(false, 100, 0, 0, false, 0);
         assert!(cache.get(&key("g.com.")).is_none());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn optimistic_serves_stale_within_window() {
+        // TTL 0 normally wouldn't cache; use a tiny ttl and a generous stale
+        // window. An expired entry should be served stale (and flagged) when
+        // optimistic + within window, then become a miss once the window passes.
+        let cache = DnsCache::new(100, 0, 0, true, 3600);
+        // Insert with ttl 1, then force expiry by mutating stored_at.
+        cache.insert(key("h.com."), &answer("h.com.", 1));
+        {
+            let mut map = cache.map.lock();
+            let e = map.get_mut(&key("h.com.")).unwrap();
+            e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
+        }
+        let hit = cache.get(&key("h.com.")).expect("stale hit");
+        assert!(hit.stale);
+
+        // Now push it beyond the stale window -> miss.
+        cache.insert(key("h.com."), &answer("h.com.", 1));
+        {
+            let mut map = cache.map.lock();
+            let e = map.get_mut(&key("h.com.")).unwrap();
+            e.stored_at = Instant::now() - std::time::Duration::from_secs(7200);
+        }
+        assert!(cache.get(&key("h.com.")).is_none());
+    }
+
+    #[test]
+    fn stale_window_zero_disables_serve_stale() {
+        let cache = DnsCache::new(100, 0, 0, true, 0);
+        cache.insert(key("i.com."), &answer("i.com.", 1));
+        {
+            let mut map = cache.map.lock();
+            let e = map.get_mut(&key("i.com.")).unwrap();
+            e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
+        }
+        assert!(cache.get(&key("i.com.")).is_none());
     }
 }

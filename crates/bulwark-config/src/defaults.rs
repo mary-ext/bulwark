@@ -55,6 +55,11 @@ pub(crate) fn default_max_ttl() -> u32 {
     86_400
 }
 
+/// Default serve-stale window: 24h past expiry.
+pub(crate) fn default_stale_max_age() -> u32 {
+    86_400
+}
+
 pub(crate) fn default_log_size() -> usize {
     10_000
 }

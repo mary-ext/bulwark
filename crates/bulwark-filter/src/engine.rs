@@ -46,9 +46,14 @@ pub struct FilterEngine {
     /// Reverse index: token hash -> wildcard rule ids bucketed under that token.
     /// Only queries sharing a token need check these rules.
     scan_index: HashMap<u32, Vec<u32>, ahash::RandomState>,
-    /// Wildcard rules without a safe token + all regex rules: scanned for every
-    /// query (kept small in practice).
+    /// Wildcard rules without a safe token + all regex rules: checked for every
+    /// query (kept small in practice). `fallback_set` (a `RegexSet`) matches all
+    /// of them in a single pass and reports *which* matched (preserving rule
+    /// attribution); `scan_fallback[i]` is the rule id for set pattern `i`. If
+    /// the `RegexSet` failed to build (e.g. size limit), `fallback_set` is
+    /// `None` and we fall back to checking each rule individually.
     scan_fallback: Vec<u32>,
+    fallback_set: Option<regex::RegexSet>,
 }
 
 /// Returns true if `domain` equals `base` or is a subdomain of it.
@@ -104,12 +109,35 @@ impl FilterEngine {
             }
         }
 
+        // Build a RegexSet over the fallback rules so they can be matched in a
+        // single pass (adblock-rust-style fusion, but the set tells us *which*
+        // rule matched, so we keep per-rule attribution).
+        let fallback_patterns: Vec<&str> = scan_fallback
+            .iter()
+            .filter_map(|&id| match &rules[id as usize].pattern {
+                Pattern::Wildcard(re) | Pattern::Regex(re) => Some(re.as_str()),
+                _ => None,
+            })
+            .collect();
+        let fallback_set = if fallback_patterns.is_empty() {
+            None
+        } else {
+            regex::RegexSet::new(&fallback_patterns).ok()
+        };
+
+        // The signature strings are only needed during compilation (badfilter
+        // pairing + dedup); drop them to save memory on large rule sets.
+        for rule in rules.iter_mut() {
+            rule.signature = String::new();
+        }
+
         FilterEngine {
             rules,
             subdomain,
             exact,
             scan_index,
             scan_fallback,
+            fallback_set,
         }
     }
 
@@ -137,7 +165,7 @@ impl FilterEngine {
             }
         }
 
-        // Wildcard/regex rules: always-scan fallback + token-indexed candidates.
+        // Wildcard/regex rules: always-checked fallback + token-indexed.
         let check = |id: u32, out: &mut Vec<u32>| {
             let matched = match &self.rules[id as usize].pattern {
                 Pattern::Wildcard(re) | Pattern::Regex(re) => re.is_match(domain),
@@ -147,8 +175,18 @@ impl FilterEngine {
                 out.push(id);
             }
         };
-        for &id in &self.scan_fallback {
-            check(id, out);
+        // Fallback set: one RegexSet pass instead of N individual matches.
+        match &self.fallback_set {
+            Some(set) => {
+                for idx in set.matches(domain) {
+                    out.push(self.scan_fallback[idx]);
+                }
+            }
+            None => {
+                for &id in &self.scan_fallback {
+                    check(id, out);
+                }
+            }
         }
         if !self.scan_index.is_empty() {
             for tok in crate::token::tokenize_query(domain) {

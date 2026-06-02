@@ -26,6 +26,7 @@ export interface CacheCfg {
   min_ttl_secs: number;
   max_ttl_secs: number;
   optimistic: boolean;
+  optimistic_max_age_secs: number;
 }
 
 export type BlockingMode = "nx_domain" | "null_ip" | "custom_ip" | "refused" | "no_data";

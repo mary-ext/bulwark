@@ -34,6 +34,30 @@ that's an orthogonal optimisation that further reduces upstream load.
 
 ---
 
+## Follow-up enhancements (post-Phase-9)
+
+- **Configurable optimistic-cache retention**: the serve-stale window was a
+  hard-coded 30h constant; it's now `cache.optimistic_max_age_secs` (default
+  24h), plumbed through `DnsCache` as an atomic and editable in Settings. It
+  bounds *staleness* (how long past expiry a stale answer may be served); total
+  memory is independently bounded by the LRU `size`. `0` disables serve-stale.
+- **Query log** already covers the asks: searchable by domain substring and by
+  client (IP **or** name), blocked-only filter, and each entry records the
+  action (blocked/cached/forwarded/rewritten/error), the upstream that answered
+  (or `cache`), the matched rule, rcode, answers, and processing time — verified
+  live.
+- **Second adblock-rust pass**:
+  - *Compile-time de-duplication* of identical rules by signature (huge for
+    overlapping blocklists; first occurrence keeps attribution).
+  - *`RegexSet` fallback*: the always-checked wildcard/regex fallback bucket is
+    now matched with a single `regex::RegexSet` pass that reports *which*
+    patterns matched — so we keep per-rule attribution while turning N regex
+    evals into one (adblock fuses into an alternation but loses attribution; the
+    `RegexSet` gives us both). Falls back to per-rule checks if the set can't
+    build.
+  - Dropped the compile-only `signature` strings from rules after build to cut
+    memory on large lists.
+
 ## Phase 1 — filter engine — DONE
 
 Design:

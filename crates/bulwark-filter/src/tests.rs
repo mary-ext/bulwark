@@ -243,6 +243,30 @@ fn multi_list_stats_and_priority() {
 }
 
 #[test]
+fn duplicate_rules_are_deduplicated() {
+    // The same domain across several lists should collapse to one rule.
+    let mut c = Compiler::new();
+    c.add_list(1, "a", "||ads.example.com^\n0.0.0.0 dup.test");
+    c.add_list(2, "b", "||ads.example.com^\n0.0.0.0 dup.test");
+    c.add_list(3, "c", "||ads.example.com^");
+    let (engine, _) = c.build();
+    // Three identical block rules + two identical host rules -> 2 active rules.
+    assert_eq!(engine.len(), 2);
+    assert!(engine.check("ads.example.com", "A", &ci()).is_blocked());
+    assert!(engine.check("dup.test", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn regexset_fallback_matches_multiple_regex_rules() {
+    // Several regex rules land in the fallback RegexSet; all must still match.
+    let e = compile_one("/^ads?\\./\n/tracker/\n/^[0-9]+cdn/");
+    assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
+    assert!(e.check("x.tracker.net", "A", &ci()).is_blocked());
+    assert!(e.check("123cdn.example.com", "A", &ci()).is_blocked());
+    assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
 fn wildcard_reverse_index_correctness() {
     // Mix of wildcard rules; the token index must not change results vs a scan.
     let e = compile_one(
