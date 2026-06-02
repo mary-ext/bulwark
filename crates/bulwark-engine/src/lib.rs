@@ -67,6 +67,21 @@ fn summarize(rec: &hickory_proto::rr::Record) -> String {
     format!("{} {}", rec.record_type(), rec.data)
 }
 
+/// The display label for a response code, avoiding a `format!`/`to_uppercase`
+/// allocation pair on the hot path for the codes we actually emit.
+fn rcode_label(code: ResponseCode) -> String {
+    let s = match code {
+        ResponseCode::NoError => "NOERROR",
+        ResponseCode::FormErr => "FORMERR",
+        ResponseCode::ServFail => "SERVFAIL",
+        ResponseCode::NXDomain => "NXDOMAIN",
+        ResponseCode::NotImp => "NOTIMP",
+        ResponseCode::Refused => "REFUSED",
+        other => return format!("{other:?}").to_uppercase(),
+    };
+    s.to_string()
+}
+
 impl Engine {
     pub fn new(
         state: EngineState,
@@ -120,9 +135,13 @@ impl Engine {
         let rtype = question.query_type();
         let rtype_str = rtype.to_string();
         let qname_display = question.name().to_ascii();
-        let domain = qname_display.trim_end_matches('.').to_ascii_lowercase();
+        // Normalize the name once (lowercased, dot-terminated) and reuse it for
+        // both filtering and the cache/single-flight key. `domain` is a borrow
+        // into it, so the common path allocates the name exactly once.
+        let name_lower = qname_display.to_ascii_lowercase();
+        let domain = name_lower.trim_end_matches('.');
 
-        let mut log = LogBuilder::new(&client, &qname_display, &rtype_str);
+        let mut log = LogBuilder::new(&client, qname_display, &rtype_str);
 
         // ---- Filtering ----
         if state.filtering_enabled && client.filtering_enabled {
@@ -131,7 +150,7 @@ impl Engine {
                 name: client.name.as_deref(),
                 tags: &client.tags,
             };
-            match state.filter.check(&domain, &rtype_str, &ci) {
+            match state.filter.check(domain, &rtype_str, &ci) {
                 Verdict::Block(info) => {
                     let resp = block_response(
                         &query,
@@ -167,31 +186,33 @@ impl Engine {
         }
 
         // ---- Cache ----
-        let key = QueryKey::from_message(&query);
-        if let Some(key) = &key {
-            if let Some(hit) = self.cache.get(key) {
-                let mut resp = hit.message;
-                resp.metadata.id = query.metadata.id;
-                if hit.stale {
-                    // Optimistic: refresh in the background (single-flight in the
-                    // pool ensures only one upstream request).
-                    self.spawn_refresh(state.pool.clone(), query.clone(), key.clone());
-                }
-                return self.finalize(resp, QueryAction::Cached, log, start);
+        // Built from the name we already normalized above — no second wire-walk
+        // or lowercase pass.
+        let key = QueryKey {
+            name: name_lower,
+            rtype,
+            class: question.query_class(),
+        };
+        if let Some(hit) = self.cache.get(&key) {
+            let mut resp = hit.message;
+            resp.metadata.id = query.metadata.id;
+            if hit.stale {
+                // Optimistic: refresh in the background (single-flight in the
+                // pool ensures only one upstream request).
+                self.spawn_refresh(state.pool.clone(), query.clone(), key.clone());
             }
+            return self.finalize(resp, QueryAction::Cached, log, start);
         }
 
         // ---- Upstream ----
         match state.pool.resolve(&query).await {
             Ok(resolved) => {
-                if let Some(key) = key {
-                    self.cache.insert(key, &resolved.message);
-                }
+                self.cache.insert(key, &resolved.message);
                 log.upstream = Some(resolved.upstream);
                 self.finalize(resolved.message, QueryAction::Forwarded, log, start)
             }
             Err(e) => {
-                tracing::debug!(%domain, error = %e, "upstream resolution failed");
+                tracing::debug!(name = %key.name, error = %e, "upstream resolution failed");
                 let resp = error_response(&query, ResponseCode::ServFail);
                 self.finalize(resp, QueryAction::Error, log, start)
             }
@@ -237,7 +258,7 @@ impl Engine {
     ) -> Message {
         log.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         log.action = action;
-        log.rcode = format!("{:?}", resp.metadata.response_code).to_uppercase();
+        log.rcode = rcode_label(resp.metadata.response_code);
         log.answers = resp.answers.iter().map(summarize).collect();
         log.cached = matches!(action, QueryAction::Cached);
 
@@ -266,11 +287,11 @@ struct LogBuilder {
 }
 
 impl LogBuilder {
-    fn new(client: &ResolvedClient, question: &str, qtype: &str) -> Self {
+    fn new(client: &ResolvedClient, question: String, qtype: &str) -> Self {
         Self {
             client_ip: client.ip.to_string(),
             client_name: client.name.clone(),
-            question: question.to_string(),
+            question,
             qtype: qtype.to_string(),
             action: QueryAction::Forwarded,
             allowlisted: false,
