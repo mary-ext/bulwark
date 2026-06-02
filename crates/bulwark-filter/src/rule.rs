@@ -142,6 +142,12 @@ pub enum RewriteData {
     Aaaa(Ipv6Addr),
     /// Force a CNAME answer (the engine resolves the target).
     Cname(String),
+    /// Force a TXT answer.
+    Txt(String),
+    /// Force an MX answer (`preference exchange`).
+    Mx { preference: u16, exchange: String },
+    /// Force a PTR answer (a hostname).
+    Ptr(String),
     /// Force a specific response code (NXDOMAIN / REFUSED / NOERROR / SERVFAIL).
     Rcode(RewriteRcode),
 }

@@ -34,6 +34,23 @@ that's an orthogonal optimisation that further reduces upstream load.
 
 ---
 
+## AdGuard Home rule-parity check (round 3)
+
+Cloned AdGuardHome + AdguardTeam/urlfilter (its rule parser) to `/tmp` and
+compared. urlfilter's option table shows the DNS-relevant modifiers are:
+`important, badfilter, dnstype, dnsrewrite, denyallow, ctag, client` — **all of
+which Bulwark supports** (`$important` = priority +100; `@@` exceptions =
+unblocking; both confirmed). The rest in urlfilter's table are HTTP/cosmetic
+(`script`, `image`, `third-party`, `elemhide`, `domain`, …) and irrelevant to
+DNS — we skip those rules as `Unsupported` rather than mis-match them.
+
+`$dnsrewrite`: AGH's `dnsrewrite.go` handles RCODEs + A/AAAA/CNAME/TXT/MX/PTR/
+HTTPS/SVCB/SRV. We had A/AAAA/CNAME + RCODEs; **added TXT, MX, PTR** (parse +
+response synthesis in `block.rs`). Left HTTPS/SVCB/SRV out for now — their
+parameterised values (SvcParams, target/port/priority) are involved and rarely
+used for a DNS filter; the parser reports them as unsupported rather than
+guessing.
+
 ## Follow-up enhancements (round 2)
 
 - **Query-log list attribution**: each entry already carried the matching `rule`

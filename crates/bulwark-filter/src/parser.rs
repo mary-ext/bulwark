@@ -404,7 +404,7 @@ fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
         return Ok(ip_rewrite(ip));
     }
     // Full form: `RCODE;TYPE;VALUE` (e.g. `NOERROR;A;1.2.3.4`).
-    let segs: Vec<&str> = v.split(';').collect();
+    let segs: Vec<&str> = v.splitn(3, ';').collect();
     if segs.len() == 3 {
         let rtype = segs[1].to_ascii_uppercase();
         let data = segs[2];
@@ -422,6 +422,23 @@ fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
                 return Ok(RewriteData::Aaaa(ip));
             }
             "CNAME" => return Ok(RewriteData::Cname(norm_domain(data))),
+            "TXT" => return Ok(RewriteData::Txt(data.trim_matches('"').to_string())),
+            "PTR" => return Ok(RewriteData::Ptr(norm_domain(data))),
+            "MX" => {
+                // `<preference> <exchange>`, e.g. `10 mail.example.com`.
+                let mut it = data.split_whitespace();
+                let preference: u16 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| ParseError::Invalid(format!("bad MX in dnsrewrite: {data}")))?;
+                let exchange = it
+                    .next()
+                    .ok_or_else(|| ParseError::Invalid(format!("bad MX in dnsrewrite: {data}")))?;
+                return Ok(RewriteData::Mx {
+                    preference,
+                    exchange: norm_domain(exchange),
+                });
+            }
             _ => {}
         }
     }

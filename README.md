@@ -146,11 +146,25 @@ Bulwark understands:
 - **AdBlock-style**: `||ads.example.com^`, `@@||allow.example.com^`,
   `*.tracker.com`, `/^ads?\d*\./`.
 - **Modifiers**: `$important`, `$badfilter`, `$dnstype=A|AAAA`,
-  `$dnsrewrite=NOERROR;A;1.2.3.4`, `$client=10.0.0.0/24|laptop`,
-  `$ctag=device_kids`, `$denyallow=good.example.com`.
+  `$dnsrewrite=…`, `$client=10.0.0.0/24|laptop`, `$ctag=device_kids`,
+  `$denyallow=good.example.com`.
+- **`$dnsrewrite`** supports response-code keywords (`NOERROR`, `NXDOMAIN`,
+  `REFUSED`, `SERVFAIL`), short-form IPs (`1.2.3.4`, `::1`), and full-form
+  `RCODE;TYPE;VALUE` for `A`, `AAAA`, `CNAME`, `TXT`, `MX`, `PTR`.
 
 Rule priority follows AdGuard: `$important` > `@@` exceptions > basic rules;
 `$badfilter` cancels a matching rule; `$denyallow` carves out exceptions.
+
+### AdGuard Home parity
+
+Bulwark supports AdGuard Home's **complete DNS-relevant modifier set**
+(`$important`, `$badfilter`, `$dnstype`, `$dnsrewrite`, `$denyallow`, `$ctag`,
+`$client`) and all DNS rule forms (adblock-style, hosts, bare domains,
+wildcards, `/regex/`, and `@@` exceptions). The only intentional gaps are
+`$dnsrewrite` to the exotic record types `HTTPS`/`SVCB`/`SRV` (rare; their
+parameterised values aren't synthesised yet) and HTTP/cosmetic-only modifiers
+(`$script`, `$third-party`, element hiding, …), which are irrelevant to DNS and
+are safely skipped rather than mis-applied.
 
 ## Development
 

@@ -138,6 +138,33 @@ fn dnsrewrite_full_form_and_rcodes() {
 }
 
 #[test]
+fn dnsrewrite_txt_mx_ptr() {
+    let e = compile_one(
+        "||a.com^$dnsrewrite=NOERROR;TXT;hello world\n\
+         ||b.com^$dnsrewrite=NOERROR;MX;10 mail.b.com\n\
+         ||c.com^$dnsrewrite=NOERROR;PTR;host.c.com",
+    );
+    assert!(matches!(
+        e.check("a.com", "TXT", &ci()),
+        Verdict::Rewrite { data: RewriteData::Txt(t), .. } if t == "hello world"
+    ));
+    assert!(matches!(
+        e.check("b.com", "MX", &ci()),
+        Verdict::Rewrite {
+            data: RewriteData::Mx { preference: 10, .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        e.check("c.com", "PTR", &ci()),
+        Verdict::Rewrite {
+            data: RewriteData::Ptr(_),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn client_modifier_by_ip() {
     let e = compile_one("||example.com^$client=10.0.0.5");
     let ip: IpAddr = "10.0.0.5".parse().unwrap();

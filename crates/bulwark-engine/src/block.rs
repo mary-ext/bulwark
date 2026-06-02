@@ -6,7 +6,7 @@ use std::str::FromStr;
 use bulwark_config::BlockingMode;
 use bulwark_filter::{RewriteData, RewriteRcode};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, PTR, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 /// Build a response shell echoing the query's id, question, and EDNS.
@@ -116,6 +116,38 @@ pub fn rewrite_response(query: &Message, data: &RewriteData, ttl: u32) -> Rewrit
             if qt == RecordType::AAAA {
                 m.answers
                     .push(Record::from_rdata(name, ttl, RData::AAAA(AAAA(*ip))));
+            }
+            Rewritten::Done(m)
+        }
+        RewriteData::Txt(text) => {
+            if qt == RecordType::TXT {
+                m.answers.push(Record::from_rdata(
+                    name,
+                    ttl,
+                    RData::TXT(TXT::new(vec![text.clone()])),
+                ));
+            }
+            Rewritten::Done(m)
+        }
+        RewriteData::Mx {
+            preference,
+            exchange,
+        } => {
+            if qt == RecordType::MX {
+                let ex = Name::from_str(exchange).unwrap_or_else(|_| Name::root());
+                m.answers.push(Record::from_rdata(
+                    name,
+                    ttl,
+                    RData::MX(MX::new(*preference, ex)),
+                ));
+            }
+            Rewritten::Done(m)
+        }
+        RewriteData::Ptr(target) => {
+            if qt == RecordType::PTR {
+                let t = Name::from_str(target).unwrap_or_else(|_| Name::root());
+                m.answers
+                    .push(Record::from_rdata(name, ttl, RData::PTR(PTR(t))));
             }
             Rewritten::Done(m)
         }
