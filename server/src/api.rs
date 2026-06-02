@@ -585,7 +585,35 @@ async fn get_querylog(State(state): State<AppState>, Query(q): Query<LogQuery>) 
         .engine
         .log()
         .query(&filter, q.offset, q.limit.min(1000));
-    Json(json!({ "entries": page.entries, "total": page.total }))
+
+    // Resolve list ids to friendly names so the UI can show which list (and
+    // which rule) was responsible. A block is one winning rule from one list;
+    // id 0 is the user's custom rules.
+    let names: std::collections::HashMap<u32, String> = {
+        let cfg = state.config.read().await;
+        let mut m: std::collections::HashMap<u32, String> = cfg
+            .filtering
+            .lists
+            .iter()
+            .map(|l| (l.id, l.name.clone()))
+            .collect();
+        m.insert(0, "Custom rules".to_string());
+        m
+    };
+    let entries: Vec<Value> = page
+        .entries
+        .iter()
+        .map(|e| {
+            let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
+            if let (Value::Object(map), Some(id)) = (&mut v, e.list_id) {
+                if let Some(name) = names.get(&id) {
+                    map.insert("list_name".into(), json!(name));
+                }
+            }
+            v
+        })
+        .collect();
+    Json(json!({ "entries": entries, "total": page.total }))
 }
 
 async fn clear_querylog(State(state): State<AppState>) -> Json<Value> {

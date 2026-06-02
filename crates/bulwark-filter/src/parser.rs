@@ -113,27 +113,28 @@ fn try_parse_hosts(line: &str) -> Option<Vec<Rule>> {
         if domain.is_empty() || HOSTS_NOISE.contains(&domain.as_str()) {
             continue;
         }
-        let (action, rewrite) = if block {
+        let (action, mods) = if block {
             (Action::Block, None)
         } else {
             let rw = match ip {
                 IpAddr::V4(v4) => RewriteData::A(v4),
                 IpAddr::V6(v6) => RewriteData::Aaaa(v6),
             };
-            (Action::Rewrite, Some(rw))
+            (
+                Action::Rewrite,
+                Some(Box::new(RuleMods {
+                    rewrite: Some(rw),
+                    ..Default::default()
+                })),
+            )
         };
         rules.push(Rule {
             id: 0,
             raw: format!("{first} {host}"),
             action,
             pattern: Pattern::Exact(domain.clone()),
-            dnstype: None,
-            client: None,
-            ctag: None,
-            denyallow: Vec::new(),
-            important: false,
+            mods,
             badfilter: false,
-            rewrite,
             list_id: 0,
             signature: format!("hosts|{domain}|{}", if block { "block" } else { "rewrite" }),
             index_tokens: Vec::new(),
@@ -175,41 +176,27 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
     let signature = make_signature(action, pattern_str, mods_str);
 
     let (pattern, index_tokens) = parse_pattern(pattern_str)?;
-    let mut rule = Rule {
-        id: 0,
-        raw: line.to_string(),
-        action,
-        pattern,
-        dnstype: None,
-        client: None,
-        ctag: None,
-        denyallow: Vec::new(),
-        important: false,
-        badfilter: false,
-        rewrite: None,
-        list_id: 0,
-        signature,
-        index_tokens,
-    };
+    let mut badfilter = false;
+    let mut m = RuleMods::default();
 
     if let Some(mods) = mods_str {
-        for m in mods.split(',') {
-            let m = m.trim();
-            if m.is_empty() {
+        for tok in mods.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
                 continue;
             }
-            let (key, value) = match m.split_once('=') {
+            let (key, value) = match tok.split_once('=') {
                 Some((k, v)) => (k, Some(v)),
-                None => (m, None),
+                None => (tok, None),
             };
             match key {
-                "important" => rule.important = true,
-                "badfilter" => rule.badfilter = true,
-                "dnstype" => rule.dnstype = Some(parse_dnstype(value.unwrap_or(""))),
-                "client" => rule.client = Some(parse_client(value.unwrap_or(""))?),
-                "ctag" => rule.ctag = Some(parse_ctag(value.unwrap_or(""))),
+                "important" => m.important = true,
+                "badfilter" => badfilter = true,
+                "dnstype" => m.dnstype = Some(parse_dnstype(value.unwrap_or(""))),
+                "client" => m.client = Some(parse_client(value.unwrap_or(""))?),
+                "ctag" => m.ctag = Some(parse_ctag(value.unwrap_or(""))),
                 "denyallow" => {
-                    rule.denyallow = value
+                    m.denyallow = value
                         .unwrap_or("")
                         .split('|')
                         .filter(|s| !s.is_empty())
@@ -217,9 +204,9 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
                         .collect();
                 }
                 "dnsrewrite" => {
-                    rule.rewrite = Some(parse_dnsrewrite(value.unwrap_or(""))?);
-                    if rule.action == Action::Block {
-                        rule.action = Action::Rewrite;
+                    m.rewrite = Some(parse_dnsrewrite(value.unwrap_or(""))?);
+                    if action == Action::Block {
+                        action = Action::Rewrite;
                     }
                 }
                 // HTTP/cosmetic-only modifiers are irrelevant to DNS filtering;
@@ -228,6 +215,22 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
             }
         }
     }
+
+    let rule = Rule {
+        id: 0,
+        raw: line.to_string(),
+        action,
+        pattern,
+        mods: if m.is_empty() {
+            None
+        } else {
+            Some(Box::new(m))
+        },
+        badfilter,
+        list_id: 0,
+        signature,
+        index_tokens,
+    };
 
     Ok(Parsed::Rules(vec![rule]))
 }

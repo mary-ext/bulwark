@@ -125,10 +125,12 @@ impl FilterEngine {
             regex::RegexSet::new(&fallback_patterns).ok()
         };
 
-        // The signature strings are only needed during compilation (badfilter
-        // pairing + dedup); drop them to save memory on large rule sets.
+        // The signature strings and index tokens are only needed during
+        // compilation; drop them to save memory on large rule sets.
         for rule in rules.iter_mut() {
             rule.signature = String::new();
+            rule.signature.shrink_to_fit();
+            rule.index_tokens = Vec::new();
         }
 
         FilterEngine {
@@ -201,27 +203,28 @@ impl FilterEngine {
 
     /// Is `rule` applicable to this query (modifiers, client, denyallow)?
     fn applicable(&self, rule: &Rule, domain: &str, rtype: &str, client: &ClientInfo<'_>) -> bool {
-        if let Some(f) = &rule.dnstype {
+        // Plain rules (no modifiers) always apply — the common, fast path.
+        let Some(m) = &rule.mods else {
+            return true;
+        };
+        if let Some(f) = &m.dnstype {
             if !f.matches(rtype) {
                 return false;
             }
         }
-        if let Some(f) = &rule.client {
+        if let Some(f) = &m.client {
             if !f.matches(client) {
                 return false;
             }
         }
-        if let Some(f) = &rule.ctag {
+        if let Some(f) = &m.ctag {
             if !f.matches(client.tags) {
                 return false;
             }
         }
         // `$denyallow`: the (blocking) rule does *not* apply to these domains.
         if matches!(rule.action, Action::Block | Action::Rewrite)
-            && rule
-                .denyallow
-                .iter()
-                .any(|base| is_subdomain_of(domain, base))
+            && m.denyallow.iter().any(|base| is_subdomain_of(domain, base))
         {
             return false;
         }
@@ -239,22 +242,33 @@ impl FilterEngine {
             domain
         };
 
-        let mut candidates = Vec::new();
-        self.collect_candidates(domain, &mut candidates);
-
-        let mut best: Option<&Rule> = None;
-        for &id in &candidates {
-            let rule = &self.rules[id as usize];
-            if !self.applicable(rule, domain, rtype, client) {
-                continue;
-            }
-            match best {
-                Some(b) if rule.priority() <= b.priority() => {}
-                _ => best = Some(rule),
-            }
+        // Reuse a per-thread scratch buffer to avoid allocating on every query.
+        thread_local! {
+            static CANDIDATES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
         }
 
-        match best {
+        let best_id = CANDIDATES.with(|cell| {
+            let mut candidates = cell.borrow_mut();
+            candidates.clear();
+            self.collect_candidates(domain, &mut candidates);
+
+            let mut best: Option<u32> = None;
+            let mut best_prio = 0u32;
+            for &id in candidates.iter() {
+                let rule = &self.rules[id as usize];
+                if !self.applicable(rule, domain, rtype, client) {
+                    continue;
+                }
+                let prio = rule.priority();
+                if best.is_none() || prio > best_prio {
+                    best = Some(id);
+                    best_prio = prio;
+                }
+            }
+            best
+        });
+
+        match best_id.map(|id| &self.rules[id as usize]) {
             None => Verdict::Allow { rule: None },
             Some(rule) => {
                 let info = MatchInfo {
@@ -268,8 +282,8 @@ impl FilterEngine {
                     Action::Rewrite => Verdict::Rewrite {
                         info,
                         data: rule
-                            .rewrite
-                            .clone()
+                            .rewrite()
+                            .cloned()
                             .expect("rewrite rule must carry rewrite data"),
                     },
                 }

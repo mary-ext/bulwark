@@ -87,7 +87,8 @@
         <th>Type</th>
         <th>Client</th>
         <th>Status</th>
-        <th>Result</th>
+        <th>Rule / result</th>
+        <th>List</th>
         <th>Upstream</th>
         <th>Time</th>
       </tr>
@@ -105,12 +106,15 @@
           <td class="mono muted" title={e.rule ?? e.answers.join(", ")}>
             {#if e.rule}{e.rule}{:else}{e.answers[0] ?? e.rcode}{/if}
           </td>
+          <td class="muted" title={e.list_name ?? ""}>
+            {#if e.rule}{e.list_name ?? "—"}{:else}—{/if}
+          </td>
           <td class="muted">{e.upstream ?? (e.cached ? "cache" : "—")}</td>
           <td class="muted">{ms(e.elapsed_ms)}</td>
         </tr>
       {/each}
       {#if entries.length === 0}
-        <tr><td colspan="8" class="muted" style="text-align:center;padding:2rem">No matching queries.</td></tr>
+        <tr><td colspan="9" class="muted" style="text-align:center;padding:2rem">No matching queries.</td></tr>
       {/if}
     </tbody>
   </table>

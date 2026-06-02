@@ -34,7 +34,34 @@ that's an orthogonal optimisation that further reduces upstream load.
 
 ---
 
-## Follow-up enhancements (post-Phase-9)
+## Follow-up enhancements (round 2)
+
+- **Query-log list attribution**: each entry already carried the matching `rule`
+  text + `list_id`; the query-log API now resolves `list_id → list name`
+  (id 0 = "Custom rules") and the UI shows a **List** column. A block is one
+  winning rule from one list (after de-dup, the first list that defined it), so
+  we attribute to that — no ambiguous "blocked by N lists".
+- **Serialized snapshots — decided against.** adblock-rust serializes (its
+  `.dat` = magic+version+seahash+flatbuffer) mainly for *instant client cold
+  start* (browser extension / mobile re-parsing 100k+ network+cosmetic rules on
+  every launch) and as a zero-copy in-memory layout. Bulwark is a long-running
+  server; measured build is ~0.68s for 200k rules (incl. 5k regex compiles),
+  amortised over days of uptime — so a snapshot is low ROI. We borrowed the part
+  that *does* help a server (memory compactness) instead.
+- **Hot-path + memory optimization** (the part of adblock's design worth taking):
+  - `Rule`'s modifier cluster (`dnstype/client/ctag/denyallow/rewrite/important`)
+    is boxed into `Option<Box<RuleMods>>`. The overwhelming majority of blocklist
+    rules carry no modifiers, so the common rule shrinks to id/raw/action/
+    pattern/list_id + a null pointer; `applicable()` early-returns on `None`.
+  - Build-only `signature` strings and `index_tokens` are dropped after the
+    engine is built.
+  - `check()` uses a per-thread reusable scratch buffer for candidate ids, so
+    steady-state lookups don't allocate.
+  - Measured: 200k rules, **~0.34µs/query non-matching, ~0.65µs/query matching**
+    (incl. the bench's own per-iteration string alloc). See
+    `server/examples/bench_filter.rs`.
+
+## Follow-up enhancements (round 1)
 
 - **Configurable optimistic-cache retention**: the serve-stale window was a
   hard-coded 30h constant; it's now `cache.optimistic_max_age_secs` (default

@@ -155,6 +155,32 @@ pub enum RewriteRcode {
     ServFail,
 }
 
+/// The optional modifier cluster of a rule. The vast majority of blocklist
+/// rules (`||domain^`, hosts entries) carry *none* of these, so we box this
+/// behind `Option<Box<RuleMods>>` on [`Rule`] to keep the common rule small.
+#[derive(Debug, Clone, Default)]
+pub struct RuleMods {
+    pub important: bool,
+    pub dnstype: Option<DnsTypeFilter>,
+    pub client: Option<ClientFilter>,
+    pub ctag: Option<CtagFilter>,
+    /// `$denyallow=` domains excluded from this (blocking) rule.
+    pub denyallow: Vec<String>,
+    pub rewrite: Option<RewriteData>,
+}
+
+impl RuleMods {
+    /// True when no modifier is set (so we can store `None` instead of boxing).
+    pub fn is_empty(&self) -> bool {
+        !self.important
+            && self.dnstype.is_none()
+            && self.client.is_none()
+            && self.ctag.is_none()
+            && self.denyallow.is_empty()
+            && self.rewrite.is_none()
+    }
+}
+
 /// A fully-parsed filtering rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -164,22 +190,19 @@ pub struct Rule {
     pub raw: String,
     pub action: Action,
     pub pattern: Pattern,
-    pub dnstype: Option<DnsTypeFilter>,
-    pub client: Option<ClientFilter>,
-    pub ctag: Option<CtagFilter>,
-    /// `$denyallow=` domains excluded from this (blocking) rule.
-    pub denyallow: Vec<String>,
-    pub important: bool,
+    /// Optional DNS modifiers; `None` for the common plain-block rule.
+    pub mods: Option<Box<RuleMods>>,
     /// `$badfilter` — this rule disables a matching rule rather than acting.
+    /// (Build-time only; retained rules always have this `false`.)
     pub badfilter: bool,
-    pub rewrite: Option<RewriteData>,
     /// Which loaded list this rule came from.
     pub list_id: u32,
     /// Canonical signature (pattern + sorted modifiers minus badfilter), used to
-    /// pair `$badfilter` rules with the rules they disable.
+    /// pair `$badfilter` rules and de-duplicate. **Build-time only** — cleared
+    /// after the engine is built to save memory.
     pub signature: String,
-    /// Safe interior token hashes for the wildcard reverse index (empty for
-    /// exact/subdomain/regex rules). See [`crate::token`].
+    /// Safe interior token hashes for the wildcard reverse index. **Build-time
+    /// only** — cleared after build.
     pub index_tokens: Vec<u32>,
 }
 
@@ -192,9 +215,14 @@ impl Rule {
             Action::Allow => 2,
             Action::Block | Action::Rewrite => 1,
         };
-        if self.important {
+        if self.mods.as_ref().is_some_and(|m| m.important) {
             score += 100;
         }
         score
+    }
+
+    /// The rewrite data, if this is a rewrite rule.
+    pub fn rewrite(&self) -> Option<&RewriteData> {
+        self.mods.as_ref().and_then(|m| m.rewrite.as_ref())
     }
 }

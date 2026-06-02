@@ -114,6 +114,7 @@ export interface LogEntry {
   answers: string[];
   rule?: string | null;
   list_id?: number | null;
+  list_name?: string | null;
   upstream?: string | null;
   elapsed_ms: number;
   cached: boolean;
