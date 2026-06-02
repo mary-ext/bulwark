@@ -141,15 +141,12 @@ pub struct CacheConfig {
     /// Clamp upper bound for TTLs (seconds); 0 means "no upper clamp".
     #[serde(default = "default_max_ttl")]
     pub max_ttl_secs: u32,
-    /// Optimistic caching (serve-stale): serve expired entries immediately while
-    /// refreshing in the background.
+    /// Optimistic caching (serve-stale): the maximum number of seconds **past
+    /// expiry** that a stale entry may be served immediately while a fresh
+    /// resolve runs in the background. `0` disables serve-stale entirely; any
+    /// value `> 0` enables it and bounds how stale an answer can be (entries are
+    /// never served unbounded).
     #[serde(default)]
-    pub optimistic: bool,
-    /// When optimistic caching is on, the maximum number of seconds **past
-    /// expiry** that a stale entry may still be served before a fresh resolve is
-    /// required. Bounds staleness (entries are never served unbounded); 0
-    /// disables serve-stale even if `optimistic` is true.
-    #[serde(default = "default_stale_max_age")]
     pub optimistic_max_age_secs: u32,
 }
 
@@ -160,8 +157,7 @@ impl Default for CacheConfig {
             size: default_cache_size(),
             min_ttl_secs: 0,
             max_ttl_secs: default_max_ttl(),
-            optimistic: false,
-            optimistic_max_age_secs: default_stale_max_age(),
+            optimistic_max_age_secs: 0,
         }
     }
 }

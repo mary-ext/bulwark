@@ -231,7 +231,7 @@ impl Stats {
 
         match entry.action {
             QueryAction::Cached => s.cached += 1,
-            QueryAction::Rewritten => s.rewritten += 1,
+            QueryAction::Rewritten { .. } => s.rewritten += 1,
             QueryAction::Error => s.errors += 1,
             _ => {}
         }
@@ -251,19 +251,19 @@ impl Stats {
         }
         bump(&mut s.clients, client, 1, cap);
         bump(&mut s.qtypes, &entry.qtype, 1, cap);
-        if let Some(up) = &entry.upstream {
+        if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
             // Avoid cloning the upstream name on the hot (existing-key) path.
             match s.upstream_rtt_sum.get_mut(up) {
                 Some(v) => *v += entry.elapsed_ms,
                 None => {
-                    s.upstream_rtt_sum.insert(up.clone(), entry.elapsed_ms);
+                    s.upstream_rtt_sum.insert(up.to_string(), entry.elapsed_ms);
                 }
             }
             match s.upstream_rtt_count.get_mut(up) {
                 Some(v) => *v += 1,
                 None => {
-                    s.upstream_rtt_count.insert(up.clone(), 1);
+                    s.upstream_rtt_count.insert(up.to_string(), 1);
                 }
             }
         }
@@ -457,7 +457,7 @@ pub struct StatsSummary {
 mod tests {
     use super::*;
 
-    fn entry(q: &str, action: QueryAction, ms: f64, up: Option<&str>) -> QueryLogEntry {
+    fn entry(q: &str, action: QueryAction, ms: f64) -> QueryLogEntry {
         QueryLogEntry {
             id: 0,
             time_ms: 1_700_000_000_000,
@@ -469,26 +469,30 @@ mod tests {
             allowlisted: false,
             rcode: "NOERROR".into(),
             answers: vec![],
-            rule: None,
-            list_id: None,
-            upstream: up.map(|s| s.to_string()),
             elapsed_ms: ms,
-            cached: matches!(action, QueryAction::Cached),
+        }
+    }
+
+    fn blocked() -> QueryAction {
+        QueryAction::Blocked {
+            rule: "||ads^".into(),
+            list_id: 0,
+        }
+    }
+
+    fn forwarded(up: &str) -> QueryAction {
+        QueryAction::Forwarded {
+            upstream: up.to_string(),
         }
     }
 
     #[test]
     fn counts_and_top_n() {
         let s = Stats::new(true, 30);
-        s.record(&entry("ads.com.", QueryAction::Blocked, 0.5, None));
-        s.record(&entry("ads.com.", QueryAction::Blocked, 0.5, None));
-        s.record(&entry(
-            "good.com.",
-            QueryAction::Forwarded,
-            12.0,
-            Some("1.1.1.1"),
-        ));
-        s.record(&entry("good.com.", QueryAction::Cached, 0.1, None));
+        s.record(&entry("ads.com.", blocked(), 0.5));
+        s.record(&entry("ads.com.", blocked(), 0.5));
+        s.record(&entry("good.com.", forwarded("1.1.1.1"), 12.0));
+        s.record(&entry("good.com.", QueryAction::Cached, 0.1));
 
         let snap = s.snapshot(10);
         assert_eq!(snap.total, 4);
@@ -504,12 +508,7 @@ mod tests {
     #[test]
     fn export_import_roundtrip() {
         let s = Stats::new(true, 30);
-        s.record(&entry(
-            "x.com.",
-            QueryAction::Forwarded,
-            3.0,
-            Some("8.8.8.8"),
-        ));
+        s.record(&entry("x.com.", forwarded("8.8.8.8"), 3.0));
         let dump = s.export();
         let s2 = Stats::new(true, 30);
         s2.import(&dump);
@@ -519,8 +518,8 @@ mod tests {
     #[test]
     fn time_series_buckets_by_hour() {
         let s = Stats::new(true, 1);
-        s.record(&entry("x.com.", QueryAction::Forwarded, 1.0, None));
-        s.record(&entry("y.com.", QueryAction::Blocked, 1.0, None));
+        s.record(&entry("x.com.", forwarded("1.1.1.1"), 1.0));
+        s.record(&entry("y.com.", blocked(), 1.0));
         let snap = s.snapshot(10);
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].total, 2);
@@ -537,7 +536,7 @@ mod tests {
             let s = s.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
-                    s.record(&entry("ads.com.", QueryAction::Blocked, 0.5, Some("1.1.1.1")));
+                    s.record(&entry("ads.com.", blocked(), 0.5));
                 }
             }));
         }

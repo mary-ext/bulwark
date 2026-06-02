@@ -159,13 +159,17 @@ impl Engine {
                         state.block_v6,
                         state.blocked_ttl,
                     );
-                    log.rule = Some(info.rule);
-                    log.list_id = Some(info.list_id);
-                    return self.finalize(resp, QueryAction::Blocked, log, start);
+                    let action = QueryAction::Blocked {
+                        rule: info.rule,
+                        list_id: info.list_id,
+                    };
+                    return self.finalize(resp, action, log, start);
                 }
                 Verdict::Rewrite { info, data } => {
-                    log.rule = Some(info.rule);
-                    log.list_id = Some(info.list_id);
+                    let action = QueryAction::Rewritten {
+                        rule: info.rule,
+                        list_id: info.list_id,
+                    };
                     let resp = match rewrite_response(&query, &data, state.blocked_ttl) {
                         Rewritten::Done(m) => m,
                         Rewritten::ResolveCname {
@@ -177,7 +181,7 @@ impl Engine {
                             message
                         }
                     };
-                    return self.finalize(resp, QueryAction::Rewritten, log, start);
+                    return self.finalize(resp, action, log, start);
                 }
                 Verdict::Allow { rule } => {
                     log.allowlisted = rule.is_some();
@@ -208,8 +212,10 @@ impl Engine {
         match state.pool.resolve(&query).await {
             Ok(resolved) => {
                 self.cache.insert(key, &resolved.message);
-                log.upstream = Some(resolved.upstream);
-                self.finalize(resolved.message, QueryAction::Forwarded, log, start)
+                let action = QueryAction::Forwarded {
+                    upstream: resolved.upstream,
+                };
+                self.finalize(resolved.message, action, log, start)
             }
             Err(e) => {
                 tracing::debug!(name = %key.name, error = %e, "upstream resolution failed");
@@ -257,33 +263,28 @@ impl Engine {
         start: Instant,
     ) -> Message {
         log.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        log.action = action;
         log.rcode = rcode_label(resp.metadata.response_code);
         log.answers = resp.answers.iter().map(summarize).collect();
-        log.cached = matches!(action, QueryAction::Cached);
 
-        let entry = log.build(self.seq.fetch_add(1, Ordering::Relaxed));
+        let entry = log.build(self.seq.fetch_add(1, Ordering::Relaxed), action);
         self.stats.record(&entry);
         self.log.push(entry);
         resp
     }
 }
 
-/// Accumulates fields for a [`QueryLogEntry`] during processing.
+/// Accumulates the outcome-independent fields for a [`QueryLogEntry`] during
+/// processing. The outcome-specific data lives in the [`QueryAction`] passed to
+/// [`build`](LogBuilder::build).
 struct LogBuilder {
     client_ip: String,
     client_name: Option<String>,
     question: String,
     qtype: String,
-    action: QueryAction,
     allowlisted: bool,
     rcode: String,
     answers: Vec<String>,
-    rule: Option<String>,
-    list_id: Option<u32>,
-    upstream: Option<String>,
     elapsed_ms: f64,
-    cached: bool,
 }
 
 impl LogBuilder {
@@ -293,19 +294,14 @@ impl LogBuilder {
             client_name: client.name.clone(),
             question,
             qtype: qtype.to_string(),
-            action: QueryAction::Forwarded,
             allowlisted: false,
             rcode: String::new(),
             answers: Vec::new(),
-            rule: None,
-            list_id: None,
-            upstream: None,
             elapsed_ms: 0.0,
-            cached: false,
         }
     }
 
-    fn build(self, id: u64) -> QueryLogEntry {
+    fn build(self, id: u64, action: QueryAction) -> QueryLogEntry {
         QueryLogEntry {
             id,
             time_ms: now_ms(),
@@ -313,15 +309,11 @@ impl LogBuilder {
             client_name: self.client_name,
             question: self.question,
             qtype: self.qtype,
-            action: self.action,
+            action,
             allowlisted: self.allowlisted,
             rcode: self.rcode,
             answers: self.answers,
-            rule: self.rule,
-            list_id: self.list_id,
-            upstream: self.upstream,
             elapsed_ms: self.elapsed_ms,
-            cached: self.cached,
         }
     }
 }

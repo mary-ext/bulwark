@@ -637,7 +637,7 @@ async fn get_querylog(State(state): State<AppState>, Query(q): Query<LogQuery>) 
         .iter()
         .map(|e| {
             let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
-            if let (Value::Object(map), Some(id)) = (&mut v, e.list_id) {
+            if let (Value::Object(map), Some(id)) = (&mut v, e.list_id()) {
                 if let Some(name) = names.get(&id) {
                     map.insert("list_name".into(), json!(name));
                 }

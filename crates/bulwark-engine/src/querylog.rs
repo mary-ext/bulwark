@@ -6,18 +6,22 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-/// What happened to a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// What happened to a query, together with the data specific to that outcome.
+///
+/// Modeling the per-outcome fields inside each variant makes invalid
+/// combinations (e.g. a cached entry that also names an upstream, or a
+/// forwarded entry carrying a blocking rule) unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum QueryAction {
     /// Resolved via an upstream.
-    Forwarded,
+    Forwarded { upstream: String },
     /// Served from cache.
     Cached,
     /// Blocked by a filtering rule.
-    Blocked,
+    Blocked { rule: String, list_id: u32 },
     /// Rewritten by a rule (`$dnsrewrite` / hosts IP).
-    Rewritten,
+    Rewritten { rule: String, list_id: u32 },
     /// An error response (e.g. SERVFAIL) was returned.
     Error,
 }
@@ -32,24 +36,54 @@ pub struct QueryLogEntry {
     pub client_name: Option<String>,
     pub question: String,
     pub qtype: String,
+    /// The outcome and its associated data. Flattened on the wire so the
+    /// discriminator appears as a top-level `"action"` string with the
+    /// variant's fields alongside it.
+    #[serde(flatten)]
     pub action: QueryAction,
-    /// True if an `@@` exception allowed an otherwise-blocked query.
+    /// True if an `@@` exception allowed an otherwise-blocked query. Orthogonal
+    /// to `action`: an allowlisted query is still forwarded or cached.
     pub allowlisted: bool,
     pub rcode: String,
     /// Short summary of answer records (e.g. `["A 1.2.3.4"]`).
     pub answers: Vec<String>,
-    /// The rule text that matched, if any.
-    pub rule: Option<String>,
-    pub list_id: Option<u32>,
-    /// Upstream used, if forwarded.
-    pub upstream: Option<String>,
     pub elapsed_ms: f64,
-    pub cached: bool,
 }
 
 impl QueryLogEntry {
     pub fn is_blocked(&self) -> bool {
-        matches!(self.action, QueryAction::Blocked) && !self.allowlisted
+        matches!(self.action, QueryAction::Blocked { .. }) && !self.allowlisted
+    }
+
+    /// The rule text that matched, if the query was blocked or rewritten.
+    pub fn rule(&self) -> Option<&str> {
+        match &self.action {
+            QueryAction::Blocked { rule, .. } | QueryAction::Rewritten { rule, .. } => Some(rule),
+            _ => None,
+        }
+    }
+
+    /// The filter list responsible, if the query was blocked or rewritten.
+    pub fn list_id(&self) -> Option<u32> {
+        match self.action {
+            QueryAction::Blocked { list_id, .. } | QueryAction::Rewritten { list_id, .. } => {
+                Some(list_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// The upstream used, if the query was forwarded.
+    pub fn upstream(&self) -> Option<&str> {
+        match &self.action {
+            QueryAction::Forwarded { upstream } => Some(upstream),
+            _ => None,
+        }
+    }
+
+    /// True if the query was served from cache.
+    pub fn cached(&self) -> bool {
+        matches!(self.action, QueryAction::Cached)
     }
 }
 
@@ -207,18 +241,19 @@ mod tests {
             question: q.into(),
             qtype: "A".into(),
             action: if blocked {
-                QueryAction::Blocked
+                QueryAction::Blocked {
+                    rule: "||ads^".into(),
+                    list_id: 0,
+                }
             } else {
-                QueryAction::Forwarded
+                QueryAction::Forwarded {
+                    upstream: "1.1.1.1".into(),
+                }
             },
             allowlisted: false,
             rcode: "NOERROR".into(),
             answers: vec![],
-            rule: None,
-            list_id: None,
-            upstream: None,
             elapsed_ms: 1.0,
-            cached: false,
         }
     }
 
@@ -266,5 +301,52 @@ mod tests {
         let log = QueryLog::new(10, false);
         log.push(entry(1, "x.com", false));
         assert_eq!(log.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    /// The action discriminator and its data must serialize as flat top-level
+    /// keys (`action`, plus the variant's fields). The web UI reads them as
+    /// `e.action`, `e.rule`, `e.list_id`, `e.upstream`, so this is a contract.
+    #[test]
+    fn action_flattens_to_top_level_keys() {
+        let mut e = QueryLogEntry {
+            id: 1,
+            time_ms: 0,
+            client_ip: "10.0.0.1".into(),
+            client_name: None,
+            question: "ads.com.".into(),
+            qtype: "A".into(),
+            action: QueryAction::Blocked {
+                rule: "||ads^".into(),
+                list_id: 3,
+            },
+            allowlisted: false,
+            rcode: "NXDOMAIN".into(),
+            answers: vec![],
+            elapsed_ms: 0.5,
+        };
+
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains(r#""action":"blocked""#));
+        assert!(j.contains(r#""rule":"||ads^""#));
+        assert!(j.contains(r#""list_id":3"#));
+        // The redundant `cached` field is gone for good.
+        assert!(!j.contains("cached"));
+
+        // Round-trips back to the same variant.
+        let back: QueryLogEntry = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.action, e.action);
+
+        e.action = QueryAction::Forwarded {
+            upstream: "1.1.1.1".into(),
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains(r#""action":"forwarded""#));
+        assert!(j.contains(r#""upstream":"1.1.1.1""#));
+        assert!(!j.contains("list_id"));
     }
 }

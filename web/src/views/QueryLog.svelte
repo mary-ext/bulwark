@@ -140,7 +140,7 @@
           <td class="muted" title={e.list_name ?? ""}>
             {#if e.rule}{e.list_name ?? "—"}{:else}—{/if}
           </td>
-          <td class="muted">{e.upstream ?? (e.cached ? "cache" : "—")}</td>
+          <td class="muted">{e.upstream ?? (e.action === "cached" ? "cache" : "—")}</td>
           <td class="muted">{ms(e.elapsed_ms)}</td>
           <td style="text-align:right">
             <div class="menu-wrap">

@@ -80,7 +80,7 @@ async fn make_engine(rules: &str, upstream: SocketAddr) -> Arc<Engine> {
     };
     Engine::new(
         state,
-        Arc::new(DnsCache::new(100, 0, 0, false, 0)),
+        Arc::new(DnsCache::new(100, 0, 0, 0)),
         Arc::new(QueryLog::new(100, true)),
         Arc::new(Stats::new(true, 1)),
     )
@@ -133,7 +133,10 @@ async fn blocks_filtered_domain() {
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
     let page = engine.log().query(&Default::default(), 0, 10);
-    assert_eq!(page.entries[0].action, QueryAction::Blocked);
+    assert!(matches!(
+        page.entries[0].action,
+        QueryAction::Blocked { .. }
+    ));
     assert!(page.entries[0].is_blocked());
 }
 

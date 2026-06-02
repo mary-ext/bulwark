@@ -25,7 +25,7 @@ export interface CacheCfg {
   size: number;
   min_ttl_secs: number;
   max_ttl_secs: number;
-  optimistic: boolean;
+  /** Serve-stale window in seconds past expiry; 0 disables optimistic caching. */
   optimistic_max_age_secs: number;
 }
 
@@ -117,7 +117,6 @@ export interface LogEntry {
   list_name?: string | null;
   upstream?: string | null;
   elapsed_ms: number;
-  cached: boolean;
 }
 
 export interface UpstreamStat {
