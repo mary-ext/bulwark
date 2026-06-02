@@ -66,6 +66,10 @@ struct StatsInner {
     qtypes: HashMap<String, u64>,
     upstream_rtt_sum: HashMap<String, f64>,
     upstream_rtt_count: HashMap<String, u64>,
+    /// Per-upstream latency histograms (same buckets as `latency_hist`), kept so
+    /// the snapshot can derive approximate p50/p90/p99 per upstream.
+    #[serde(default)]
+    upstream_latency_hist: HashMap<String, Vec<u64>>,
 
     #[serde(default)]
     series: Vec<Bucket>,
@@ -105,6 +109,17 @@ impl StatsInner {
         }
         for (k, v) in &other.upstream_rtt_count {
             *self.upstream_rtt_count.entry(k.clone()).or_insert(0) += v;
+        }
+        for (k, hist) in &other.upstream_latency_hist {
+            let dst = self
+                .upstream_latency_hist
+                .entry(k.clone())
+                .or_insert_with(|| vec![0; LATENCY_BUCKETS_MS.len() + 1]);
+            if dst.len() == hist.len() {
+                for (a, b) in dst.iter_mut().zip(hist) {
+                    *a += b;
+                }
+            }
         }
 
         for b in &other.series {
@@ -266,6 +281,14 @@ impl Stats {
                     s.upstream_rtt_count.insert(up.to_string(), 1);
                 }
             }
+            match s.upstream_latency_hist.get_mut(up) {
+                Some(h) => h[idx] += 1,
+                None => {
+                    let mut h = vec![0; LATENCY_BUCKETS_MS.len() + 1];
+                    h[idx] += 1;
+                    s.upstream_latency_hist.insert(up.to_string(), h);
+                }
+            }
         }
 
         // Time series (hourly).
@@ -336,6 +359,11 @@ impl Stats {
                 (k.clone(), if c > 0 { sum / c as f64 } else { 0.0 })
             })
             .collect();
+        let upstream_latency_pct = s
+            .upstream_latency_hist
+            .iter()
+            .map(|(k, hist)| (k.clone(), percentiles(hist)))
+            .collect();
 
         StatsSummary {
             total: s.total,
@@ -357,6 +385,7 @@ impl Stats {
             top_upstreams: top_n_of(&s.upstreams, top_n),
             qtypes: top_n_of(&s.qtypes, top_n),
             upstream_avg_rtt_ms: upstream_rtt,
+            upstream_latency_pct,
             series: s
                 .series
                 .iter()
@@ -401,6 +430,49 @@ fn latency_labels() -> Vec<String> {
         .collect();
     v.push(format!(">{}ms", LATENCY_BUCKETS_MS.last().unwrap()));
     v
+}
+
+/// Inclusive lower / exclusive upper bound (ms) of histogram bucket `i`. The
+/// final bucket is unbounded above (`+inf`).
+fn bucket_bounds(i: usize) -> (f64, f64) {
+    let lower = if i == 0 { 0.0 } else { LATENCY_BUCKETS_MS[i - 1] };
+    let upper = LATENCY_BUCKETS_MS.get(i).copied().unwrap_or(f64::INFINITY);
+    (lower, upper)
+}
+
+/// Approximate the `q` quantile (0..=1) of a bucketed histogram by linear
+/// interpolation within the bucket that holds the target rank. Samples in the
+/// unbounded final bucket pin to its lower bound (can't interpolate to +inf).
+fn quantile(hist: &[u64], total: u64, q: f64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let target = q * total as f64;
+    let mut cum = 0u64;
+    for (i, &c) in hist.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        if (cum + c) as f64 >= target {
+            let (lower, upper) = bucket_bounds(i);
+            if !upper.is_finite() {
+                return lower;
+            }
+            let within = (target - cum as f64) / c as f64;
+            return lower + (upper - lower) * within;
+        }
+        cum += c;
+    }
+    *LATENCY_BUCKETS_MS.last().unwrap()
+}
+
+fn percentiles(hist: &[u64]) -> LatencyPercentiles {
+    let total: u64 = hist.iter().sum();
+    LatencyPercentiles {
+        p50: quantile(hist, total, 0.50),
+        p90: quantile(hist, total, 0.90),
+        p99: quantile(hist, total, 0.99),
+    }
 }
 
 fn top_n_of(map: &HashMap<String, u64>, n: usize) -> Vec<TopEntry> {
@@ -450,7 +522,17 @@ pub struct StatsSummary {
     pub top_upstreams: Vec<TopEntry>,
     pub qtypes: Vec<TopEntry>,
     pub upstream_avg_rtt_ms: HashMap<String, f64>,
+    pub upstream_latency_pct: HashMap<String, LatencyPercentiles>,
     pub series: Vec<SeriesPoint>,
+}
+
+/// Approximate latency percentiles (milliseconds) derived from a bucketed
+/// histogram. Accuracy is bounded by the histogram bucket widths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencyPercentiles {
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
 }
 
 #[cfg(test)]
@@ -513,6 +595,24 @@ mod tests {
         let s2 = Stats::new(true, 30);
         s2.import(&dump);
         assert_eq!(s2.snapshot(10).total, 1);
+    }
+
+    #[test]
+    fn per_upstream_percentiles() {
+        let s = Stats::new(true, 30);
+        // 100 fast samples (~5ms) and a few slow ones to push the tail up.
+        for _ in 0..95 {
+            s.record(&entry("a.com.", forwarded("up"), 5.0));
+        }
+        for _ in 0..5 {
+            s.record(&entry("a.com.", forwarded("up"), 300.0));
+        }
+        let snap = s.snapshot(10);
+        let p = snap.upstream_latency_pct.get("up").expect("upstream present");
+        // p50/p90 fall in the ≤5ms bucket; p99 lands in the slow tail.
+        assert!(p.p50 <= 5.0, "p50 = {}", p.p50);
+        assert!(p.p90 <= 5.0, "p90 = {}", p.p90);
+        assert!(p.p99 > 200.0, "p99 = {}", p.p99);
     }
 
     #[test]
