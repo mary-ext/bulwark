@@ -55,20 +55,21 @@ A Cargo workspace of focused, independently-tested crates:
 
 ### Build
 
-Bulwark embeds a prebuilt web UI, so a plain Cargo build produces a working
-binary:
+The web UI is embedded into the binary at compile time. Build its dependencies
+once, then build normally:
 
 ```sh
+cd web && pnpm install && cd ..
 cargo build --release
 ```
 
-To rebuild the UI (optional; the built assets are committed):
-
-```sh
-cd web
-pnpm install
-pnpm build      # outputs to web/dist, embedded at compile time
-```
+`server/build.rs` automatically runs `pnpm build` during the Cargo build (when
+`pnpm` + `web/node_modules` are present) so the embedded UI always matches the
+front-end sources. The built bundle (`web/dist`) is generated, **not** committed.
+If you build without a Node toolchain, the server still compiles and runs — it
+just serves a small "UI not built" placeholder until you run `pnpm build` in
+`web/`. You can also iterate on the UI live with `cd web && pnpm dev` (it proxies
+`/api` to a running server on `:3000`).
 
 ### Run
 

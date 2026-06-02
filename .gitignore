@@ -6,8 +6,12 @@ Cargo.lock.orig
 # Node / web
 node_modules/
 .vite/
-# NOTE: web/dist/ is intentionally committed so `cargo build` embeds a working
-# UI without requiring Node. Regenerate it with `pnpm build` in web/.
+# The built UI bundle is generated, not committed. `server/build.rs` rebuilds it
+# during `cargo build` when pnpm + web/node_modules are present; otherwise a
+# placeholder is embedded. The folder itself is kept (.gitkeep) so the
+# rust-embed `#[folder]` always compiles.
+web/dist/*
+!web/dist/.gitkeep
 
 # Editor / OS
 .DS_Store
