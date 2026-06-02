@@ -697,10 +697,10 @@ impl OldStats {
             .unwrap_or_else(|| entry.client_ip.clone());
         old_bump(&mut s.clients, &client, 1);
         old_bump(&mut s.qtypes, &entry.qtype, 1);
-        if let Some(up) = &entry.upstream {
+        if let Some(up) = entry.upstream() {
             old_bump(&mut s.upstreams, up, 1);
-            *s.upstream_rtt_sum.entry(up.clone()).or_insert(0.0) += entry.elapsed_ms;
-            *s.upstream_rtt_count.entry(up.clone()).or_insert(0) += 1;
+            *s.upstream_rtt_sum.entry(up.to_string()).or_insert(0.0) += entry.elapsed_ms;
+            *s.upstream_rtt_count.entry(up.to_string()).or_insert(0) += 1;
         }
     }
 }
@@ -713,15 +713,20 @@ fn entry_for(domain: &str, blocked: bool) -> QueryLogEntry {
         client_name: Some("laptop".into()),
         question: format!("{domain}."),
         qtype: "A".into(),
-        action: if blocked { QueryAction::Blocked } else { QueryAction::Forwarded },
+        action: if blocked {
+            QueryAction::Blocked {
+                rule: "||ads^".into(),
+                list_id: 0,
+            }
+        } else {
+            QueryAction::Forwarded {
+                upstream: "mock".into(),
+            }
+        },
         allowlisted: false,
         rcode: "NOERROR".into(),
         answers: vec![],
-        rule: None,
-        list_id: None,
-        upstream: if blocked { None } else { Some("mock".into()) },
         elapsed_ms: 1.5,
-        cached: false,
     }
 }
 

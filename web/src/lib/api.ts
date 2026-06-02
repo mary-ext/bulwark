@@ -117,7 +117,6 @@ export interface LogEntry {
   list_name?: string | null;
   upstream?: string | null;
   elapsed_ms: number;
-  cached: boolean;
 }
 
 export interface UpstreamStat {

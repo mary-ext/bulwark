@@ -133,7 +133,10 @@ async fn blocks_filtered_domain() {
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
     let page = engine.log().query(&Default::default(), 0, 10);
-    assert_eq!(page.entries[0].action, QueryAction::Blocked);
+    assert!(matches!(
+        page.entries[0].action,
+        QueryAction::Blocked { .. }
+    ));
     assert!(page.entries[0].is_blocked());
 }
 
