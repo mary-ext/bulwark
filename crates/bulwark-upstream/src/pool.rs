@@ -151,7 +151,15 @@ pub struct UpstreamStat {
     pub last_error: Option<String>,
 }
 
-type ResolveFuture = Shared<BoxFuture<'static, SharedResult<Message>>>;
+/// A successful resolution: the response plus the upstream that answered.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    pub message: Message,
+    /// Display name of the upstream that produced the answer.
+    pub upstream: String,
+}
+
+type ResolveFuture = Shared<BoxFuture<'static, SharedResult<Resolved>>>;
 
 /// A pool of upstream resolvers.
 pub struct UpstreamPool {
@@ -210,7 +218,7 @@ impl UpstreamPool {
     }
 
     /// Resolve a query, honouring single-flight and fastest-upstream selection.
-    pub async fn resolve(&self, query: &Message) -> Result<Message> {
+    pub async fn resolve(&self, query: &Message) -> Result<Resolved> {
         if self.upstreams.is_empty() {
             return Err(UpstreamError::NoUpstreams);
         }
@@ -245,10 +253,10 @@ impl UpstreamPool {
         }
 
         match result {
-            Ok(mut msg) => {
+            Ok(mut resolved) => {
                 // Restore the caller's transaction id.
-                msg.metadata.id = query.metadata.id;
-                Ok(msg)
+                resolved.message.metadata.id = query.metadata.id;
+                Ok(resolved)
             }
             Err(arc) => Err((*arc).clone()),
         }
@@ -281,14 +289,17 @@ async fn resolve_sequential(
     timeout: Duration,
     alpha: f64,
     threshold: u32,
-) -> SharedResult<Message> {
+) -> SharedResult<Resolved> {
     let mut last = UpstreamError::NoUpstreams;
     for up in ordered {
         let start = Instant::now();
         match tokio::time::timeout(timeout, up.transport.query(&query)).await {
             Ok(Ok(resp)) => {
                 up.record_success(start.elapsed(), alpha);
-                return Ok(resp);
+                return Ok(Resolved {
+                    message: resp,
+                    upstream: up.name.clone(),
+                });
             }
             Ok(Err(e)) => {
                 up.record_failure(&e, threshold);

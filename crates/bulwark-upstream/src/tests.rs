@@ -101,8 +101,9 @@ async fn resolves_via_udp_and_restores_id() {
         .unwrap();
 
     let resp = pool.resolve(&make_query("example.com.")).await.unwrap();
-    assert_eq!(resp.metadata.id, 0x4242);
-    assert_eq!(resp.answers.len(), 1);
+    assert_eq!(resp.message.metadata.id, 0x4242);
+    assert_eq!(resp.message.answers.len(), 1);
+    assert_eq!(resp.upstream, format!("udp://{}", mock.addr));
     assert_eq!(mock.received.load(Ordering::SeqCst), 1);
 }
 
@@ -140,7 +141,7 @@ async fn sequential_failover_to_healthy_upstream() {
         .unwrap();
 
     let resp = pool.resolve(&make_query("failover.test.")).await.unwrap();
-    assert_eq!(resp.answers.len(), 1);
+    assert_eq!(resp.message.answers.len(), 1);
     assert!(good.received.load(Ordering::SeqCst) >= 1);
 }
 
@@ -219,7 +220,10 @@ async fn live_resolve(spec: &str) {
         .await
         .unwrap_or_else(|e| panic!("{spec} failed: {e}"));
     assert!(
-        resp.answers.iter().any(|r| matches!(&r.data, RData::A(_))),
+        resp.message
+            .answers
+            .iter()
+            .any(|r| matches!(&r.data, RData::A(_))),
         "{spec} returned no A records"
     );
 }

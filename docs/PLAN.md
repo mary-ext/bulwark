@@ -136,7 +136,7 @@ Upstream resolution layer.
       with failover.
 - [x] Tests with a local mock UDP DNS server; failover, dedup, selection.
 
-### Phase 3 — caching  `[x]` (in `bulwark-engine`)
+### Phase 3 — caching  `[x]` (in `bulwark-engine`) — DONE
 - [x] TTL-respecting positive & negative cache (RFC 2308).
 - [x] **User-configurable minimum & maximum TTL** clamps (override upstream TTLs
       within `[min_ttl, max_ttl]`), settable from the web UI.
@@ -147,7 +147,7 @@ Upstream resolution layer.
 - [x] Cache keyed by (name, qtype, qclass); LRU bound.
 - [x] Tests.
 
-### Phase 4 — `bulwark-engine`  `[x]`
+### Phase 4 — `bulwark-engine`  `[x]` — DONE
 The query-processing pipeline & observability.
 - [x] DNS server: UDP + TCP listeners (tokio), proper truncation/EDNS handling.
 - [x] Pipeline: parse → identify client → filter → cache → upstream → log+stats.
@@ -159,7 +159,7 @@ The query-processing pipeline & observability.
 - [x] Hot-reload of config/filters without dropping traffic.
 - [x] Integration tests against the mock upstream.
 
-### Phase 5 — `bulwark-config`  `[x]`
+### Phase 5 — `bulwark-config`  `[x]` — DONE
 - [x] Strongly-typed config (server, upstreams, filtering, clients, lists, UI).
 - [x] Sensible defaults; load/save YAML; atomic writes; schema versioning.
 - [x] Validation with helpful errors.

@@ -21,7 +21,9 @@ pub mod transport;
 
 pub use bootstrap::{Bootstrap, SharedBootstrap};
 pub use error::{Result, UpstreamError};
-pub use pool::{test_spec, PoolEntry, PoolSettings, Upstream, UpstreamPool, UpstreamStat};
+pub use pool::{
+    test_spec, PoolEntry, PoolSettings, Resolved, Upstream, UpstreamPool, UpstreamStat,
+};
 pub use spec::{Host, TransportKind, UpstreamSpec};
 pub use transport::{QueryKey, Transport};
 

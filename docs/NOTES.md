@@ -100,11 +100,44 @@ transports are written to spec and should work wherever direct egress exists
 (the intended Tailscale deployment). Fixed a real bug: DoH must negotiate h2 via
 ALPN, not `http2_prior_knowledge()` (that's for cleartext h2c).
 
-## Phase 3 — cache
+## Phase 3 — cache — DONE
 
-## Phase 4 — engine
+`DnsCache` (in engine crate): LRU (`lru` crate) keyed by `QueryKey`. Stores the
+full response + `stored_at` + clamped `ttl`. On `get`, adjusts record TTLs to
+the remaining lifetime. Positive + negative caching (NXDOMAIN/NODATA via SOA
+minimum per RFC 2308). Tuning (enabled, size, min/max TTL clamp, optimistic) is
+held in atomics and `reconfigure`d live. Optimistic mode serves stale within a
+window and the *engine* spawns a single background refresh (pool single-flight
+keeps it to one upstream request). Doesn't cache SERVFAIL/REFUSED/truncated.
 
-## Phase 5 — config
+## Phase 4 — engine — DONE
+
+`Engine` holds hot-swappable `EngineState` (filter + pool + client map +
+filtering knobs) in an `ArcSwap`; cache/log/stats are persistent `Arc`s so a
+config reload never drops accumulated data. `handle()` pipeline:
+client-identify → filter (block/rewrite/allow) → cache → upstream → finalize
+(record stats + push log). CNAME rewrites resolve the target via the pool and
+append answers. Blocking modes: NXDOMAIN / NODATA / REFUSED / null-IP /
+custom-IP (per query type). `server.rs` runs UDP (per-query task, EDNS-aware
+truncation with TC bit) and TCP (length-prefixed, pipelined, idle timeout).
+
+### Persistence design (per user request: separate retention for logs & stats)
+
+- **Query log**: in-memory ring for fast browsing + an optional async *sink*
+  (`set_sink`) so the server can append entries to disk and `preload` recent
+  ones on startup. Retention (`query_log.retention_days`) is independent.
+- **Stats**: serializable inner state with `export()`/`import()`; the server
+  snapshots it periodically and on shutdown, and the time-series honours
+  `stats.retention_days` (separate from the log). Both have `persist` toggles.
+- Actual file I/O lives in the server (Phase 6), which owns the data dir.
+
+## Phase 5 — config — DONE
+
+`bulwark-config`: one `Config` root with `server / upstreams / cache /
+filtering / clients / query_log / stats / auth` sections, all `#[serde(default)]`
+so partial YAML works. Durations stored as `*_secs`/`*_days` for simple
+UI/JSON editing. Atomic save (temp + rename), validation, schema version.
+Password stored as an Argon2 hash (set by the server during the setup flow).
 
 ## Phase 6 — server
 
