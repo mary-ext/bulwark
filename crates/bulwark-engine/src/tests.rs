@@ -80,7 +80,7 @@ async fn make_engine(rules: &str, upstream: SocketAddr) -> Arc<Engine> {
     };
     Engine::new(
         state,
-        Arc::new(DnsCache::new(100, 0, 0, false, 0)),
+        Arc::new(DnsCache::new(100, 0, 0, 0)),
         Arc::new(QueryLog::new(100, true)),
         Arc::new(Stats::new(true, 1)),
     )

@@ -231,7 +231,6 @@ async fn build_engine(
     filter: Arc<FilterEngine>,
     upstream: SocketAddr,
     timeout: Duration,
-    optimistic: bool,
     max_ttl: u32,
     stale_max_age: u32,
     filtering_enabled: bool,
@@ -256,7 +255,7 @@ async fn build_engine(
     };
     Engine::new(
         state,
-        Arc::new(DnsCache::new(100_000, 0, max_ttl, optimistic, stale_max_age)),
+        Arc::new(DnsCache::new(100_000, 0, max_ttl, stale_max_age)),
         Arc::new(QueryLog::new(10_000, true)),
         Arc::new(Stats::new(true, 24)),
     )
@@ -477,7 +476,7 @@ async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstrea
     println!("\n== Phase 2: whole-chain latency per scenario ==");
 
     // Production-like engine: optimistic cache on, generous stale window.
-    let engine = build_engine(filter.clone(), upstream, Duration::from_millis(500), true, 0, 3600, true).await;
+    let engine = build_engine(filter.clone(), upstream, Duration::from_millis(500), 0, 3600, true).await;
 
     // Blocked: real list domains -> synthesized NXDOMAIN, never touches upstream.
     let bset: Vec<String> = blocked.iter().cloned().cycle().take(n).collect();
@@ -502,7 +501,7 @@ async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstrea
     scenario(&engine, "negative cache (NXDOMAIN)", many(nx, RecordType::A)).await;
 
     // Filtering disabled: skips the filter stage entirely.
-    let nofilter = build_engine(filter.clone(), upstream, Duration::from_millis(500), true, 0, 3600, false).await;
+    let nofilter = build_engine(filter.clone(), upstream, Duration::from_millis(500), 0, 3600, false).await;
     let _ = nofilter.handle(query("nf-hot.example.", RecordType::A), local()).await;
     let nf = (0..n).map(|_| "nf-hot.example".to_string());
     scenario(&nofilter, "filtering disabled (cache)", many(nf, RecordType::A)).await;
@@ -511,7 +510,7 @@ async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstrea
     // succeeds, so every lookup serves the stale entry (isolates that path).
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let stale_engine =
-        build_engine(filter.clone(), dead, Duration::from_millis(50), true, 1, 3600, true).await;
+        build_engine(filter.clone(), dead, Duration::from_millis(50), 1, 3600, true).await;
     // Insert a fresh entry directly, then let it age past its 1s TTL.
     let key = QueryKey::from_message(&query("stale-hot.example.", RecordType::A)).unwrap();
     let mut warm = query("stale-hot.example.", RecordType::A);
@@ -540,7 +539,7 @@ async fn phase3_concurrency(
     concurrency: usize,
 ) {
     println!("\n== Phase 3: concurrent mixed workload (concurrency={concurrency}) ==");
-    let engine = build_engine(filter, upstream, Duration::from_millis(500), true, 0, 3600, true).await;
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
 
     // Realistic mix: ~30% blocked, ~50% repeated popular (cache hits), ~20% unique forward.
     let mut msgs: Vec<Message> = Vec::with_capacity(total);
@@ -593,7 +592,6 @@ async fn phase3_concurrency(
         sf_count_filter(),
         sf_up,
         Duration::from_millis(500),
-        false,
         0,
         0,
         false,

@@ -123,7 +123,6 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
         cfg.cache.size,
         cfg.cache.min_ttl_secs,
         cfg.cache.max_ttl_secs,
-        cfg.cache.optimistic,
         cfg.cache.optimistic_max_age_secs,
     ));
     cache.reconfigure(
@@ -131,7 +130,6 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
         cfg.cache.size,
         cfg.cache.min_ttl_secs,
         cfg.cache.max_ttl_secs,
-        cfg.cache.optimistic,
         cfg.cache.optimistic_max_age_secs,
     );
     let log = Arc::new(QueryLog::new(cfg.query_log.size, cfg.query_log.enabled));
@@ -161,7 +159,6 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         new_cfg.cache.size,
         new_cfg.cache.min_ttl_secs,
         new_cfg.cache.max_ttl_secs,
-        new_cfg.cache.optimistic,
         new_cfg.cache.optimistic_max_age_secs,
     );
     state

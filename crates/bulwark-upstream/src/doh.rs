@@ -47,6 +47,19 @@ enum AltSvcH3 {
     Absent,
 }
 
+/// HTTP/3 strategy for a DoH upstream.
+///
+/// Modeled as an enum so the Alt-Svc discovery cache (`h3_until`) only exists
+/// when it can actually be used — a forced-HTTP/3 transport never negotiates, so
+/// it carries no discovery state at all.
+enum H3Mode {
+    /// Pinned to HTTP/3 (`force_http3`): no Alt-Svc discovery, no fallback.
+    Forced,
+    /// Negotiated: when an advertised HTTP/3 alternative stops being trusted.
+    /// `None` means we have no current advertisement and should use h1/h2.
+    Auto { until: Mutex<Option<Instant>> },
+}
+
 pub struct DohTransport {
     spec: UpstreamSpec,
     bootstrap: SharedBootstrap,
@@ -57,15 +70,20 @@ pub struct DohTransport {
     client_h12: OnceCell<reqwest::Client>,
     /// HTTP/3-only client (`http3_prior_knowledge`), built lazily on first use.
     client_h3: OnceCell<reqwest::Client>,
-    /// When an advertised HTTP/3 alternative stops being trusted. `None` means we
-    /// have no current advertisement and should use the h1/h2 client.
-    h3_until: Mutex<Option<Instant>>,
+    h3: H3Mode,
     desc: String,
 }
 
 impl DohTransport {
     pub fn new(spec: UpstreamSpec, bootstrap: SharedBootstrap) -> Self {
         let url = format!("https://{}:{}{}", spec.server_name(), spec.port, spec.path);
+        let h3 = if spec.force_http3 {
+            H3Mode::Forced
+        } else {
+            H3Mode::Auto {
+                until: Mutex::new(None),
+            }
+        };
         Self {
             desc: url.clone(),
             url,
@@ -74,7 +92,7 @@ impl DohTransport {
             ips: OnceCell::new(),
             client_h12: OnceCell::new(),
             client_h3: OnceCell::new(),
-            h3_until: Mutex::new(None),
+            h3,
         }
     }
 
@@ -125,16 +143,23 @@ impl DohTransport {
     }
 
     /// Whether a previously advertised HTTP/3 alternative is still within its
-    /// max-age.
+    /// max-age. Always false in forced mode (it never negotiates).
     fn h3_fresh(&self) -> bool {
-        matches!(*self.h3_until.lock(), Some(until) if until > Instant::now())
+        match &self.h3 {
+            H3Mode::Auto { until } => matches!(*until.lock(), Some(t) if t > Instant::now()),
+            H3Mode::Forced => false,
+        }
     }
 
-    /// Record (or clear) an HTTP/3 alternative learned from a response.
+    /// Record (or clear) an HTTP/3 alternative learned from a response. No-op in
+    /// forced mode, which has no discovery state.
     fn learn_alt_svc(&self, decision: AltSvcH3) {
+        let H3Mode::Auto { until } = &self.h3 else {
+            return;
+        };
         match decision {
-            AltSvcH3::Found(ma) => *self.h3_until.lock() = Some(Instant::now() + ma),
-            AltSvcH3::Clear => *self.h3_until.lock() = None,
+            AltSvcH3::Found(ma) => *until.lock() = Some(Instant::now() + ma),
+            AltSvcH3::Clear => *until.lock() = None,
             AltSvcH3::Absent => {}
         }
     }
@@ -147,7 +172,7 @@ impl DohTransport {
         let body = encode(&q)?;
 
         // Pinned to HTTP/3: no discovery, no fallback.
-        if self.spec.force_http3 {
+        if matches!(self.h3, H3Mode::Forced) {
             return self.exchange(self.h3().await?, &body, original_id, false).await;
         }
 
