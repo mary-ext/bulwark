@@ -10,6 +10,7 @@
   let blockedOnly = $state(false);
   let offset = $state(0);
   let live = $state(true);
+  let menuFor = $state<number | null>(null);
   const limit = 100;
 
   async function load() {
@@ -56,6 +57,35 @@
     if (e.action === "blocked") return "block";
     return e.action;
   }
+
+  function bareDomain(question: string): string {
+    return question.replace(/\.$/, "");
+  }
+
+  // Match AdGuard Home: allow => @@||host^$important, block => ||host^$important.
+  async function addRule(e: LogEntry, allow: boolean) {
+    menuFor = null;
+    const domain = bareDomain(e.question);
+    const rule = `${allow ? "@@" : ""}||${domain}^$important`;
+    try {
+      const r = await api.addRule(rule);
+      toaster.show(r.added ? `Added: ${rule}` : `Already present: ${rule}`);
+      load();
+    } catch (err: any) {
+      toaster.show(err.message ?? "Failed to add rule", true);
+    }
+  }
+
+  function toggleMenu(id: number, ev: MouseEvent) {
+    ev.stopPropagation();
+    menuFor = menuFor === id ? null : id;
+  }
+
+  $effect(() => {
+    const close = () => (menuFor = null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  });
 </script>
 
 <h1 class="page-title">
@@ -91,6 +121,7 @@
         <th>List</th>
         <th>Upstream</th>
         <th>Time</th>
+        <th></th>
       </tr>
     </thead>
     <tbody>
@@ -111,10 +142,22 @@
           </td>
           <td class="muted">{e.upstream ?? (e.cached ? "cache" : "—")}</td>
           <td class="muted">{ms(e.elapsed_ms)}</td>
+          <td style="text-align:right">
+            <div class="menu-wrap">
+              <button class="menu-btn" title="Actions" onclick={(ev) => toggleMenu(e.id, ev)}>⋯</button>
+              {#if menuFor === e.id}
+                <div class="menu" onclick={(ev) => ev.stopPropagation()} role="menu" tabindex="-1" onkeydown={() => {}}>
+                  <span class="mono">{bareDomain(e.question)}</span>
+                  <button onclick={() => addRule(e, true)}>✅ Allow this domain</button>
+                  <button onclick={() => addRule(e, false)}>🚫 Block this domain</button>
+                </div>
+              {/if}
+            </div>
+          </td>
         </tr>
       {/each}
       {#if entries.length === 0}
-        <tr><td colspan="9" class="muted" style="text-align:center;padding:2rem">No matching queries.</td></tr>
+        <tr><td colspan="10" class="muted" style="text-align:center;padding:2rem">No matching queries.</td></tr>
       {/if}
     </tbody>
   </table>

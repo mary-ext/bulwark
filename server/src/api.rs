@@ -60,6 +60,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/stats", put(put_stats_cfg))
         .route("/api/filters", get(get_filters))
         .route("/api/filters/custom", put(put_custom_rules))
+        .route("/api/filters/rule", post(add_custom_rule))
         .route("/api/filters/check", post(check_domain))
         .route("/api/filters/lists", post(add_list))
         .route(
@@ -318,6 +319,37 @@ async fn put_custom_rules(
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct AddRule {
+    /// A single rule line to append to the custom rules, e.g. `@@||example.com^`
+    /// or `||ads.example.com^`. Used by the query-log "allow/block" actions.
+    rule: String,
+}
+
+async fn add_custom_rule(
+    State(state): State<AppState>,
+    Json(body): Json<AddRule>,
+) -> ApiResult<Json<Value>> {
+    let rule = body.rule.trim();
+    if rule.is_empty() {
+        return Err(ApiError::BadRequest("empty rule".into()));
+    }
+    let mut cfg = state.config.read().await.clone();
+    // Idempotent: don't append a rule that's already present as a line.
+    let already = cfg.filtering.custom_rules.lines().any(|l| l.trim() == rule);
+    if !already {
+        if !cfg.filtering.custom_rules.is_empty() && !cfg.filtering.custom_rules.ends_with('\n') {
+            cfg.filtering.custom_rules.push('\n');
+        }
+        cfg.filtering.custom_rules.push_str(rule);
+        cfg.filtering.custom_rules.push('\n');
+        apply_config(&state, cfg)
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    }
+    Ok(Json(json!({ "ok": true, "rule": rule, "added": !already })))
 }
 
 #[derive(Deserialize)]

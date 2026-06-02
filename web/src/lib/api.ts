@@ -184,6 +184,7 @@ export const api = {
       blocking_mode: BlockingMode;
     }>("GET", "/api/filters"),
   putCustomRules: (rules: string) => req("PUT", "/api/filters/custom", { rules }),
+  addRule: (rule: string) => req<{ added: boolean }>("POST", "/api/filters/rule", { rule }),
   checkDomain: (domain: string, qtype?: string) =>
     req<{ action: string; rule?: string; list_id?: number }>("POST", "/api/filters/check", {
       domain,

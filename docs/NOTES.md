@@ -34,6 +34,23 @@ that's an orthogonal optimisation that further reduces upstream load.
 
 ---
 
+## Allow/Block from the query log (round 4)
+
+Added a per-row overflow menu (⋯) in the Query Log with "Allow this domain" /
+"Block this domain". Matches AdGuard Home's behaviour exactly (verified in
+`AdGuardHome client/src/actions/index.tsx::toggleBlocking`): block adds
+`||domain^$important`, allow adds `@@||domain^$important`. The `$important` is
+what lets a UI unblock override even an important block from a subscribed list
+(our priorities: important-allow 102 > important-block 101). Backed by a new
+idempotent `POST /api/filters/rule {rule}` that appends one line to the custom
+rules. Verified: a list-blocked domain flips to `allow` after the action.
+
+Final adblock-rust skim: the only unadopted idea is `RegexManager` (lazy-compile
++ discard infrequently-used regexes to cap memory when there are *many* regex
+rules) — geared at browser extensions; negligible for DNS (mostly plain
+`||domain^`/hosts, few `/regex/`), so intentionally skipped. Everything else of
+value (tokenized reverse index, RegexSet fallback, de-dup, compact memory) is in.
+
 ## AdGuard Home rule-parity check (round 3)
 
 Cloned AdGuardHome + AdguardTeam/urlfilter (its rule parser) to `/tmp` and
