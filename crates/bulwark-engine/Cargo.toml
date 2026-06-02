@@ -1,0 +1,26 @@
+[package]
+name = "bulwark-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+bulwark-filter.workspace = true
+bulwark-upstream.workspace = true
+bulwark-config.workspace = true
+hickory-proto.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+ahash.workspace = true
+ipnet.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

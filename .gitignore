@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node / web
+node_modules/
+web/dist/
+.vite/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Bulwark runtime data
+/data/
+*.log
+config.local.yaml
