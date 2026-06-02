@@ -3,15 +3,27 @@
 //!
 //! State is serializable (`export`/`import`) so the server can persist it across
 //! restarts with its own configurable retention.
+//!
+//! # Concurrency
+//!
+//! Recording happens on every resolved query, so it must not become a
+//! serialization point under load. Instead of one global lock, the state is
+//! split into a small number of independently-locked shards (one per CPU,
+//! rounded to a power of two). Each OS thread is pinned to a single shard, so
+//! the tokio worker threads almost never contend with one another. Reads
+//! (`snapshot`/`export`) merge the shards under their individual locks.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::querylog::{QueryAction, QueryLogEntry};
 
-/// Upper bound on distinct keys tracked per top-N map (memory guard).
+/// Upper bound on distinct keys tracked per top-N map, summed across shards
+/// (memory guard). Divided evenly between shards at construction.
 const MAX_KEYS: usize = 50_000;
 
 /// Latency histogram bucket upper-bounds in milliseconds (last bucket = +inf).
@@ -65,50 +77,131 @@ impl StatsInner {
             self.latency_hist = vec![0; LATENCY_BUCKETS_MS.len() + 1];
         }
     }
+
+    /// Fold another shard's state into this accumulator (used for snapshots).
+    fn merge_from(&mut self, other: &StatsInner) {
+        self.total += other.total;
+        self.blocked += other.blocked;
+        self.cached += other.cached;
+        self.rewritten += other.rewritten;
+        self.errors += other.errors;
+        self.proc_time_sum_ms += other.proc_time_sum_ms;
+        self.proc_time_count += other.proc_time_count;
+
+        self.ensure_hist();
+        if other.latency_hist.len() == self.latency_hist.len() {
+            for (a, b) in self.latency_hist.iter_mut().zip(&other.latency_hist) {
+                *a += b;
+            }
+        }
+
+        merge_counts(&mut self.domains, &other.domains);
+        merge_counts(&mut self.blocked_domains, &other.blocked_domains);
+        merge_counts(&mut self.clients, &other.clients);
+        merge_counts(&mut self.upstreams, &other.upstreams);
+        merge_counts(&mut self.qtypes, &other.qtypes);
+        for (k, v) in &other.upstream_rtt_sum {
+            *self.upstream_rtt_sum.entry(k.clone()).or_insert(0.0) += v;
+        }
+        for (k, v) in &other.upstream_rtt_count {
+            *self.upstream_rtt_count.entry(k.clone()).or_insert(0) += v;
+        }
+
+        for b in &other.series {
+            match self.series.iter_mut().find(|x| x.hour == b.hour) {
+                Some(x) => {
+                    x.total += b.total;
+                    x.blocked += b.blocked;
+                    x.cached += b.cached;
+                }
+                None => self.series.push(b.clone()),
+            }
+        }
+    }
 }
 
-fn bump(map: &mut HashMap<String, u64>, key: &str, by: u64) {
+fn merge_counts(dst: &mut HashMap<String, u64>, src: &HashMap<String, u64>) {
+    for (k, v) in src {
+        *dst.entry(k.clone()).or_insert(0) += v;
+    }
+}
+
+fn bump(map: &mut HashMap<String, u64>, key: &str, by: u64, cap: usize) {
     if let Some(v) = map.get_mut(key) {
         *v += by;
-    } else if map.len() < MAX_KEYS {
+    } else if map.len() < cap {
         map.insert(key.to_string(), by);
     }
 }
 
-/// Aggregated statistics.
+/// Number of shards: one per CPU, rounded up to a power of two so shard
+/// selection is a cheap mask, and clamped to a sane range.
+fn shard_count() -> usize {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    n.next_power_of_two().clamp(1, 64)
+}
+
+/// A stable, process-wide slot for the calling thread, used to pin each thread
+/// to one shard. Worker threads are long-lived, so this is computed once.
+fn thread_slot() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SLOT: Cell<usize> = Cell::new(NEXT.fetch_add(1, Ordering::Relaxed));
+    }
+    SLOT.with(|s| s.get())
+}
+
+/// Aggregated statistics, split into per-CPU shards to avoid lock contention.
 pub struct Stats {
-    inner: Mutex<StatsInner>,
-    enabled: std::sync::atomic::AtomicBool,
-    max_buckets: std::sync::atomic::AtomicUsize,
+    shards: Vec<Mutex<StatsInner>>,
+    /// Bit mask for shard selection (`shards.len()` is a power of two).
+    mask: usize,
+    /// Per-shard distinct-key cap for the top-N maps.
+    key_cap: usize,
+    enabled: AtomicBool,
+    max_buckets: AtomicUsize,
 }
 
 impl Stats {
     pub fn new(enabled: bool, retention_days: u32) -> Self {
-        let mut inner = StatsInner::default();
-        inner.ensure_hist();
+        let n = shard_count();
+        let shards = (0..n)
+            .map(|_| {
+                let mut inner = StatsInner::default();
+                inner.ensure_hist();
+                Mutex::new(inner)
+            })
+            .collect();
         Self {
-            inner: Mutex::new(inner),
-            enabled: std::sync::atomic::AtomicBool::new(enabled),
-            max_buckets: std::sync::atomic::AtomicUsize::new(
-                ((retention_days.max(1)) * 24) as usize,
-            ),
+            shards,
+            mask: n - 1,
+            key_cap: (MAX_KEYS / n).max(1024),
+            enabled: AtomicBool::new(enabled),
+            max_buckets: AtomicUsize::new(((retention_days.max(1)) * 24) as usize),
         }
     }
 
+    /// The shard this thread records into.
+    fn shard(&self) -> &Mutex<StatsInner> {
+        &self.shards[thread_slot() & self.mask]
+    }
+
     pub fn reconfigure(&self, enabled: bool, retention_days: u32) {
-        self.enabled
-            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.enabled.store(enabled, Ordering::Relaxed);
         let max = ((retention_days.max(1)) * 24) as usize;
-        self.max_buckets
-            .store(max, std::sync::atomic::Ordering::Relaxed);
-        let mut inner = self.inner.lock();
-        while inner.series.len() > max {
-            inner.series.remove(0);
+        self.max_buckets.store(max, Ordering::Relaxed);
+        for shard in &self.shards {
+            let mut inner = shard.lock();
+            while inner.series.len() > max {
+                inner.series.remove(0);
+            }
         }
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Record one completed query.
@@ -116,11 +209,26 @@ impl Stats {
         if !self.is_enabled() {
             return;
         }
-        let mut s = self.inner.lock();
+
+        // Prepare everything that doesn't need the lock first, and keep the
+        // critical section to cheap map probes / increments. The top-N maps take
+        // `&str` keys and only allocate when a *new* key is inserted, so the
+        // common (existing-key) path holds the lock without allocating.
+        let blocked = entry.is_blocked();
+        let domain = entry.question.trim_end_matches('.');
+        let client = entry
+            .client_name
+            .as_deref()
+            .unwrap_or(entry.client_ip.as_str());
+        let idx = hist_index(entry.elapsed_ms);
+        let hour = entry.time_ms / 1000 / 3600;
+        let max = self.max_buckets.load(Ordering::Relaxed);
+        let cap = self.key_cap;
+
+        let mut s = self.shard().lock();
         s.ensure_hist();
         s.total += 1;
 
-        let blocked = entry.is_blocked();
         match entry.action {
             QueryAction::Cached => s.cached += 1,
             QueryAction::Rewritten => s.rewritten += 1,
@@ -134,30 +242,33 @@ impl Stats {
         // Latency.
         s.proc_time_sum_ms += entry.elapsed_ms;
         s.proc_time_count += 1;
-        let idx = hist_index(entry.elapsed_ms);
         s.latency_hist[idx] += 1;
 
         // Top-N counters.
-        let domain = entry.question.trim_end_matches('.').to_string();
-        bump(&mut s.domains, &domain, 1);
+        bump(&mut s.domains, domain, 1, cap);
         if blocked {
-            bump(&mut s.blocked_domains, &domain, 1);
+            bump(&mut s.blocked_domains, domain, 1, cap);
         }
-        let client = entry
-            .client_name
-            .clone()
-            .unwrap_or_else(|| entry.client_ip.clone());
-        bump(&mut s.clients, &client, 1);
-        bump(&mut s.qtypes, &entry.qtype, 1);
+        bump(&mut s.clients, client, 1, cap);
+        bump(&mut s.qtypes, &entry.qtype, 1, cap);
         if let Some(up) = &entry.upstream {
-            bump(&mut s.upstreams, up, 1);
-            *s.upstream_rtt_sum.entry(up.clone()).or_insert(0.0) += entry.elapsed_ms;
-            *s.upstream_rtt_count.entry(up.clone()).or_insert(0) += 1;
+            bump(&mut s.upstreams, up, 1, cap);
+            // Avoid cloning the upstream name on the hot (existing-key) path.
+            match s.upstream_rtt_sum.get_mut(up) {
+                Some(v) => *v += entry.elapsed_ms,
+                None => {
+                    s.upstream_rtt_sum.insert(up.clone(), entry.elapsed_ms);
+                }
+            }
+            match s.upstream_rtt_count.get_mut(up) {
+                Some(v) => *v += 1,
+                None => {
+                    s.upstream_rtt_count.insert(up.clone(), 1);
+                }
+            }
         }
 
         // Time series (hourly).
-        let hour = entry.time_ms / 1000 / 3600;
-        let max = self.max_buckets.load(std::sync::atomic::Ordering::Relaxed);
         match s.series.last_mut() {
             Some(b) if b.hour == hour => {
                 b.total += 1;
@@ -184,14 +295,34 @@ impl Stats {
 
     /// Reset all statistics.
     pub fn reset(&self) {
-        let mut inner = self.inner.lock();
-        *inner = StatsInner::default();
-        inner.ensure_hist();
+        for shard in &self.shards {
+            let mut inner = shard.lock();
+            *inner = StatsInner::default();
+            inner.ensure_hist();
+        }
+    }
+
+    /// Merge every shard into a single view. Shards are locked one at a time, so
+    /// a concurrently-recording thread may land just before or after the merge
+    /// point — acceptable for monotonic, approximate statistics.
+    fn merged(&self) -> StatsInner {
+        let mut acc = StatsInner::default();
+        acc.ensure_hist();
+        for shard in &self.shards {
+            let s = shard.lock();
+            acc.merge_from(&s);
+        }
+        acc.series.sort_by_key(|b| b.hour);
+        let max = self.max_buckets.load(Ordering::Relaxed);
+        while acc.series.len() > max {
+            acc.series.remove(0);
+        }
+        acc
     }
 
     /// Build a snapshot for the API/UI.
     pub fn snapshot(&self, top_n: usize) -> StatsSummary {
-        let s = self.inner.lock();
+        let s = self.merged();
         let avg_proc = if s.proc_time_count > 0 {
             s.proc_time_sum_ms / s.proc_time_count as f64
         } else {
@@ -241,14 +372,24 @@ impl Stats {
 
     /// Serialize state for persistence.
     pub fn export(&self) -> String {
-        serde_json::to_string(&*self.inner.lock()).unwrap_or_default()
+        serde_json::to_string(&self.merged()).unwrap_or_default()
     }
 
-    /// Load persisted state (best-effort; ignores malformed data).
+    /// Load persisted state (best-effort; ignores malformed data). Everything is
+    /// loaded into a single shard; the rest are cleared.
     pub fn import(&self, json: &str) {
-        if let Ok(mut loaded) = serde_json::from_str::<StatsInner>(json) {
-            loaded.ensure_hist();
-            *self.inner.lock() = loaded;
+        let Ok(mut loaded) = serde_json::from_str::<StatsInner>(json) else {
+            return;
+        };
+        loaded.ensure_hist();
+        for (i, shard) in self.shards.iter().enumerate() {
+            let mut g = shard.lock();
+            if i == 0 {
+                *g = loaded.clone();
+            } else {
+                *g = StatsInner::default();
+                g.ensure_hist();
+            }
         }
     }
 }
@@ -384,5 +525,29 @@ mod tests {
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].total, 2);
         assert_eq!(snap.series[0].blocked, 1);
+    }
+
+    #[test]
+    fn aggregates_across_shards() {
+        // Spread records across many threads so multiple shards are populated,
+        // then confirm the merged snapshot is exact.
+        let s = std::sync::Arc::new(Stats::new(true, 30));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let s = s.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..1000 {
+                    s.record(&entry("ads.com.", QueryAction::Blocked, 0.5, Some("1.1.1.1")));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let snap = s.snapshot(10);
+        assert_eq!(snap.total, 16_000);
+        assert_eq!(snap.blocked, 16_000);
+        assert_eq!(snap.top_blocked_domains[0].count, 16_000);
+        assert_eq!(snap.latency_hist.iter().sum::<u64>(), 16_000);
     }
 }
