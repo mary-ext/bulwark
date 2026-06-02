@@ -120,7 +120,7 @@ The filtering engine. Pure, no I/O, fully unit-tested.
 - [x] Filter list manager: load from text, merge multiple lists, stats per list.
 - [x] Extensive unit tests + criterion-style sanity benches (in tests).
 
-### Phase 2 — `bulwark-upstream`  `[x]`
+### Phase 2 — `bulwark-upstream`  `[x]` — DONE
 Upstream resolution layer.
 - [x] Transport trait `Upstream { resolve(query) -> Response }`.
 - [x] Plain DNS over UDP (+ TCP fallback on truncation).

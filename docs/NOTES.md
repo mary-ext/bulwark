@@ -64,7 +64,41 @@ Decisions / faithful-to-AdGuard choices:
   whole rule is skipped (counted as `unsupported`) rather than mis-matched.
 - 50k-rule build + 10k lookups complete in well under the 2s test budget.
 
-## Phase 2 — upstream
+## Phase 2 — upstream — DONE
+
+Modules: `spec` (parse `udp/tcp/tls/https/quic://`), `transport` (trait +
+`QueryKey` + wire codec), `plain` (UDP w/ TCP-on-truncation, TCP), `dot`,
+`doh`, `doq`, `bootstrap`, `tlsconf`, `pool`.
+
+Key decisions:
+- **Transport trait** returns `BoxFuture` so the pool can hold heterogeneous
+  `Box<dyn Transport>`. UDP binds an ephemeral socket per query (simple,
+  stateless; cache + single-flight keep volume low). DoT keeps one persistent
+  TLS connection, serialised by a `tokio::Mutex` (reconnects on error). DoH uses
+  `reqwest` (HTTP/2 keep-alive) with the host pinned to bootstrap-resolved IPs so
+  it never loops through Bulwark itself. DoQ opens one bi-stream per query over a
+  reused QUIC connection (id forced to 0 per RFC 9250).
+- **Bootstrap**: resolves DoT/DoH/DoQ hostnames via plain-DNS to well-known
+  servers (default 1.1.1.1/8.8.8.8) so encrypted upstreams referenced by name
+  don't depend on (and can't loop through) Bulwark.
+- **Single-flight**: `futures::Shared` future keyed by `QueryKey` in a mutexed
+  map; the first caller is "leader" and removes the entry on completion, others
+  await the shared result. Verified: 16 concurrent identical queries → 1 upstream
+  request.
+- **Fastest upstream + sequential failover**: per-upstream EWMA latency + health;
+  `ordered()` sorts healthy-first then by latency; `resolve_sequential` tries one
+  at a time. Never parallel — satisfies the politeness requirement. Verified by
+  tests (prefers fast upstream after probing; fails over past a dead one).
+- **Background probing**: `probe_all()` sends `NS .` to each upstream once,
+  sequentially, refreshing latency/health. Server schedules it on a timer.
+- rustls crypto provider (ring) installed once via `OnceLock`.
+
+Environment note: this dev sandbox routes outbound HTTPS through a proxy
+(`CLAUDE_CODE_PROXY_RESOLVES_HOSTS`) and blocks direct TCP/QUIC to :443/:853, so
+the `#[ignore]`d live DoT/DoH/DoQ tests time out *here*; `live_udp` passes. The
+transports are written to spec and should work wherever direct egress exists
+(the intended Tailscale deployment). Fixed a real bug: DoH must negotiate h2 via
+ALPN, not `http2_prior_knowledge()` (that's for cleartext h2c).
 
 ## Phase 3 — cache
 
