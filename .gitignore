@@ -6,12 +6,11 @@ Cargo.lock.orig
 # Node / web
 node_modules/
 .vite/
-# The built UI bundle is generated, not committed. `server/build.rs` rebuilds it
-# during `cargo build` when pnpm + web/node_modules are present; otherwise a
-# placeholder is embedded. The folder itself is kept (.gitkeep) so the
-# rust-embed `#[folder]` always compiles.
-web/dist/*
-!web/dist/.gitkeep
+# The built UI bundle is generated, not committed. The web build and the Rust
+# build are decoupled (see server/build.rs / README): `cargo build` embeds
+# whatever is in web/dist, and server/build.rs creates the directory (with a
+# .keep marker) if it's missing so the rust-embed `#[folder]` always compiles.
+web/dist/
 
 # Editor / OS
 .DS_Store

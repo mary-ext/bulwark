@@ -55,21 +55,30 @@ A Cargo workspace of focused, independently-tested crates:
 
 ### Build
 
-The web UI is embedded into the binary at compile time. Build its dependencies
-once, then build normally:
+The web UI is embedded into the binary at compile time, but the **web build and
+the Rust build are decoupled**: `cargo build` only embeds whatever is already in
+`web/dist` — it never runs `pnpm`. Build the front-end first, then the binary:
 
 ```sh
-cd web && pnpm install && cd ..
+cd web && pnpm install && pnpm build && cd ..
 cargo build --release
 ```
 
-`server/build.rs` automatically runs `pnpm build` during the Cargo build (when
-`pnpm` + `web/node_modules` are present) so the embedded UI always matches the
-front-end sources. The built bundle (`web/dist`) is generated, **not** committed.
-If you build without a Node toolchain, the server still compiles and runs — it
-just serves a small "UI not built" placeholder until you run `pnpm build` in
-`web/`. You can also iterate on the UI live with `cd web && pnpm dev` (it proxies
-`/api` to a running server on `:3000`).
+Or, with [`just`](https://github.com/casey/just): `just install && just dist`.
+
+The built bundle (`web/dist`) is generated, **not** committed. If you build
+without a Node toolchain (or before building the UI), the server still compiles
+and runs — it just serves a small "UI not built" placeholder, and `cargo` prints
+a warning. Iterate on the UI live with `cd web && pnpm dev` (it proxies `/api` to
+a running server on `:3000`); in that mode you don't need the embedded bundle at
+all.
+
+> **Why decoupled?** The front-end's API client is generated from an OpenAPI
+> spec that the server emits. If `cargo build` also drove `pnpm build`, building
+> the server would require the web bundle, which would require the spec, which
+> would require building the server — a cycle. Keeping the steps separate makes
+> the pipeline a straight line: spec → client codegen → `pnpm build` →
+> `cargo build`.
 
 ### Run
 
