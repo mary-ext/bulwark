@@ -174,17 +174,33 @@ The query-processing pipeline & observability.
 - [x] Embeds the built web UI via `rust-embed`; serves SPA.
 - [x] Graceful shutdown, structured logging (`tracing`).
 
-### Phase 7 — Web UI  `[x]`
+### Phase 7 — Web UI  `[x]` — DONE
 - [x] Svelte + Vite + TS SPA.
 - [x] Dashboard (stats, charts), Query Log, Filters (lists + custom rules),
       Upstreams, Clients, Settings, Login.
 - [x] Talks to REST API; live-ish updates via polling (polite).
-- [x] `pnpm build` → static assets embedded in the binary.
+- [x] `pnpm build` → static assets embedded in the binary (Chart.js for charts).
 
-### Phase 8 — Integration, polish, docs  `[x]`
-- [x] End-to-end smoke test (spin server, real query through dig/hickory).
-- [x] README with quick start, Tailscale notes, config reference.
-- [x] Final pass: clippy, fmt, deny warnings where reasonable.
+### Phase 8 — Integration, polish, docs  `[ ]`
+- [ ] End-to-end smoke test (spin server, real query through hickory/python).
+- [ ] README with quick start, Tailscale notes, config reference.
+- [ ] Final pass: clippy, fmt, deny warnings where reasonable.
+
+### Phase 9 — Filtering optimization (learn from adblock-rust)  `[ ]`
+Study Brave's [`adblock-rust`](https://github.com/brave/adblock-rust) to sharpen
+our request-filtering engine. Areas to mine for ideas:
+- **Tokenization / reverse-index**: adblock-rust buckets network rules by an
+  optimal token (rarest n-gram) so a query only checks a small candidate set
+  instead of scanning. Our subdomain/exact hash maps already give O(labels)
+  lookup, but wildcard/regex rules are scanned linearly — a tokenized prefilter
+  would cut that.
+- **Rule data layout**: their flatbuffer/compact representations reduce memory
+  and improve cache locality for large lists (100k–1M rules).
+- **Optimization passes**: rule de-duplication, fusing, and discarding
+  redundant rules at compile time.
+- Benchmark before/after with large real lists; keep the AdGuard-compatible
+  semantics we already test.
+(`adblock-rust` is GPL/MPL — we study concepts, not copy code.)
 
 ---
 

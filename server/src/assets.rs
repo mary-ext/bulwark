@@ -47,7 +47,9 @@ async fn index() -> Response {
 }
 
 async fn asset(Path(path): Path<String>) -> Response {
-    serve_path(&path)
+    // The wildcard captures the part after `/assets/`; embedded keys are
+    // relative to the dist root, so restore the prefix.
+    serve_path(&format!("assets/{path}"))
 }
 
 async fn fallback(uri: Uri) -> Response {

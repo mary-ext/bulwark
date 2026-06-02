@@ -172,4 +172,27 @@ API surface: `/api/status|setup|login|logout`, `/api/config` (+ section PUTs
 `check`, `lists` CRUD + `refresh`), `/api/clients`, `/api/stats` (+ `reset`),
 `/api/querylog` (GET/DELETE), `/api/upstreams` (+ `test`).
 
-## Phase 7 — web UI
+## Phase 7 — web UI — DONE
+
+Svelte 5 (runes) + Vite + TypeScript SPA in `web/`, built to `web/dist` and
+embedded via `rust-embed`. Charts use **Chart.js** (per request — more reliable
+than hand-rolled SVG). Hash-based routing; a typed `api.ts` client; a toast
+store; dark theme in `app.css`.
+
+Views: Login/Setup, Dashboard (stat cards + time-series line, top
+domains/blocked/clients bars, qtype doughnut, latency histogram; 5s polling),
+Query Log (filter/search/paginate, live toggle), Filters (lists CRUD + refresh,
+custom-rules editor, check-a-domain tool), Upstreams (live status/RTT table +
+chart, add/remove/test, settings), Clients (named IP/CIDR + tags + per-client
+filtering), Settings (filtering/cache/querylog/stats/server sections).
+
+Gotchas:
+- `web/dist` is committed (un-ignored) so `cargo build` embeds a working UI with
+  no Node needed. `pnpm build` regenerates it.
+- Asset route `/assets/{*path}` captures the path *after* `/assets/`; the
+  handler re-prepends `assets/` to match embed keys (rust-embed keys are
+  relative to the dist root). Verified JS/CSS serve with correct content types.
+- esbuild's pnpm build script is allow-listed via `pnpm.onlyBuiltDependencies`.
+- Test-harness notes: foreground `sleep` is blocked (use `curl --retry`);
+  `pkill -f target/debug/bulwark` matches the shell's own command line and kills
+  it — use `pkill -x bulwark`.
