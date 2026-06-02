@@ -1,0 +1,27 @@
+[package]
+name = "bulwark-upstream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hickory-proto.workspace = true
+tokio.workspace = true
+futures.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
+quinn.workspace = true
+reqwest.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+arc-swap.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
