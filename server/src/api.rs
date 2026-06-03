@@ -840,7 +840,8 @@ pub async fn get_stats(
     State(state): State<AppState>,
     Query(q): Query<TopQuery>,
 ) -> Json<StatsResponse> {
-    let summary = state.engine.stats().snapshot(q.top);
+    let clients = state.engine.clients();
+    let summary = state.engine.stats().snapshot(q.top, &clients);
     let cache = state.engine.cache();
     Json(StatsResponse::new(
         summary,
@@ -902,7 +903,7 @@ pub async fn get_querylog(
     let page = state
         .engine
         .log()
-        .query(&filter, q.offset, q.limit.min(1000));
+        .query(&filter, q.offset, q.limit.min(1000), &state.engine.clients());
 
     // Resolve list ids to friendly names so the UI can show which list (and
     // which rule) was responsible. A block is one winning rule from one list;

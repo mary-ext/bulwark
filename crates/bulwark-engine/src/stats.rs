@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::clients::ClientMatcher;
 use crate::querylog::{QueryAction, QueryLogEntry};
 
 /// Upper bound on distinct keys tracked per top-N map, summed across shards
@@ -231,10 +232,10 @@ impl Stats {
         // common (existing-key) path holds the lock without allocating.
         let blocked = entry.is_blocked();
         let domain = entry.question.trim_end_matches('.');
-        let client = entry
-            .client_name
-            .as_deref()
-            .unwrap_or(entry.client_ip.as_str());
+        // Keyed by the stable client IP, never the friendly name: the name is a
+        // presentation concern resolved at snapshot time, so renaming a client
+        // doesn't split its history into a separate bucket.
+        let client = entry.client_ip.as_str();
         let idx = hist_index(entry.elapsed_ms);
         let hour = entry.time_ms / 1000 / 3600;
         let max = self.max_buckets.load(Ordering::Relaxed);
@@ -343,8 +344,9 @@ impl Stats {
         acc
     }
 
-    /// Build a snapshot for the API/UI.
-    pub fn snapshot(&self, top_n: usize) -> StatsSummary {
+    /// Build a snapshot for the API/UI. `clients` is the current client matcher,
+    /// used to resolve the IP-keyed client counts to friendly names at read time.
+    pub fn snapshot(&self, top_n: usize, clients: &ClientMatcher) -> StatsSummary {
         let s = self.merged();
         let avg_proc = if s.proc_time_count > 0 {
             s.proc_time_sum_ms / s.proc_time_count as f64
@@ -381,7 +383,7 @@ impl Stats {
             latency_hist: s.latency_hist.clone(),
             top_domains: top_n_of(&s.domains, top_n),
             top_blocked_domains: top_n_of(&s.blocked_domains, top_n),
-            top_clients: top_n_of(&s.clients, top_n),
+            top_clients: top_clients_resolved(&s.clients, clients, top_n),
             top_upstreams: top_n_of(&s.upstreams, top_n),
             qtypes: top_n_of(&s.qtypes, top_n),
             upstream_avg_rtt_ms: upstream_rtt,
@@ -488,6 +490,34 @@ fn top_n_of(map: &HashMap<String, u64>, n: usize) -> Vec<TopEntry> {
     v
 }
 
+/// Build the top-N client list from IP-keyed counts, resolving each IP to its
+/// current configured name and aggregating per name. Resolution happens here (at
+/// read time) rather than at record time, so renaming a client merges its
+/// history under the new name, and removing the name reverts it to the bare IP —
+/// both retroactively, with no divergence between old and new data. IPs covered
+/// by the same named (e.g. CIDR) client collapse into one row.
+fn top_clients_resolved(
+    counts: &HashMap<String, u64>,
+    clients: &ClientMatcher,
+    n: usize,
+) -> Vec<TopEntry> {
+    let mut by_label: HashMap<&str, u64> = HashMap::with_capacity(counts.len());
+    for (ip, &count) in counts {
+        let label = clients.name_for_str(ip).unwrap_or(ip.as_str());
+        *by_label.entry(label).or_insert(0) += count;
+    }
+    let mut v: Vec<TopEntry> = by_label
+        .into_iter()
+        .map(|(name, count)| TopEntry {
+            name: name.to_string(),
+            count,
+        })
+        .collect();
+    v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+    v.truncate(n);
+    v
+}
+
 /// A name + count pair for top-N lists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopEntry {
@@ -576,7 +606,7 @@ mod tests {
         s.record(&entry("good.com.", forwarded("1.1.1.1"), 12.0));
         s.record(&entry("good.com.", QueryAction::Cached, 0.1));
 
-        let snap = s.snapshot(10);
+        let snap = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(snap.total, 4);
         assert_eq!(snap.blocked, 2);
         assert_eq!(snap.cached, 1);
@@ -587,6 +617,48 @@ mod tests {
         assert!(snap.latency_hist.iter().sum::<u64>() == 4);
     }
 
+    fn entry_ip(ip: &str, action: QueryAction) -> QueryLogEntry {
+        QueryLogEntry {
+            client_ip: ip.into(),
+            ..entry("x.com.", action, 1.0)
+        }
+    }
+
+    #[test]
+    fn top_clients_resolve_names_retroactively() {
+        use bulwark_config::ClientConfig;
+
+        let s = Stats::new(true, 30);
+        // Two distinct IPs in the same /24, plus an unrelated one.
+        s.record(&entry_ip("10.0.0.1", forwarded("u")));
+        s.record(&entry_ip("10.0.0.2", forwarded("u")));
+        s.record(&entry_ip("10.0.0.2", forwarded("u")));
+        s.record(&entry_ip("192.168.1.5", forwarded("u")));
+
+        // No client config: each IP is its own row, keyed by the bare IP.
+        let bare = s.snapshot(10, &ClientMatcher::default());
+        assert_eq!(bare.top_clients.len(), 3);
+
+        // Name the /24 "lan": the two 10.0.0.x rows collapse under "lan"
+        // retroactively, without re-recording anything. Removing the name later
+        // (an empty matcher) reverts them to bare IPs — as the `bare` case shows.
+        let m = ClientMatcher::build(&[ClientConfig {
+            name: "lan".into(),
+            ids: vec!["10.0.0.0/24".into()],
+            tags: vec![],
+            filtering_enabled: true,
+        }]);
+        let named = s.snapshot(10, &m);
+        assert_eq!(named.top_clients.len(), 2);
+        let lan = named
+            .top_clients
+            .iter()
+            .find(|t| t.name == "lan")
+            .expect("named row present");
+        assert_eq!(lan.count, 3);
+        assert!(named.top_clients.iter().any(|t| t.name == "192.168.1.5"));
+    }
+
     #[test]
     fn export_import_roundtrip() {
         let s = Stats::new(true, 30);
@@ -594,7 +666,7 @@ mod tests {
         let dump = s.export();
         let s2 = Stats::new(true, 30);
         s2.import(&dump);
-        assert_eq!(s2.snapshot(10).total, 1);
+        assert_eq!(s2.snapshot(10, &ClientMatcher::default()).total, 1);
     }
 
     #[test]
@@ -607,7 +679,7 @@ mod tests {
         for _ in 0..5 {
             s.record(&entry("a.com.", forwarded("up"), 300.0));
         }
-        let snap = s.snapshot(10);
+        let snap = s.snapshot(10, &ClientMatcher::default());
         let p = snap.upstream_latency_pct.get("up").expect("upstream present");
         // p50/p90 fall in the ≤5ms bucket; p99 lands in the slow tail.
         assert!(p.p50 <= 5.0, "p50 = {}", p.p50);
@@ -620,7 +692,7 @@ mod tests {
         let s = Stats::new(true, 1);
         s.record(&entry("x.com.", forwarded("1.1.1.1"), 1.0));
         s.record(&entry("y.com.", blocked(), 1.0));
-        let snap = s.snapshot(10);
+        let snap = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].total, 2);
         assert_eq!(snap.series[0].blocked, 1);
@@ -643,7 +715,7 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let snap = s.snapshot(10);
+        let snap = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(snap.total, 16_000);
         assert_eq!(snap.blocked, 16_000);
         assert_eq!(snap.top_blocked_domains[0].count, 16_000);

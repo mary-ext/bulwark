@@ -141,6 +141,11 @@ impl Engine {
     pub fn stats(&self) -> &Arc<Stats> {
         &self.stats
     }
+    /// The current (hot-swappable) client matcher. Used to resolve client names
+    /// at read time so renames/removals apply retroactively to stats and logs.
+    pub fn clients(&self) -> Arc<ClientMatcher> {
+        self.state.load().clients.clone()
+    }
     pub fn pool(&self) -> Arc<UpstreamPool> {
         self.state.load().pool.clone()
     }
@@ -322,7 +327,6 @@ impl Engine {
 /// [`build`](LogBuilder::build).
 struct LogBuilder {
     client_ip: IpAddr,
-    client_name: Option<String>,
     question: String,
     qtype: Cow<'static, str>,
     allowlisted: bool,
@@ -337,7 +341,6 @@ impl LogBuilder {
             // Kept as an `IpAddr` (Copy); only stringified in `build()`, which the
             // caller skips entirely when neither logging nor stats is enabled.
             client_ip: client.ip,
-            client_name: client.name.clone(),
             question,
             qtype,
             allowlisted: false,
@@ -352,7 +355,10 @@ impl LogBuilder {
             id,
             time_ms: now_ms(),
             client_ip: self.client_ip.to_string(),
-            client_name: self.client_name,
+            // The friendly name is resolved at read time from the current client
+            // config (see `QueryLog::query`), not frozen in at log time, so
+            // renames/removals apply retroactively.
+            client_name: None,
             question: self.question,
             qtype: self.qtype,
             action,
