@@ -22,3 +22,6 @@ web/dist/
 /data/
 *.log
 config.local.yaml
+
+# Research stuff
+/.research/
