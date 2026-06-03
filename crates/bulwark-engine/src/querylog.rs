@@ -234,7 +234,12 @@ impl QueryLog {
             .collect();
 
         let total = matched.len();
-        let entries = matched.into_iter().skip(offset).take(limit).cloned().collect();
+        let entries = matched
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .cloned()
+            .collect();
         LogPage { entries, total }
     }
 }

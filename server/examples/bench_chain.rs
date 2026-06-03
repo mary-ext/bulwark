@@ -39,12 +39,14 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
-const ADGUARD_URL: &str =
-    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
+const ADGUARD_URL: &str = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
 const OISD_URL: &str = "https://big.oisd.nl/";
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -160,7 +162,10 @@ fn parse_blockable(line: &str) -> Option<String> {
         if domain.contains('.') {
             return Some(domain.to_string());
         }
-    } else if let Some(rest) = line.strip_prefix("0.0.0.0 ").or_else(|| line.strip_prefix("127.0.0.1 ")) {
+    } else if let Some(rest) = line
+        .strip_prefix("0.0.0.0 ")
+        .or_else(|| line.strip_prefix("127.0.0.1 "))
+    {
         let domain = rest.trim();
         if domain.contains('.') && !domain.contains(' ') {
             return Some(domain.to_string());
@@ -171,10 +176,26 @@ fn parse_blockable(line: &str) -> Option<String> {
 
 /// A handful of real popular domains, used as the "allowed / forwarded" set.
 const POPULAR: &[&str] = &[
-    "google.com", "youtube.com", "facebook.com", "wikipedia.org", "amazon.com",
-    "reddit.com", "github.com", "cloudflare.com", "apple.com", "microsoft.com",
-    "netflix.com", "twitch.tv", "stackoverflow.com", "mozilla.org", "rust-lang.org",
-    "nytimes.com", "bbc.co.uk", "spotify.com", "wordpress.org", "debian.org",
+    "google.com",
+    "youtube.com",
+    "facebook.com",
+    "wikipedia.org",
+    "amazon.com",
+    "reddit.com",
+    "github.com",
+    "cloudflare.com",
+    "apple.com",
+    "microsoft.com",
+    "netflix.com",
+    "twitch.tv",
+    "stackoverflow.com",
+    "mozilla.org",
+    "rust-lang.org",
+    "nytimes.com",
+    "bbc.co.uk",
+    "spotify.com",
+    "wordpress.org",
+    "debian.org",
 ];
 
 // ---------------------------------------------------------------------------
@@ -196,7 +217,9 @@ async fn mock_upstream(delay: Duration) -> (SocketAddr, Arc<AtomicU64>) {
                 Err(_) => break,
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            let Ok(query) = Message::from_vec(&buf[..n]) else { continue };
+            let Ok(query) = Message::from_vec(&buf[..n]) else {
+                continue;
+            };
             let mut resp = query.clone();
             resp.metadata.message_type = MessageType::Response;
             if let Some(q) = query.queries.first() {
@@ -237,8 +260,14 @@ async fn build_engine(
 ) -> Arc<Engine> {
     let pool = Arc::new(
         UpstreamPool::build(
-            &[PoolEntry { spec: format!("udp://{upstream}"), name: Some("mock".into()) }],
-            PoolSettings { query_timeout: timeout, ..Default::default() },
+            &[PoolEntry {
+                spec: format!("udp://{upstream}"),
+                name: Some("mock".into()),
+            }],
+            PoolSettings {
+                query_timeout: timeout,
+                ..Default::default()
+            },
         )
         .await
         .unwrap(),
@@ -264,7 +293,11 @@ async fn build_engine(
 fn query(name: &str, rtype: RecordType) -> Message {
     let mut m = Message::new(rand::random(), MessageType::Query, OpCode::Query);
     m.metadata.recursion_desired = true;
-    let fqdn = if name.ends_with('.') { name.to_string() } else { format!("{name}.") };
+    let fqdn = if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    };
     let mut q = Query::query(Name::from_str(&fqdn).unwrap(), rtype);
     q.set_query_class(DNSClass::IN);
     m.queries.push(q);
@@ -360,8 +393,11 @@ fn rcode_label(code: ResponseCode) -> String {
 fn phase0_ab(blocked: &[String]) {
     println!("\n== Phase 0: optimized hot-path steps, before vs after (best-of-5) ==");
     let n = 1_000_000usize;
-    let msgs: Vec<Message> =
-        blocked.iter().take(5_000).map(|d| query(d, RecordType::A)).collect();
+    let msgs: Vec<Message> = blocked
+        .iter()
+        .take(5_000)
+        .map(|d| query(d, RecordType::A))
+        .collect();
 
     // --- Name + cache-key derivation, per query ---
     // OLD: lowercase the name for `domain`, then QueryKey::from_message re-walks
@@ -382,7 +418,11 @@ fn phase0_ab(blocked: &[String]) {
         let name_lower = qname_display.to_ascii_lowercase();
         let domain = name_lower.trim_end_matches('.');
         let dlen = domain.len();
-        let key = QueryKey { name: name_lower, rtype: q.query_type(), class: q.query_class() };
+        let key = QueryKey {
+            name: name_lower,
+            rtype: q.query_type(),
+            class: q.query_class(),
+        };
         dlen + key.name.len()
     });
     println!(
@@ -391,7 +431,11 @@ fn phase0_ab(blocked: &[String]) {
     );
 
     // --- Response-code label, per query (runs on every response) ---
-    let codes = [ResponseCode::NoError, ResponseCode::NXDomain, ResponseCode::ServFail];
+    let codes = [
+        ResponseCode::NoError,
+        ResponseCode::NXDomain,
+        ResponseCode::ServFail,
+    ];
     let old_r = best_ns_per_op(5, n, |i| {
         let c = codes[i % codes.len()];
         format!("{c:?}").to_uppercase().len()
@@ -405,7 +449,12 @@ fn phase0_ab(blocked: &[String]) {
     // --- Record-type label, per query (runs on every query: filter + log) ---
     // OLD: RecordType::to_string() heap-allocates. NEW: a borrowed &'static str
     // for the common types.
-    let rtypes = [RecordType::A, RecordType::AAAA, RecordType::HTTPS, RecordType::TXT];
+    let rtypes = [
+        RecordType::A,
+        RecordType::AAAA,
+        RecordType::HTTPS,
+        RecordType::TXT,
+    ];
     let old_t = best_ns_per_op(5, n, |i| rtypes[i % rtypes.len()].to_string().len());
     let new_t = best_ns_per_op(5, n, |i| rtype_label(rtypes[i % rtypes.len()]).len());
     println!(
@@ -438,11 +487,15 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
 
     // Build a representative set of query names.
     let hits: Vec<&str> = blocked.iter().take(10_000).map(|s| s.as_str()).collect();
-    let misses: Vec<String> =
-        (0..10_000).map(|i| format!("node{i}.cdn-{}.example", i % 31)).collect();
+    let misses: Vec<String> = (0..10_000)
+        .map(|i| format!("node{i}.cdn-{}.example", i % 31))
+        .collect();
 
     // (a) Name normalization as handle() does it (to_ascii + lowercase).
-    let names: Vec<Name> = hits.iter().map(|h| Name::from_str(&format!("{h}.")).unwrap()).collect();
+    let names: Vec<Name> = hits
+        .iter()
+        .map(|h| Name::from_str(&format!("{h}.")).unwrap())
+        .collect();
     let t = Instant::now();
     let mut acc = 0usize;
     for i in 0..n {
@@ -451,7 +504,11 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         let lower = display.to_ascii_lowercase();
         acc += lower.trim_end_matches('.').len();
     }
-    println!("  {:<28} {:>6} ns/op  (sink={acc})", "name normalize (ascii+lc)", t.elapsed().as_nanos() / n as u128);
+    println!(
+        "  {:<28} {:>6} ns/op  (sink={acc})",
+        "name normalize (ascii+lc)",
+        t.elapsed().as_nanos() / n as u128
+    );
 
     // (b) QueryKey::from_message.
     let msgs: Vec<Message> = hits.iter().map(|h| query(h, RecordType::A)).collect();
@@ -462,7 +519,11 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
             acc += k.name.len();
         }
     }
-    println!("  {:<28} {:>6} ns/op  (sink={acc})", "QueryKey::from_message", t.elapsed().as_nanos() / n as u128);
+    println!(
+        "  {:<28} {:>6} ns/op  (sink={acc})",
+        "QueryKey::from_message",
+        t.elapsed().as_nanos() / n as u128
+    );
 
     // (c) Client identification.
     let t = Instant::now();
@@ -470,7 +531,11 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
     for _ in 0..n {
         acc += matcher.identify(ip).ip.to_string().len();
     }
-    println!("  {:<28} {:>6} ns/op  (sink={acc})", "clients.identify", t.elapsed().as_nanos() / n as u128);
+    println!(
+        "  {:<28} {:>6} ns/op  (sink={acc})",
+        "clients.identify",
+        t.elapsed().as_nanos() / n as u128
+    );
 
     // (d) Filter check — blocked (hits real list rules).
     let t = Instant::now();
@@ -480,25 +545,46 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
             blk += 1;
         }
     }
-    println!("  {:<28} {:>6} ns/op  (blocked={blk})", "filter.check (blocked)", t.elapsed().as_nanos() / n as u128);
+    println!(
+        "  {:<28} {:>6} ns/op  (blocked={blk})",
+        "filter.check (blocked)",
+        t.elapsed().as_nanos() / n as u128
+    );
 
     // (e) Filter check — no match (the common resolver case).
     let t = Instant::now();
     for i in 0..n {
         let _ = filter.check(&misses[i % misses.len()], "A", &ci);
     }
-    println!("  {:<28} {:>6} ns/op", "filter.check (no match)", t.elapsed().as_nanos() / n as u128);
+    println!(
+        "  {:<28} {:>6} ns/op",
+        "filter.check (no match)",
+        t.elapsed().as_nanos() / n as u128
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Phase 2: whole-chain latency per scenario.
 // ---------------------------------------------------------------------------
 
-async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstream: SocketAddr, n: usize) {
+async fn phase2_scenarios(
+    filter: Arc<FilterEngine>,
+    blocked: &[String],
+    upstream: SocketAddr,
+    n: usize,
+) {
     println!("\n== Phase 2: whole-chain latency per scenario ==");
 
     // Production-like engine: optimistic cache on, generous stale window.
-    let engine = build_engine(filter.clone(), upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let engine = build_engine(
+        filter.clone(),
+        upstream,
+        Duration::from_millis(500),
+        0,
+        3600,
+        true,
+    )
+    .await;
 
     // Blocked: real list domains -> synthesized NXDOMAIN, never touches upstream.
     let bset: Vec<String> = blocked.iter().cloned().cycle().take(n).collect();
@@ -509,30 +595,64 @@ async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstrea
     scenario(&engine, "forwarded (miss+insert)", many(fwd, RecordType::A)).await;
 
     // Cache hit (fresh): warm one domain, then hammer it.
-    let _ = engine.handle(query("cache-hot.example.", RecordType::A), local()).await;
+    let _ = engine
+        .handle(query("cache-hot.example.", RecordType::A), local())
+        .await;
     let hot = (0..n).map(|_| "cache-hot.example".to_string());
     scenario(&engine, "cache hit (fresh)", many(hot, RecordType::A)).await;
 
     // Allowlisted / popular: forwarded, exercises the full miss-then-cache mix
     // across a small working set (mostly cache hits after warmup).
     let pop = (0..n).map(|i| POPULAR[i % POPULAR.len()].to_string());
-    scenario(&engine, "popular set (warm cache)", many(pop, RecordType::A)).await;
+    scenario(
+        &engine,
+        "popular set (warm cache)",
+        many(pop, RecordType::A),
+    )
+    .await;
 
     // Negative cache: nx- domains -> NXDOMAIN, cached negatively after first.
     let nx = (0..n).map(|i| format!("nx-{}.bench.example", i % 64));
-    scenario(&engine, "negative cache (NXDOMAIN)", many(nx, RecordType::A)).await;
+    scenario(
+        &engine,
+        "negative cache (NXDOMAIN)",
+        many(nx, RecordType::A),
+    )
+    .await;
 
     // Filtering disabled: skips the filter stage entirely.
-    let nofilter = build_engine(filter.clone(), upstream, Duration::from_millis(500), 0, 3600, false).await;
-    let _ = nofilter.handle(query("nf-hot.example.", RecordType::A), local()).await;
+    let nofilter = build_engine(
+        filter.clone(),
+        upstream,
+        Duration::from_millis(500),
+        0,
+        3600,
+        false,
+    )
+    .await;
+    let _ = nofilter
+        .handle(query("nf-hot.example.", RecordType::A), local())
+        .await;
     let nf = (0..n).map(|_| "nf-hot.example".to_string());
-    scenario(&nofilter, "filtering disabled (cache)", many(nf, RecordType::A)).await;
+    scenario(
+        &nofilter,
+        "filtering disabled (cache)",
+        many(nf, RecordType::A),
+    )
+    .await;
 
     // Optimistic stale serve: a dead upstream means background refresh never
     // succeeds, so every lookup serves the stale entry (isolates that path).
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
-    let stale_engine =
-        build_engine(filter.clone(), dead, Duration::from_millis(50), 1, 3600, true).await;
+    let stale_engine = build_engine(
+        filter.clone(),
+        dead,
+        Duration::from_millis(50),
+        1,
+        3600,
+        true,
+    )
+    .await;
     // Insert a fresh entry directly, then let it age past its 1s TTL.
     let key = QueryKey::from_message(&query("stale-hot.example.", RecordType::A)).unwrap();
     let mut warm = query("stale-hot.example.", RecordType::A);
@@ -546,7 +666,12 @@ async fn phase2_scenarios(filter: Arc<FilterEngine>, blocked: &[String], upstrea
     stale_engine.cache().insert(key, &warm);
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let stale = (0..n.min(5_000)).map(|_| "stale-hot.example".to_string());
-    scenario(&stale_engine, "cache hit (stale+refresh)", many(stale, RecordType::A)).await;
+    scenario(
+        &stale_engine,
+        "cache hit (stale+refresh)",
+        many(stale, RecordType::A),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +694,10 @@ async fn phase3_concurrency(
         let m = match i % 10 {
             0..=2 => query(&blocked[i % blocked.len()], RecordType::A),
             3..=7 => query(POPULAR[i % POPULAR.len()], RecordType::A),
-            _ => query(&format!("c{i}-{}.bench-fwd.example", rand::random::<u32>()), RecordType::A),
+            _ => query(
+                &format!("c{i}-{}.bench-fwd.example", rand::random::<u32>()),
+                RecordType::A,
+            ),
         };
         msgs.push(m);
     }
@@ -605,7 +733,10 @@ async fn phase3_concurrency(
     let elapsed = t0.elapsed();
     let qps = total as f64 / elapsed.as_secs_f64();
     println!("  {total} queries in {elapsed:?}  =>  {qps:.0} q/s aggregate");
-    report("per-query latency", Arc::try_unwrap(lat).unwrap().into_inner());
+    report(
+        "per-query latency",
+        Arc::try_unwrap(lat).unwrap().into_inner(),
+    );
 
     // Single-flight: fire many identical, never-cached queries at once and
     // confirm the pool coalesces them into one upstream request.
@@ -650,8 +781,8 @@ fn sf_count_filter() -> Arc<FilterEngine> {
 // sharded `bulwark_engine::stats::Stats`.
 // ---------------------------------------------------------------------------
 
-use std::collections::HashMap;
 use bulwark_engine::querylog::{QueryAction, QueryLogEntry};
+use std::collections::HashMap;
 
 fn old_bump(map: &mut HashMap<String, u64>, key: &str, by: u64) {
     if let Some(v) = map.get_mut(key) {
@@ -684,8 +815,13 @@ struct OldStats {
 
 impl OldStats {
     fn new() -> Self {
-        let inner = OldInner { latency_hist: vec![0; 11], ..Default::default() };
-        Self { inner: parking_lot::Mutex::new(inner) }
+        let inner = OldInner {
+            latency_hist: vec![0; 11],
+            ..Default::default()
+        };
+        Self {
+            inner: parking_lot::Mutex::new(inner),
+        }
     }
 
     // Mirror of the original record(): single lock, allocations inside it.
@@ -745,7 +881,9 @@ fn entry_for(domain: &str, blocked: bool) -> QueryLogEntry {
 
 fn phase4_stats_contention(blocked: &[String]) {
     println!("\n== Phase 4: stats.record() scaling, old single-mutex vs new sharded ==");
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let per_thread = 400_000usize;
 
     // Shared, pre-built entries (~70% blocked, mirroring a filtering resolver).
@@ -762,7 +900,10 @@ fn phase4_stats_contention(blocked: &[String]) {
         .into_iter()
         .collect();
 
-    println!("  {:<8} {:>14} {:>14} {:>10}", "threads", "old (rec/s)", "new (rec/s)", "speedup");
+    println!(
+        "  {:<8} {:>14} {:>14} {:>10}",
+        "threads", "old (rec/s)", "new (rec/s)", "speedup"
+    );
     for &c in &thread_counts {
         let old = Arc::new(OldStats::new());
         let old_rate = run_record_bench(c, per_thread, entries.clone(), {
@@ -836,7 +977,14 @@ async fn main() {
     phase0_ab(&blocked);
     phase1_stage_profile(&filter, &blocked);
     phase2_scenarios(filter.clone(), &blocked, upstream, n).await;
-    phase3_concurrency(filter.clone(), &blocked, upstream, n.max(50_000), concurrency).await;
+    phase3_concurrency(
+        filter.clone(),
+        &blocked,
+        upstream,
+        n.max(50_000),
+        concurrency,
+    )
+    .await;
     phase4_stats_contention(&blocked);
 
     println!("\n== done ==");

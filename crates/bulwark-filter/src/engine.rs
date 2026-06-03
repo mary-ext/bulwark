@@ -100,8 +100,7 @@ impl FilterEngine {
         let hasher = ahash::RandomState::new();
         let mut subdomain: HashMap<String, Vec<u32>, ahash::RandomState> =
             HashMap::with_hasher(hasher.clone());
-        let mut exact: HashMap<String, Vec<u32>, ahash::RandomState> =
-            HashMap::with_hasher(hasher);
+        let mut exact: HashMap<String, Vec<u32>, ahash::RandomState> = HashMap::with_hasher(hasher);
         let mut scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher> = HashMap::default();
         let mut scan_fallback = Vec::new();
         let mut scan_rules: Vec<u32> = Vec::new();

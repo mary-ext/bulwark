@@ -446,7 +446,11 @@ fn latency_labels() -> Vec<String> {
 /// Inclusive lower / exclusive upper bound (ms) of histogram bucket `i`. The
 /// final bucket is unbounded above (`+inf`).
 fn bucket_bounds(i: usize) -> (f64, f64) {
-    let lower = if i == 0 { 0.0 } else { LATENCY_BUCKETS_MS[i - 1] };
+    let lower = if i == 0 {
+        0.0
+    } else {
+        LATENCY_BUCKETS_MS[i - 1]
+    };
     let upper = LATENCY_BUCKETS_MS.get(i).copied().unwrap_or(f64::INFINITY);
     (lower, upper)
 }
@@ -688,7 +692,10 @@ mod tests {
             s.record(&entry("a.com.", forwarded("up"), 300.0), Some(300.0));
         }
         let snap = s.snapshot(10, &ClientMatcher::default());
-        let p = snap.upstream_latency_pct.get("up").expect("upstream present");
+        let p = snap
+            .upstream_latency_pct
+            .get("up")
+            .expect("upstream present");
         // p50/p90 fall in the ≤5ms bucket; p99 lands in the slow tail.
         assert!(p.p50 <= 5.0, "p50 = {}", p.p50);
         assert!(p.p90 <= 5.0, "p90 = {}", p.p90);

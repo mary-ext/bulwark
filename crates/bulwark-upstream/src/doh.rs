@@ -190,13 +190,18 @@ impl DohTransport {
 
         // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
-            return self.exchange(self.h3().await?, &body, original_id, false, true).await;
+            return self
+                .exchange(self.h3().await?, &body, original_id, false, true)
+                .await;
         }
 
         // Auto-upgrade: prefer HTTP/3 while a fresh advertisement stands, but fall
         // back to h1/h2 (and forget the advertisement) if the h3 attempt fails.
         if self.h3_fresh() {
-            match self.exchange(self.h3().await?, &body, original_id, false, true).await {
+            match self
+                .exchange(self.h3().await?, &body, original_id, false, true)
+                .await
+            {
                 Ok(msg) => return Ok(msg),
                 Err(e) => {
                     self.learn_alt_svc(AltSvcH3::Clear);
@@ -206,7 +211,8 @@ impl DohTransport {
         }
 
         // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
-        self.exchange(self.h12().await?, &body, original_id, true, false).await
+        self.exchange(self.h12().await?, &body, original_id, true, false)
+            .await
     }
 
     /// Send one DoH request over `client`, optionally learning HTTP/3 availability
