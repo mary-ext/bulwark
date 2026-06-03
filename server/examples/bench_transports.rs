@@ -54,7 +54,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,7 +120,11 @@ async fn write_prefixed<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &[u8]) -> std:
 fn query(name: &str, rtype: RecordType) -> Message {
     let mut m = Message::new(rand::random(), MessageType::Query, OpCode::Query);
     m.metadata.recursion_desired = true;
-    let fqdn = if name.ends_with('.') { name.to_string() } else { format!("{name}.") };
+    let fqdn = if name.ends_with('.') {
+        name.to_string()
+    } else {
+        format!("{name}.")
+    };
     let mut q = Query::query(Name::from_str(&fqdn).unwrap(), rtype);
     q.set_query_class(DNSClass::IN);
     m.queries.push(q);
@@ -199,7 +206,9 @@ async fn mock_udp(delay: Duration) -> String {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         loop {
-            let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
+            let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                break;
+            };
             // Handle each datagram in its own task so an upstream-RTT delay does
             // not serialize the recv loop (bulwark sends UDP queries concurrently).
             let data = buf[..n].to_vec();
@@ -243,7 +252,9 @@ async fn mock_dot(delay: Duration, certs: &Certs) -> String {
             tcp.set_nodelay(true).ok();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
                 while let Some(msg) = read_prefixed(&mut tls).await {
                     if let Some(out) = respond(&msg, delay).await {
                         if write_prefixed(&mut tls, &out).await.is_err() {
@@ -262,8 +273,8 @@ fn quic_endpoint(certs: &Certs, alpn: &[&[u8]]) -> (quinn::Endpoint, u16) {
     let tls = server_tls(certs, alpn, true);
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic server config");
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(qsc));
-    let endpoint =
-        quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).expect("quic listen");
+    let endpoint = quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+        .expect("quic listen");
     let port = endpoint.local_addr().unwrap().port();
     (endpoint, port)
 }
@@ -277,7 +288,9 @@ async fn mock_doq(delay: Duration, certs: &Certs) -> String {
                 // Each DoQ query is its own bidi stream (RFC 9250).
                 while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                     tokio::spawn(async move {
-                        let Ok(data) = recv.read_to_end(64 * 1024).await else { return };
+                        let Ok(data) = recv.read_to_end(64 * 1024).await else {
+                            return;
+                        };
                         if data.len() < 2 {
                             return;
                         }
@@ -307,19 +320,30 @@ async fn mock_doh_h12(delay: Duration, certs: &Certs) -> String {
             tcp.set_nodelay(true).ok();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(tcp).await else { return };
-                let service = hyper::service::service_fn(move |req: http::Request<hyper::body::Incoming>| async move {
-                    let body = req.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
-                    let reply = respond(&body, delay).await.unwrap_or_default();
-                    http::Response::builder()
-                        .status(200)
-                        .header(http::header::CONTENT_TYPE, "application/dns-message")
-                        .body(http_body_util::Full::new(Bytes::from(reply)))
-                });
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let service = hyper::service::service_fn(
+                    move |req: http::Request<hyper::body::Incoming>| async move {
+                        let body = req
+                            .into_body()
+                            .collect()
+                            .await
+                            .map(|b| b.to_bytes())
+                            .unwrap_or_default();
+                        let reply = respond(&body, delay).await.unwrap_or_default();
+                        http::Response::builder()
+                            .status(200)
+                            .header(http::header::CONTENT_TYPE, "application/dns-message")
+                            .body(http_body_util::Full::new(Bytes::from(reply)))
+                    },
+                );
                 let io = hyper_util::rt::TokioIo::new(tls);
-                let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await;
+                let _ = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(io, service)
+                .await;
             });
         }
     });
@@ -373,8 +397,7 @@ async fn mock_doh_h3(delay: Duration, certs: &Certs) -> String {
 // Filter list loading (download-once + cache; shares bench_chain's directory).
 // ---------------------------------------------------------------------------
 
-const ADGUARD_URL: &str =
-    "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
+const ADGUARD_URL: &str = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
 const OISD_URL: &str = "https://big.oisd.nl/";
 
 fn data_dir() -> PathBuf {
@@ -464,7 +487,10 @@ fn report(label: &str, mut ns: Vec<u64>) {
 async fn build_pool(spec: &str) -> Arc<UpstreamPool> {
     Arc::new(
         UpstreamPool::build(
-            &[PoolEntry { spec: spec.to_string(), name: Some("mock".into()) }],
+            &[PoolEntry {
+                spec: spec.to_string(),
+                name: Some("mock".into()),
+            }],
             PoolSettings {
                 query_timeout: Duration::from_secs(5),
                 bootstrap: vec![],
@@ -483,8 +509,15 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
 
     // Cold: first query pays the TLS/QUIC handshake + connect.
     let t = Instant::now();
-    match pool.resolve(&query("cold-start.bench.example", RecordType::A)).await {
-        Ok(_) => println!("    {:<26} {:>8.1}µs", "handshake (first query)", t.elapsed().as_nanos() as f64 / 1000.0),
+    match pool
+        .resolve(&query("cold-start.bench.example", RecordType::A))
+        .await
+    {
+        Ok(_) => println!(
+            "    {:<26} {:>8.1}µs",
+            "handshake (first query)",
+            t.elapsed().as_nanos() as f64 / 1000.0
+        ),
         Err(e) => {
             println!("    FAILED: {e}");
             return;
@@ -495,7 +528,10 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
     // query is a real round-trip on the established connection.
     let mut ns = Vec::with_capacity(n);
     for i in 0..n {
-        let q = query(&format!("w{i}-{}.warm.bench.example", rand::random::<u32>()), RecordType::A);
+        let q = query(
+            &format!("w{i}-{}.warm.bench.example", rand::random::<u32>()),
+            RecordType::A,
+        );
         let t = Instant::now();
         if pool.resolve(&q).await.is_ok() {
             ns.push(t.elapsed().as_nanos() as u64);
@@ -520,7 +556,10 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
                 if i >= n {
                     break;
                 }
-                let q = query(&format!("c{i}-{}.conc.bench.example", rand::random::<u32>()), RecordType::A);
+                let q = query(
+                    &format!("c{i}-{}.conc.bench.example", rand::random::<u32>()),
+                    RecordType::A,
+                );
                 let t = Instant::now();
                 if pool.resolve(&q).await.is_ok() {
                     local_lat.push(t.elapsed().as_nanos() as u64);
@@ -535,7 +574,10 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
     let elapsed = t0.elapsed();
     let lat = Arc::try_unwrap(lat).unwrap().into_inner();
     let qps = lat.len() as f64 / elapsed.as_secs_f64();
-    println!("    {:<26} {:>8.0} q/s  (concurrency={concurrency})", "throughput", qps);
+    println!(
+        "    {:<26} {:>8.0} q/s  (concurrency={concurrency})",
+        "throughput", qps
+    );
     report("concurrent latency", lat);
 }
 
@@ -564,12 +606,21 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
     // Warmup.
     for _ in 0..(n / 10).max(1) {
         let _ = engine
-            .handle(query(&format!("warm-{}.chain.example", rand::random::<u32>()), RecordType::A), local())
+            .handle(
+                query(
+                    &format!("warm-{}.chain.example", rand::random::<u32>()),
+                    RecordType::A,
+                ),
+                local(),
+            )
             .await;
     }
     let mut ns = Vec::with_capacity(n);
     for i in 0..n {
-        let q = query(&format!("u{i}-{}.chain.example", rand::random::<u32>()), RecordType::A);
+        let q = query(
+            &format!("u{i}-{}.chain.example", rand::random::<u32>()),
+            RecordType::A,
+        );
         let t = Instant::now();
         let _ = engine.handle(q, local()).await;
         ns.push(t.elapsed().as_nanos() as u64);

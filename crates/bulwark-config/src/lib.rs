@@ -480,8 +480,10 @@ mod tests {
 
     #[test]
     fn active_specs_skips_comments_and_blanks() {
-        let mut cfg = UpstreamsConfig::default();
-        cfg.servers = "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n\n#tls://one.one.one.one\n  1.1.1.1  \n".into();
+        let cfg = UpstreamsConfig {
+            servers: "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n\n#tls://one.one.one.one\n  1.1.1.1  \n".into(),
+            ..Default::default()
+        };
         let specs: Vec<&str> = cfg.active_specs().collect();
         assert_eq!(specs, ["https://cloudflare-dns.com/dns-query", "1.1.1.1"]);
     }
@@ -491,7 +493,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
         let mut cfg = Config::default();
-        cfg.upstreams.servers = "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one\n".into();
+        cfg.upstreams.servers =
+            "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one\n".into();
         cfg.save(&path).unwrap();
         let loaded = Config::load_or_default(&path).unwrap();
         assert_eq!(loaded.upstreams.servers, cfg.upstreams.servers);
@@ -499,8 +502,10 @@ mod tests {
 
     #[test]
     fn normalize_trims_lines_and_collapses_blanks() {
-        let mut cfg = UpstreamsConfig::default();
-        cfg.servers = "\n\n  # Cloudflare  \n\n\n  https://cloudflare-dns.com/dns-query  \n\n\n\n#tls://one.one.one.one\n\n".into();
+        let mut cfg = UpstreamsConfig {
+            servers: "\n\n  # Cloudflare  \n\n\n  https://cloudflare-dns.com/dns-query  \n\n\n\n#tls://one.one.one.one\n\n".into(),
+            ..Default::default()
+        };
         cfg.normalize();
         assert_eq!(
             cfg.servers,
@@ -510,8 +515,10 @@ mod tests {
 
     #[test]
     fn normalize_empty_stays_empty() {
-        let mut cfg = UpstreamsConfig::default();
-        cfg.servers = "\n  \n\n".into();
+        let mut cfg = UpstreamsConfig {
+            servers: "\n  \n\n".into(),
+            ..Default::default()
+        };
         cfg.normalize();
         assert_eq!(cfg.servers, "");
     }
