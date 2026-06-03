@@ -1,11 +1,7 @@
 <script lang="ts">
   import * as api from "../api/generated";
   import { ok } from "@oazapfts/runtime";
-  import type {
-    UpstreamStatDto,
-    UpstreamsConfig,
-    LatencyPercentilesDto,
-  } from "../api/generated";
+  import type { UpstreamStatDto, UpstreamsConfig } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { ms, num, parseList } from "../lib/format";
@@ -16,7 +12,6 @@
   type UpstreamsCfg = Required<UpstreamsConfig>;
 
   let stats = $state<UpstreamStatDto[]>([]);
-  let pct = $state<Record<string, LatencyPercentilesDto>>({});
   let cfg = $state<UpstreamsCfg | null>(null);
 
   let testing = $state<string | null>(null);
@@ -26,9 +21,7 @@
   async function loadStats() {
     loading = true;
     try {
-      const [up, summary] = await Promise.all([ok(api.getUpstreams()), ok(api.getStats())]);
-      stats = up;
-      pct = summary.upstream_latency_pct ?? {};
+      stats = await ok(api.getUpstreams());
     } catch (e) {
       if (!isStatus(e, 401)) toaster.show("Failed to load upstreams", true);
     } finally {
@@ -86,7 +79,7 @@
     {#snippet head()}
       <tr>
         <th></th><th>Name</th><th>Type</th>
-        <th class="num">avg</th><th class="num">p50</th><th class="num">p90</th><th class="num">p99</th>
+        <th class="num">avg</th>
         <th class="num">queries</th><th class="num">fails</th><th></th>
       </tr>
     {/snippet}
@@ -103,9 +96,6 @@
         <td class="mono up-name" title={s.last_error ?? s.spec}>{s.name}</td>
         <td><span class="tag">{s.kind.toUpperCase()}</span></td>
         <td class="num">{ms(s.avg_rtt_ms)}</td>
-        <td class="num muted">{ms(pct[s.name]?.p50)}</td>
-        <td class="num muted">{ms(pct[s.name]?.p90)}</td>
-        <td class="num muted">{ms(pct[s.name]?.p99)}</td>
         <td class="num">{num(s.total_queries)}</td>
         <td class="num" class:bad={s.total_failures > 0}>{num(s.total_failures)}</td>
         <td style="text-align:right">
@@ -129,8 +119,6 @@
         {#if s.last_error}<div class="up-error" title={s.last_error}>{s.last_error}</div>{/if}
         <div class="up-metrics muted">
           <span>avg {ms(s.avg_rtt_ms)}</span>
-          <span>p90 {ms(pct[s.name]?.p90)}</span>
-          <span>p99 {ms(pct[s.name]?.p99)}</span>
           <span>{num(s.total_queries)} q</span>
           <span class:bad={s.total_failures > 0}>{num(s.total_failures)} fail</span>
         </div>
