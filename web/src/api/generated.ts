@@ -145,9 +145,8 @@ export type CheckRequest = {
 export type CheckResponse = {
     /** One of `allow`, `block`, or `rewrite`. */
     action: string;
-    /** The filter list responsible (absent for allow verdicts). */
-    list_id?: number | null;
-    /** Friendly name of the responsible list (`Custom rules` for `list_id` 0). */
+    /** The filter list responsible (`Custom rules` for user-written rules;
+    absent for allow verdicts). */
     list_name?: string | null;
     /** The matching rule text, if any. */
     rule?: string | null;

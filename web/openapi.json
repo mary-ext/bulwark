@@ -1202,21 +1202,12 @@
             "type": "string",
             "description": "One of `allow`, `block`, or `rewrite`."
           },
-          "list_id": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "description": "The filter list responsible (absent for allow verdicts).",
-            "minimum": 0
-          },
           "list_name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Friendly name of the responsible list (`Custom rules` for `list_id` 0)."
+            "description": "The filter list responsible (`Custom rules` for user-written rules;\nabsent for allow verdicts)."
           },
           "rule": {
             "type": [
