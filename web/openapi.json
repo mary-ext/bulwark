@@ -1207,7 +1207,7 @@
               "string",
               "null"
             ],
-            "description": "The filter list responsible (`Custom rules` for user-written rules;\nabsent for allow verdicts)."
+            "description": "The filter list responsible (`Custom rules` for user-written rules;\nabsent only when no rule matched). Set for `@@` exception allows too."
           },
           "rule": {
             "type": [
