@@ -1,0 +1,160 @@
+/* Design tokens. Light is the default; dark overrides under [data-theme="dark"].
+   Every color in the app should resolve to one of these vars — no hardcoded
+   hex outside this file (charts read the --chart-* vars at runtime). */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --bg: #ffffff;
+  --bg-elev: #fbfbfc;
+  --bg-elev2: #f3f3f6;
+  --bg-inset: #f7f7f9;
+  --bg-hover: #f4f4f7;
+
+  /* Borders */
+  --border: #e6e6ec;
+  --border-strong: #d4d4dd;
+
+  /* Text */
+  --text: #18181f;
+  --text-dim: #6b6b78;
+  --text-faint: #9a9aa7;
+
+  /* Accent — violet */
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --accent-active: #5b21b6;
+  --accent-contrast: #ffffff;
+  --accent-bg: #f5f3ff;
+  --accent-border: #ddd6fe;
+  --accent-ring: rgba(124, 58, 237, 0.35);
+
+  /* Status — semantic triplets (fg on bg within border) */
+  --good: #16a34a;
+  --good-fg: #15803d;
+  --good-bg: #f0fdf4;
+  --good-border: #bbf7d0;
+
+  --bad: #dc2626;
+  --bad-fg: #b91c1c;
+  --bad-bg: #fef2f2;
+  --bad-border: #fecaca;
+
+  --warn: #d97706;
+  --warn-fg: #b45309;
+  --warn-bg: #fffbeb;
+  --warn-border: #fde68a;
+
+  --info: #2563eb;
+  --info-fg: #1d4ed8;
+  --info-bg: #eff6ff;
+  --info-border: #bfdbfe;
+
+  /* Chart palette (themed) */
+  --chart-1: #7c3aed;
+  --chart-2: #2563eb;
+  --chart-3: #16a34a;
+  --chart-4: #d97706;
+  --chart-5: #dc2626;
+  --chart-6: #0891b2;
+  --chart-grid: #ededf1;
+  --chart-axis: #9a9aa7;
+  --chart-track: #ededf1;
+
+  /* Typography */
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius: 9px;
+  --radius-lg: 14px;
+  --radius-full: 999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px rgba(20, 20, 45, 0.05);
+  --shadow: 0 4px 14px rgba(20, 20, 45, 0.08), 0 1px 3px rgba(20, 20, 45, 0.06);
+  --shadow-lg: 0 14px 40px rgba(20, 20, 45, 0.16);
+
+  /* Spacing scale */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --sp-8: 48px;
+
+  /* Z-index */
+  --z-sticky: 50;
+  --z-drawer: 100;
+  --z-overlay: 200;
+  --z-dialog: 210;
+  --z-menu: 220;
+  --z-toast: 300;
+
+  /* Layout */
+  --sidebar-w: 240px;
+  --content-max: 1180px;
+  --topbar-h: 56px;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0e1116;
+  --bg-elev: #161b22;
+  --bg-elev2: #1c232c;
+  --bg-inset: #0b0e13;
+  --bg-hover: #1c232c;
+
+  --border: #2a313c;
+  --border-strong: #3a414c;
+
+  --text: #e6edf3;
+  --text-dim: #9aa7b4;
+  --text-faint: #6e7681;
+
+  --accent: #8b5cf6;
+  --accent-hover: #a78bfa;
+  --accent-active: #7c3aed;
+  --accent-contrast: #ffffff;
+  --accent-bg: rgba(139, 92, 246, 0.15);
+  --accent-border: rgba(139, 92, 246, 0.4);
+  --accent-ring: rgba(139, 92, 246, 0.45);
+
+  --good: #3fb950;
+  --good-fg: #6fdc8c;
+  --good-bg: rgba(63, 185, 80, 0.14);
+  --good-border: rgba(63, 185, 80, 0.34);
+
+  --bad: #f85149;
+  --bad-fg: #ff9a93;
+  --bad-bg: rgba(248, 81, 73, 0.14);
+  --bad-border: rgba(248, 81, 73, 0.34);
+
+  --warn: #d29922;
+  --warn-fg: #e3c45a;
+  --warn-bg: rgba(210, 153, 34, 0.14);
+  --warn-border: rgba(210, 153, 34, 0.34);
+
+  --info: #4f8cff;
+  --info-fg: #82b5ff;
+  --info-bg: rgba(79, 140, 255, 0.14);
+  --info-border: rgba(79, 140, 255, 0.34);
+
+  --chart-1: #a78bfa;
+  --chart-2: #60a5fa;
+  --chart-3: #4ade80;
+  --chart-4: #fbbf24;
+  --chart-5: #f87171;
+  --chart-6: #22d3ee;
+  --chart-grid: #232b35;
+  --chart-axis: #6e7681;
+  --chart-track: #232b35;
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow: 0 4px 14px rgba(0, 0, 0, 0.45), 0 1px 3px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 16px 44px rgba(0, 0, 0, 0.6);
+}

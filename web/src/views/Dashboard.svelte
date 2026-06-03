@@ -1,27 +1,31 @@
 <script lang="ts">
   import * as api from "../api/generated";
   import { ok } from "@oazapfts/runtime";
-  import type { StatsResponse, TopEntryDto } from "../api/generated";
+  import type { StatsResponse } from "../api/generated";
   import { isStatus } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { num, pct, ms } from "../lib/format";
-  import Chart from "../lib/Chart.svelte";
-  import type { ChartConfiguration } from "chart.js/auto";
+  import Icon from "../components/Icon.svelte";
+  import StatCard from "../components/StatCard.svelte";
+  import RankedList from "../components/RankedList.svelte";
 
   let stats = $state<StatsResponse | null>(null);
+  let loading = $state(false);
 
   async function load() {
+    loading = true;
     try {
       stats = await ok(api.getStats({ top: 10 }));
     } catch (e) {
       if (!isStatus(e, 401)) toaster.show("Failed to load stats", true);
+    } finally {
+      loading = false;
     }
   }
 
+  // Load once on mount — no background polling.
   $effect(() => {
     load();
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
   });
 
   const cacheRate = $derived(
@@ -29,160 +33,56 @@
       ? stats.cache_hits / (stats.cache_hits + stats.cache_misses)
       : 0,
   );
-
-  function barConfig(entries: TopEntryDto[], color: string): ChartConfiguration {
-    return {
-      type: "bar",
-      data: {
-        labels: entries.map((e) => e.name),
-        datasets: [{ data: entries.map((e) => e.count), backgroundColor: color, borderRadius: 4 }],
-      },
-      options: {
-        indexAxis: "y",
-        plugins: { legend: { display: false } },
-        scales: { x: { grid: { display: false } }, y: { grid: { display: false } } },
-      },
-    };
-  }
-
-  const seriesConfig = $derived<ChartConfiguration>({
-    type: "line",
-    data: {
-      labels: (stats?.series ?? []).map((p) =>
-        new Date(p.hour * 3600_000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit" }),
-      ),
-      datasets: [
-        {
-          label: "Total",
-          data: (stats?.series ?? []).map((p) => p.total),
-          borderColor: "#4f8cff",
-          backgroundColor: "rgba(79,140,255,0.15)",
-          fill: true,
-          tension: 0.3,
-        },
-        {
-          label: "Blocked",
-          data: (stats?.series ?? []).map((p) => p.blocked),
-          borderColor: "#f85149",
-          backgroundColor: "rgba(248,81,73,0.12)",
-          fill: true,
-          tension: 0.3,
-        },
-        {
-          label: "Cached",
-          data: (stats?.series ?? []).map((p) => p.cached),
-          borderColor: "#3fb950",
-          backgroundColor: "rgba(63,185,80,0.10)",
-          fill: true,
-          tension: 0.3,
-        },
-      ],
-    },
-    options: {
-      interaction: { mode: "index", intersect: false },
-      scales: { x: { grid: { display: false } } },
-    },
-  });
-
-  const qtypeConfig = $derived<ChartConfiguration<"doughnut">>({
-    type: "doughnut",
-    data: {
-      labels: (stats?.qtypes ?? []).map((e) => e.name),
-      datasets: [
-        {
-          data: (stats?.qtypes ?? []).map((e) => e.count),
-          backgroundColor: ["#4f8cff", "#3fb950", "#d29922", "#f85149", "#a371f7", "#56d4dd"],
-        },
-      ],
-    },
-    options: { plugins: { legend: { position: "right" } }, cutout: "60%" },
-  });
-
-  const latencyConfig = $derived<ChartConfiguration>({
-    type: "bar",
-    data: {
-      labels: stats?.latency_buckets ?? [],
-      datasets: [{ data: stats?.latency_hist ?? [], backgroundColor: "#56d4dd", borderRadius: 4 }],
-    },
-    options: {
-      plugins: { legend: { display: false } },
-      scales: { x: { grid: { display: false } } },
-    },
-  });
 </script>
 
-<h1 class="page-title">Dashboard</h1>
+<div class="page-head">
+  <h1 class="page-title">Dashboard</h1>
+  <span class="spacer"></span>
+  <button class="btn btn-sm" onclick={load} disabled={loading}>
+    <Icon name="refresh" size={15} />
+    Refresh
+  </button>
+</div>
 
 {#if stats}
   <div class="grid cols-4">
-    <div class="card stat">
-      <div class="label">Total queries</div>
-      <div class="value">{num(stats.total)}</div>
-      <div class="sub">{num(stats.errors)} errors</div>
-    </div>
-    <div class="card stat">
-      <div class="label">Blocked</div>
-      <div class="value" style="color:var(--red)">{num(stats.blocked)}</div>
-      <div class="sub">{pct(stats.block_rate)} of queries</div>
-    </div>
-    <div class="card stat">
-      <div class="label">Cache hit rate</div>
-      <div class="value" style="color:var(--green)">{pct(cacheRate)}</div>
-      <div class="sub">{num(stats.cache_size)} entries cached</div>
-    </div>
-    <div class="card stat">
-      <div class="label">Avg processing</div>
-      <div class="value">{ms(stats.avg_processing_ms)}</div>
-      <div class="sub">{num(stats.rewritten)} rewritten</div>
-    </div>
+    <StatCard label="Total queries" value={num(stats.total)} sub="{num(stats.errors)} errors" />
+    <StatCard
+      label="Blocked"
+      value={num(stats.blocked)}
+      sub="{pct(stats.block_rate)} of queries"
+      tone="bad"
+    />
+    <StatCard
+      label="Cache hit rate"
+      value={pct(cacheRate)}
+      sub="{num(stats.cache_size)} entries cached"
+      tone="good"
+    />
+    <StatCard
+      label="Avg processing"
+      value={ms(stats.avg_processing_ms)}
+      sub="{num(stats.rewritten)} rewritten"
+    />
   </div>
 
-  <div class="grid cols-1" style="margin-top:1rem">
+  <div class="grid cols-2" style="margin-top:var(--sp-4)">
     <div class="card">
-      <h3 style="margin-top:0">Queries over time</h3>
-      <div class="chart-box">
-        <Chart config={seriesConfig} />
-      </div>
-    </div>
-  </div>
-
-  <div class="grid cols-2" style="margin-top:1rem">
-    <div class="card">
-      <h3 style="margin-top:0">Top blocked domains</h3>
-      <div class="chart-box">
-        {#if stats.top_blocked_domains.length}
-          <Chart config={barConfig(stats.top_blocked_domains, "#f85149")} />
-        {:else}
-          <p class="muted">Nothing blocked yet.</p>
-        {/if}
-      </div>
+      <div class="card-title">Top queried domains</div>
+      <RankedList items={stats.top_domains} total={stats.total} color="var(--chart-2)" />
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Top queried domains</h3>
-      <div class="chart-box">
-        <Chart config={barConfig(stats.top_domains, "#4f8cff")} />
-      </div>
-    </div>
-  </div>
-
-  <div class="grid cols-3" style="margin-top:1rem">
-    <div class="card">
-      <h3 style="margin-top:0">Top clients</h3>
-      <div class="chart-box">
-        <Chart config={barConfig(stats.top_clients, "#3fb950")} />
-      </div>
+      <div class="card-title">Top blocked domains</div>
+      <RankedList
+        items={stats.top_blocked_domains}
+        total={stats.blocked}
+        color="var(--chart-5)"
+        empty="Nothing blocked yet."
+      />
     </div>
     <div class="card">
-      <h3 style="margin-top:0">Query types</h3>
-      <div class="chart-box">
-        <Chart config={qtypeConfig} />
-      </div>
-    </div>
-    <div class="card">
-      <h3 style="margin-top:0">Processing latency</h3>
-      <div class="chart-box">
-        <Chart config={latencyConfig} />
-      </div>
+      <div class="card-title">Top clients</div>
+      <RankedList items={stats.top_clients} total={stats.total} color="var(--chart-3)" />
     </div>
   </div>
 {:else}

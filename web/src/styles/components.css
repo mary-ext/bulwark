@@ -1,0 +1,334 @@
+/* Global styling for bits-ui parts. bits-ui is headless and portals overlay
+   content (Dialog/Select/DropdownMenu/Tooltip) to <body>, so these must be
+   global (scoped component styles wouldn't reach the portal). We attach
+   explicit `bw-*` classes to each bits-ui part in the wrapper components and
+   style them here; animation keys off bits-ui's data-state attribute. */
+
+/* ── Overlay (Dialog / Sheet backdrop) ──────────────── */
+.bw-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background: rgba(10, 10, 25, 0.45);
+  backdrop-filter: blur(2px);
+}
+.bw-overlay[data-state="open"] {
+  animation: bw-fade-in 0.18s ease;
+}
+.bw-overlay[data-state="closed"] {
+  animation: bw-fade-out 0.15s ease;
+}
+
+/* ── Centered dialog/modal ──────────────────────────── */
+.bw-dialog {
+  position: fixed;
+  z-index: var(--z-dialog);
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: calc(100vw - 2 * var(--sp-4));
+  max-width: 440px;
+  max-height: calc(100dvh - 2 * var(--sp-5));
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--sp-5);
+}
+.bw-dialog[data-state="open"] {
+  animation: bw-zoom-in 0.18s ease;
+}
+.bw-dialog[data-state="closed"] {
+  animation: bw-zoom-out 0.15s ease;
+}
+
+/* ── Bottom sheet (mobile detail) ───────────────────── */
+.bw-sheet {
+  position: fixed;
+  z-index: var(--z-dialog);
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  max-height: 88dvh;
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  box-shadow: var(--shadow-lg);
+  padding: var(--sp-5) var(--sp-4) calc(var(--sp-5) + env(safe-area-inset-bottom));
+}
+.bw-sheet::before {
+  content: "";
+  display: block;
+  width: 36px;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--border-strong);
+  margin: 0 auto var(--sp-4);
+}
+.bw-sheet[data-state="open"] {
+  animation: bw-slide-up 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.bw-sheet[data-state="closed"] {
+  animation: bw-slide-down 0.18s ease;
+}
+
+/* ── Left nav drawer (mobile) ───────────────────────── */
+.bw-drawer {
+  position: fixed;
+  z-index: var(--z-drawer);
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: min(82vw, 300px);
+  overflow-y: auto;
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  box-shadow: var(--shadow-lg);
+}
+.bw-drawer[data-state="open"] {
+  animation: bw-slide-in-left 0.22s cubic-bezier(0.32, 0.72, 0, 1);
+}
+.bw-drawer[data-state="closed"] {
+  animation: bw-slide-out-left 0.18s ease;
+}
+
+.bw-dialog-title {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-bottom: var(--sp-4);
+}
+.bw-dialog-desc {
+  color: var(--text-dim);
+  font-size: 0.875rem;
+  margin-top: var(--sp-1);
+}
+
+/* ── Dropdown menu (desktop row actions) ────────────── */
+.bw-menu {
+  z-index: var(--z-menu);
+  min-width: 200px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: var(--sp-1);
+}
+.bw-menu[data-state="open"] {
+  animation: bw-pop-in 0.13s ease;
+}
+.bw-menu-label {
+  display: block;
+  padding: 0.35rem 0.55rem 0.2rem;
+  font-size: 0.72rem;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bw-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  width: 100%;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 0.45rem 0.55rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.bw-menu-item[data-highlighted],
+.bw-menu-item:hover {
+  background: var(--accent-bg);
+  color: var(--accent-active);
+  outline: none;
+}
+.bw-menu-item.danger[data-highlighted],
+.bw-menu-item.danger:hover {
+  background: var(--bad-bg);
+  color: var(--bad-fg);
+}
+.bw-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: var(--sp-1) 0;
+}
+
+/* ── Select ─────────────────────────────────────────── */
+.bw-select-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  width: 100%;
+  padding: 0.5rem 0.65rem;
+  background: var(--bg);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+.bw-select-trigger:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  outline: none;
+}
+.bw-select-content {
+  z-index: var(--z-menu);
+  min-width: var(--bits-select-anchor-width, 12rem);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: var(--sp-1);
+  max-height: 18rem;
+  overflow-y: auto;
+}
+.bw-select-content[data-state="open"] {
+  animation: bw-pop-in 0.13s ease;
+}
+.bw-select-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-2);
+  padding: 0.45rem 0.55rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+.bw-select-item[data-highlighted] {
+  background: var(--accent-bg);
+  color: var(--accent-active);
+  outline: none;
+}
+.bw-select-item[data-selected]::after {
+  content: "✓";
+  color: var(--accent);
+}
+
+/* ── Switch ─────────────────────────────────────────── */
+.bw-switch {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  width: 40px;
+  height: 22px;
+  padding: 2px;
+  border-radius: var(--radius-full);
+  background: var(--border-strong);
+  border: none;
+  cursor: pointer;
+  transition: background 0.16s ease;
+}
+.bw-switch[data-state="checked"] {
+  background: var(--accent);
+}
+.bw-switch:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+.bw-switch:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.bw-switch-thumb {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-full);
+  background: #fff;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.16s ease;
+}
+.bw-switch[data-state="checked"] .bw-switch-thumb {
+  transform: translateX(18px);
+}
+
+/* ── Tooltip ────────────────────────────────────────── */
+.bw-tooltip {
+  z-index: var(--z-menu);
+  background: var(--text);
+  color: var(--bg);
+  font-size: 0.75rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  max-width: 18rem;
+}
+
+/* ── Charts (LayerChart / SVG) ──────────────────────── */
+.bw-chart {
+  width: 100%;
+}
+.bw-chart text {
+  fill: var(--chart-axis);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+.bw-chart .tick line,
+.bw-chart .grid line,
+.bw-chart line.rule,
+.bw-chart .rule line {
+  stroke: var(--chart-grid);
+  stroke-width: 1;
+}
+.bw-chart .axis path,
+.bw-chart .tick path {
+  stroke: var(--chart-grid);
+}
+
+/* ── Animations ─────────────────────────────────────── */
+@keyframes bw-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes bw-fade-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+@keyframes bw-zoom-in {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.97); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes bw-zoom-out {
+  from { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  to { opacity: 0; transform: translate(-50%, -50%) scale(0.97); }
+}
+@keyframes bw-pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+@keyframes bw-slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+@keyframes bw-slide-in-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+@keyframes bw-slide-out-left {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+@keyframes bw-slide-down {
+  from { transform: translateY(0); }
+  to { transform: translateY(100%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bw-overlay,
+  .bw-dialog,
+  .bw-sheet,
+  .bw-menu,
+  .bw-select-content {
+    animation: none !important;
+  }
+}

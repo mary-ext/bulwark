@@ -3,6 +3,9 @@
   import { ok } from "@oazapfts/runtime";
   import type { StatusResponse } from "./api/generated";
   import { toaster } from "./lib/toast.svelte";
+  import { router } from "./lib/router.svelte";
+  import AppShell from "./components/AppShell.svelte";
+  import Toast from "./components/Toast.svelte";
   import Login from "./views/Login.svelte";
   import Dashboard from "./views/Dashboard.svelte";
   import QueryLog from "./views/QueryLog.svelte";
@@ -12,36 +15,12 @@
   import Settings from "./views/Settings.svelte";
 
   let status = $state<StatusResponse | null>(null);
-  let route = $state(currentRoute());
   let loading = $state(true);
-
-  const nav = [
-    { id: "dashboard", label: "Dashboard", icon: "📊" },
-    { id: "querylog", label: "Query Log", icon: "📜" },
-    { id: "filters", label: "Filters", icon: "🛡️" },
-    { id: "upstreams", label: "Upstreams", icon: "🌐" },
-    { id: "clients", label: "Clients", icon: "💻" },
-    { id: "settings", label: "Settings", icon: "⚙️" },
-  ];
-
-  function currentRoute(): string {
-    return location.hash.replace(/^#\/?/, "") || "dashboard";
-  }
-
-  function go(id: string) {
-    location.hash = "/" + id;
-  }
-
-  $effect(() => {
-    const onHash = () => (route = currentRoute());
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
-  });
 
   async function refreshStatus() {
     try {
       status = await ok(api.status());
-    } catch (e) {
+    } catch {
       toaster.show("Failed to reach server", true);
     } finally {
       loading = false;
@@ -59,54 +38,33 @@
 </script>
 
 {#if loading}
-  <div class="login-wrap"><div class="muted">Loading…</div></div>
+  <div class="boot muted">Loading…</div>
 {:else if !authed}
   <Login {status} onAuthed={refreshStatus} />
 {:else}
-  <div class="app">
-    <aside class="sidebar">
-      <div class="brand">Bul<span>wark</span></div>
-      {#each nav as item}
-        <div
-          class="nav-item {route === item.id ? 'active' : ''}"
-          onclick={() => go(item.id)}
-          role="button"
-          tabindex="0"
-          onkeydown={(e) => e.key === "Enter" && go(item.id)}
-        >
-          <span>{item.icon}</span>
-          <span>{item.label}</span>
-        </div>
-      {/each}
-      <div class="nav-spacer"></div>
-      <div class="muted" style="padding:0 0.7rem;font-size:0.75rem">
-        v{status?.version}
-      </div>
-      <div class="nav-item" onclick={logout} role="button" tabindex="0" onkeydown={() => {}}>
-        <span>🚪</span><span>Log out</span>
-      </div>
-    </aside>
-
-    <main class="main">
-      {#if route === "dashboard"}
-        <Dashboard />
-      {:else if route === "querylog"}
-        <QueryLog />
-      {:else if route === "filters"}
-        <Filters />
-      {:else if route === "upstreams"}
-        <Upstreams />
-      {:else if route === "clients"}
-        <Clients />
-      {:else if route === "settings"}
-        <Settings />
-      {:else}
-        <Dashboard />
-      {/if}
-    </main>
-  </div>
+  <AppShell {status} onLogout={logout}>
+    {#if router.route === "dashboard"}
+      <Dashboard />
+    {:else if router.route === "querylog"}
+      <QueryLog />
+    {:else if router.route === "filters"}
+      <Filters />
+    {:else if router.route === "upstreams"}
+      <Upstreams />
+    {:else if router.route === "clients"}
+      <Clients />
+    {:else if router.route === "settings"}
+      <Settings />
+    {/if}
+  </AppShell>
 {/if}
 
-{#if toaster.msg}
-  <div class="toast {toaster.error ? 'error' : ''}">{toaster.msg}</div>
-{/if}
+<Toast />
+
+<style>
+  .boot {
+    display: grid;
+    place-items: center;
+    min-height: 100dvh;
+  }
+</style>

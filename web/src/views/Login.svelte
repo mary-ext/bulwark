@@ -38,9 +38,12 @@
 </script>
 
 <div class="login-wrap">
-  <form class="card login-card" onsubmit={submit}>
-    <div class="brand" style="padding-left:0">Bul<span>wark</span></div>
-    <p class="muted" style="margin-top:-0.6rem">
+  <form class="login-card" onsubmit={submit}>
+    <div class="brand">
+      <span class="logo">B</span>
+      <span class="brand-text">Bul<span class="accent">wark</span></span>
+    </div>
+    <p class="muted sub">
       {setup ? "Create your admin account to get started." : "Sign in to continue."}
     </p>
 
@@ -65,8 +68,68 @@
       </div>
     {/if}
 
-    <button class="primary" type="submit" disabled={busy} style="width:100%">
+    <button class="btn btn-primary submit" type="submit" disabled={busy}>
       {busy ? "…" : setup ? "Create account" : "Sign in"}
     </button>
   </form>
 </div>
+
+<style>
+  .login-wrap {
+    display: grid;
+    place-items: center;
+    min-height: 100dvh;
+    padding: var(--sp-4);
+  }
+  .login-card {
+    width: 380px;
+    max-width: 100%;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
+    padding: var(--sp-6);
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-weight: 700;
+    font-size: 1.4rem;
+    letter-spacing: -0.02em;
+  }
+  .logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 1.05rem;
+  }
+  .accent {
+    color: var(--accent);
+  }
+  .sub {
+    margin: var(--sp-2) 0 var(--sp-5);
+    font-size: 0.875rem;
+  }
+  .field {
+    margin-bottom: var(--sp-4);
+  }
+  .field label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: var(--sp-1);
+    font-weight: 500;
+  }
+  .submit {
+    width: 100%;
+    margin-top: var(--sp-2);
+  }
+</style>

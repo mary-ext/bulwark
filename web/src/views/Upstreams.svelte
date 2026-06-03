@@ -8,27 +8,31 @@
   } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
-  import { ms, num } from "../lib/format";
-  import Chart from "../lib/Chart.svelte";
-  import type { ChartConfiguration } from "chart.js/auto";
+  import { ms, num, parseList } from "../lib/format";
+  import Icon from "../components/Icon.svelte";
+  import Field from "../components/Field.svelte";
+  import ResponsiveTable from "../components/ResponsiveTable.svelte";
 
-  // The server always returns fully-populated config; treat it as required here.
   type UpstreamsCfg = Required<UpstreamsConfig>;
 
   let stats = $state<UpstreamStatDto[]>([]);
   let pct = $state<Record<string, LatencyPercentilesDto>>({});
   let cfg = $state<UpstreamsCfg | null>(null);
 
-  let testing = $state(false);
+  let testing = $state<string | null>(null);
   let saving = $state(false);
+  let loading = $state(false);
 
   async function loadStats() {
+    loading = true;
     try {
       const [up, summary] = await Promise.all([ok(api.getUpstreams()), ok(api.getStats())]);
       stats = up;
       pct = summary.upstream_latency_pct ?? {};
     } catch (e) {
       if (!isStatus(e, 401)) toaster.show("Failed to load upstreams", true);
+    } finally {
+      loading = false;
     }
   }
 
@@ -37,11 +41,10 @@
     cfg = (c.upstreams ?? null) as UpstreamsCfg | null;
   }
 
+  // Load once on mount — no background polling.
   $effect(() => {
     loadStats();
     loadCfg();
-    const t = setInterval(loadStats, 5000);
-    return () => clearInterval(t);
   });
 
   async function save() {
@@ -50,8 +53,6 @@
     try {
       await ok(api.putUpstreams(cfg));
       toaster.show("Upstreams saved");
-      // Reflect the server-normalized text (trimmed lines, collapsed blanks)
-      // back into the editor.
       await Promise.all([loadCfg(), loadStats()]);
     } catch (e) {
       toaster.show(errMsg(e, "Save failed"), true);
@@ -61,96 +62,194 @@
   }
 
   async function testSpec(spec: string) {
-    testing = true;
+    testing = spec;
     try {
       const r = await ok(api.testUpstream({ spec }));
       if (r.ok) toaster.show(`OK — ${r.rtt_ms?.toFixed(1)} ms`);
       else toaster.show(`Failed: ${r.error}`, true);
     } finally {
-      testing = false;
+      testing = null;
     }
   }
-
-  const rttConfig = $derived<ChartConfiguration>({
-    type: "bar",
-    data: {
-      labels: stats.map((s) => s.name),
-      datasets: [
-        {
-          label: "Avg RTT (ms)",
-          data: stats.map((s) => s.avg_rtt_ms ?? 0),
-          backgroundColor: stats.map((s) => (s.up ? "#4f8cff" : "#f85149")),
-          borderRadius: 4,
-        },
-      ],
-    },
-    options: { plugins: { legend: { display: false } }, scales: { x: { grid: { display: false } } } },
-  });
 </script>
 
-<h1 class="page-title">Upstreams</h1>
-
-<div class="card">
-  <h3 style="margin-top:0">Status & latency</h3>
-  <table>
-    <thead>
-      <tr><th>Name</th><th>Type</th><th>Status</th><th>Avg RTT</th><th>Last</th><th>p50</th><th>p90</th><th>p99</th><th>Queries</th><th>Fails</th><th></th></tr>
-    </thead>
-    <tbody>
-      {#each stats as s}
-        <tr>
-          <td class="mono" title={s.spec}>{s.name}</td>
-          <td><span class="tag">{s.kind.toUpperCase()}</span></td>
-          <td><span class="badge {s.up ? 'up' : 'down'}">{s.up ? "up" : "down"}</span></td>
-          <td>{ms(s.avg_rtt_ms)}</td>
-          <td class="muted">{ms(s.last_rtt_ms)}</td>
-          <td class="muted">{ms(pct[s.name]?.p50)}</td>
-          <td class="muted">{ms(pct[s.name]?.p90)}</td>
-          <td class="muted">{ms(pct[s.name]?.p99)}</td>
-          <td>{num(s.total_queries)}</td>
-          <td class="muted">{num(s.total_failures)}</td>
-          <td style="text-align:right"><button onclick={() => testSpec(s.spec)} disabled={testing}>Test</button></td>
-        </tr>
-      {/each}
-      {#if stats.length === 0}
-        <tr><td colspan="11" class="muted" style="text-align:center;padding:1.5rem">No upstreams configured.</td></tr>
-      {/if}
-    </tbody>
-  </table>
-  {#if stats.length}
-    <div class="chart-box" style="height:200px;margin-top:1rem"><Chart config={rttConfig} /></div>
-  {/if}
+<div class="page-head">
+  <h1 class="page-title">Upstreams</h1>
+  <span class="spacer"></span>
+  <button class="btn btn-sm" onclick={loadStats} disabled={loading}>
+    <Icon name="refresh" size={15} /> Refresh
+  </button>
 </div>
 
-{#if cfg}
-  <div class="card" style="margin-top:1rem">
-    <h3 style="margin-top:0">Configured upstreams</h3>
-    <p class="muted" style="margin-top:0">
-      One upstream per line. Each query goes to the single fastest healthy
-      upstream, failing over sequentially — never fanned out in parallel.
-      Supports plain DNS, <code>tls://</code>, <code>https://…/dns-query</code>,
-      and <code>quic://</code>. Lines starting with <code>#</code> are comments
-      (preserved on save) — handy for labelling or disabling an entry.
-    </p>
-    <textarea bind:value={cfg.servers} rows="8" class="mono" spellcheck="false"
-      placeholder={"# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one"}></textarea>
+<section class="card" style="padding:0;overflow:hidden">
+  <ResponsiveTable items={stats} key={(s) => s.name}>
+    {#snippet head()}
+      <tr>
+        <th></th><th>Name</th><th>Type</th>
+        <th class="num">avg</th><th class="num">p50</th><th class="num">p90</th><th class="num">p99</th>
+        <th class="num">queries</th><th class="num">fails</th><th></th>
+      </tr>
+    {/snippet}
+    {#snippet row(s)}
+      <tr class="hoverable">
+        <td>
+          <span
+            class="dot"
+            class:up={s.up}
+            class:down={!s.up}
+            title={s.last_error ? `down — ${s.last_error}` : s.up ? "up" : "down"}
+          ></span>
+        </td>
+        <td class="mono up-name" title={s.last_error ?? s.spec}>{s.name}</td>
+        <td><span class="tag">{s.kind.toUpperCase()}</span></td>
+        <td class="num">{ms(s.avg_rtt_ms)}</td>
+        <td class="num muted">{ms(pct[s.name]?.p50)}</td>
+        <td class="num muted">{ms(pct[s.name]?.p90)}</td>
+        <td class="num muted">{ms(pct[s.name]?.p99)}</td>
+        <td class="num">{num(s.total_queries)}</td>
+        <td class="num" class:bad={s.total_failures > 0}>{num(s.total_failures)}</td>
+        <td style="text-align:right">
+          <button class="btn btn-sm" onclick={() => testSpec(s.spec)} disabled={testing === s.spec}>
+            {testing === s.spec ? "…" : "Test"}
+          </button>
+        </td>
+      </tr>
+    {/snippet}
+    {#snippet card(s)}
+      <div class="up-card">
+        <div class="up-head">
+          <span class="dot" class:up={s.up} class:down={!s.up}></span>
+          <span class="mono up-name" title={s.spec}>{s.name}</span>
+          <span class="tag">{s.kind.toUpperCase()}</span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm" onclick={() => testSpec(s.spec)} disabled={testing === s.spec}>
+            {testing === s.spec ? "…" : "Test"}
+          </button>
+        </div>
+        {#if s.last_error}<div class="up-error" title={s.last_error}>{s.last_error}</div>{/if}
+        <div class="up-metrics muted">
+          <span>avg {ms(s.avg_rtt_ms)}</span>
+          <span>p90 {ms(pct[s.name]?.p90)}</span>
+          <span>p99 {ms(pct[s.name]?.p99)}</span>
+          <span>{num(s.total_queries)} q</span>
+          <span class:bad={s.total_failures > 0}>{num(s.total_failures)} fail</span>
+        </div>
+      </div>
+    {/snippet}
+    {#snippet empty()}No upstreams configured.{/snippet}
+  </ResponsiveTable>
+</section>
 
-    <div class="grid cols-3" style="margin-top:1rem">
-      <div class="field">
-        <label for="to">Query timeout (s)</label>
+{#if cfg}
+  <section class="card" style="margin-top:var(--sp-4)">
+    <div class="card-title">Configured upstreams</div>
+    <p class="muted hint">
+      One upstream per line. Each query goes to the single fastest healthy upstream, failing over
+      sequentially — never fanned out in parallel. Supports plain DNS, <code>tls://</code>,
+      <code>https://…/dns-query</code>, and <code>quic://</code>. Lines starting with
+      <code>#</code> are comments (preserved on save).
+    </p>
+    <textarea
+      bind:value={cfg.servers}
+      rows="8"
+      class="mono"
+      spellcheck="false"
+      placeholder={"# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one"}
+    ></textarea>
+
+    <div class="grid cols-3" style="margin-top:var(--sp-4)">
+      <Field label="Query timeout (s)" htmlFor="to">
         <input id="to" type="number" bind:value={cfg.timeout_secs} min="1" />
-      </div>
-      <div class="field">
-        <label for="pi">Probe interval (s)</label>
+      </Field>
+      <Field label="Probe interval (s)" htmlFor="pi">
         <input id="pi" type="number" bind:value={cfg.probe_interval_secs} min="0" />
-      </div>
-      <div class="field">
-        <label for="bs">Bootstrap servers</label>
-        <input id="bs" class="mono" value={cfg.bootstrap.join(", ")}
-          onchange={(e) => cfg && (cfg.bootstrap = (e.target as HTMLInputElement).value.split(",").map((s) => s.trim()).filter(Boolean))} />
-      </div>
+      </Field>
+      <Field label="Bootstrap servers" htmlFor="bs">
+        <input
+          id="bs"
+          class="mono"
+          value={cfg.bootstrap.join(", ")}
+          onchange={(e) => cfg && (cfg.bootstrap = parseList((e.target as HTMLInputElement).value))}
+        />
+      </Field>
     </div>
 
-    <button class="primary" onclick={save} disabled={saving}>{saving ? "Saving…" : "Save settings"}</button>
-  </div>
+    <div style="margin-top:var(--sp-4)">
+      <button class="btn btn-primary" onclick={save} disabled={saving}>
+        {saving ? "Saving…" : "Save settings"}
+      </button>
+    </div>
+  </section>
 {/if}
+
+<style>
+  .dot {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .dot.up {
+    background: var(--good);
+    box-shadow: 0 0 0 3px var(--good-bg);
+  }
+  .dot.down {
+    background: var(--bad);
+    box-shadow: 0 0 0 3px var(--bad-bg);
+  }
+  .up-name {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+  }
+  .num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  td.num {
+    font-family: var(--font-mono);
+  }
+  td.bad,
+  .up-metrics .bad {
+    color: var(--bad-fg);
+  }
+  .hint {
+    margin: 0 0 var(--sp-3);
+    font-size: 0.82rem;
+  }
+
+  /* Mobile card */
+  .up-card {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-2);
+    padding: 0.8rem 0.85rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .up-head {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+  }
+  .up-error {
+    font-size: 0.78rem;
+    color: var(--bad-fg);
+    background: var(--bad-bg);
+    border: 1px solid var(--bad-border);
+    border-radius: var(--radius-sm);
+    padding: 0.3rem 0.5rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .up-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px var(--sp-3);
+    font-size: 0.8rem;
+  }
+</style>

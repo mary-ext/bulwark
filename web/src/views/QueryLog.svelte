@@ -1,10 +1,19 @@
 <script lang="ts">
   import * as api from "../api/generated";
   import { ok } from "@oazapfts/runtime";
+  import { DropdownMenu } from "bits-ui";
   import type { LogEntryView } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
-  import { relTime, ms } from "../lib/format";
+  import { relTime, ms, dateTime } from "../lib/format";
+  import { isMobile } from "../lib/media.svelte";
+  import Icon from "../components/Icon.svelte";
+  import Badge from "../components/Badge.svelte";
+  import Switch from "../components/Switch.svelte";
+  import Sheet from "../components/Sheet.svelte";
+  import ConfirmDialog from "../components/ConfirmDialog.svelte";
+  import Pagination from "../components/Pagination.svelte";
+  import ResponsiveTable from "../components/ResponsiveTable.svelte";
 
   let entries = $state<LogEntryView[]>([]);
   let total = $state(0);
@@ -12,11 +21,16 @@
   let client = $state("");
   let blockedOnly = $state(false);
   let offset = $state(0);
-  let live = $state(true);
-  let menuFor = $state<number | null>(null);
+  let live = $state(false); // auto-refresh is opt-in and starts OFF.
   const limit = 100;
 
+  let loading = $state(false);
+  let detail = $state<LogEntryView | null>(null);
+  let sheetOpen = $state(false);
+  let confirmClear = $state(false);
+
   async function load() {
+    loading = true;
     try {
       const r = await ok(
         api.getQuerylog({
@@ -31,16 +45,19 @@
       total = r.total;
     } catch (e) {
       if (!isStatus(e, 401)) toaster.show("Failed to load query log", true);
+    } finally {
+      loading = false;
     }
   }
 
   $effect(() => {
-    // Re-run when any filter changes.
     search;
     client;
     blockedOnly;
     offset;
-    load();
+    // Debounce so typing in the search/client fields doesn't fire a request per keystroke.
+    const t = setTimeout(load, 250);
+    return () => clearTimeout(t);
   });
 
   $effect(() => {
@@ -52,24 +69,48 @@
   });
 
   async function clearLog() {
-    if (!confirm("Clear the in-memory query log?")) return;
     await ok(api.clearQuerylog());
     offset = 0;
     load();
-  }
-
-  function badgeClass(e: LogEntryView): string {
-    if (e.action === "blocked") return "block";
-    return e.action;
   }
 
   function bareDomain(question: string): string {
     return question.replace(/\.$/, "");
   }
 
+  function tone(e: LogEntryView): "good" | "bad" | "info" | "warn" | "neutral" {
+    if (e.allowlisted) return "good";
+    switch (e.action) {
+      case "blocked":
+      case "error":
+        return "bad";
+      case "allowed":
+      case "forwarded":
+        return "good";
+      case "cached":
+        return "info";
+      case "rewritten":
+        return "warn";
+      default:
+        return "neutral";
+    }
+  }
+
+  function statusLabel(e: LogEntryView): string {
+    return e.allowlisted ? "allowed" : e.action;
+  }
+
+  // The merged "Response" summary: matched rule, else first answer, else rcode.
+  function resultText(e: LogEntryView): string {
+    return e.rule ?? e.answers[0] ?? e.rcode;
+  }
+
+  function upstreamText(e: LogEntryView): string {
+    return e.upstream ?? (e.action === "cached" ? "cache" : "");
+  }
+
   // Match AdGuard Home: allow => @@||host^$important, block => ||host^$important.
   async function addRule(e: LogEntryView, allow: boolean) {
-    menuFor = null;
     const domain = bareDomain(e.question);
     const rule = `${allow ? "@@" : ""}||${domain}^$important`;
     try {
@@ -81,95 +122,358 @@
     }
   }
 
-  function toggleMenu(id: number, ev: MouseEvent) {
-    ev.stopPropagation();
-    menuFor = menuFor === id ? null : id;
+  function openDetail(e: LogEntryView) {
+    detail = e;
+    sheetOpen = true;
   }
 
-  $effect(() => {
-    const close = () => (menuFor = null);
-    window.addEventListener("click", close);
-    return () => window.removeEventListener("click", close);
-  });
+  async function actFromSheet(allow: boolean) {
+    if (detail) await addRule(detail, allow);
+    sheetOpen = false;
+  }
+
+  function resetOffset() {
+    offset = 0;
+  }
 </script>
 
-<h1 class="page-title">
-  Query Log
-  <span class="muted" style="font-size:0.9rem;font-weight:400">{total.toLocaleString()} matching</span>
-</h1>
-
-<div class="toolbar">
-  <input placeholder="Search domain…" bind:value={search} style="max-width:240px" oninput={() => (offset = 0)} />
-  <input placeholder="Client IP / name…" bind:value={client} style="max-width:200px" oninput={() => (offset = 0)} />
-  <label class="row" style="margin:0;gap:0.4rem;align-items:center">
-    <input type="checkbox" bind:checked={blockedOnly} style="width:auto" onchange={() => (offset = 0)} />
-    <span>Blocked only</span>
-  </label>
-  <label class="row" style="margin:0;gap:0.4rem;align-items:center">
-    <input type="checkbox" bind:checked={live} style="width:auto" />
-    <span>Live</span>
-  </label>
-  <div class="spacer"></div>
-  <button class="danger" onclick={clearLog}>Clear log</button>
+<div class="page-head">
+  <h1 class="page-title">Query Log</h1>
+  <span class="page-sub">{total.toLocaleString()} matching</span>
 </div>
 
-<div class="card" style="padding:0;overflow-x:auto">
-  <table>
-    <thead>
+<div class="toolbar">
+  <div class="search-field">
+    <Icon name="search" size={15} class="search-icon" />
+    <input placeholder="Search domain…" bind:value={search} oninput={resetOffset} />
+  </div>
+  <input
+    class="client-field"
+    placeholder="Client IP / name…"
+    bind:value={client}
+    oninput={resetOffset}
+  />
+  <label class="inline-switch">
+    <Switch bind:checked={blockedOnly} onCheckedChange={resetOffset} />
+    <span>Blocked only</span>
+  </label>
+  <label class="inline-switch">
+    <Switch bind:checked={live} />
+    <span>Live</span>
+  </label>
+  <span class="spacer"></span>
+  <button class="btn btn-sm" onclick={load} disabled={loading || live} title={live ? "Auto-refreshing while Live is on" : "Refresh"}>
+    <Icon name="refresh" size={15} /> Refresh
+  </button>
+  <button class="btn btn-sm btn-danger" onclick={() => (confirmClear = true)}>
+    <Icon name="trash" size={15} /> Clear log
+  </button>
+</div>
+
+<div class="card" style="padding:0;overflow:hidden">
+  <ResponsiveTable items={entries} key={(e) => e.id}>
+    {#snippet head()}
       <tr>
         <th>Time</th>
         <th>Domain</th>
-        <th>Type</th>
         <th>Client</th>
-        <th>Status</th>
-        <th>Rule / result</th>
-        <th>List</th>
-        <th>Upstream</th>
-        <th>Time</th>
+        <th>Response</th>
         <th></th>
       </tr>
-    </thead>
-    <tbody>
-      {#each entries as e (e.id)}
-        <tr>
-          <td class="muted" title={new Date(e.time_ms).toLocaleString()}>{relTime(e.time_ms)}</td>
-          <td class="mono" title={e.question}>{e.question}</td>
-          <td>{e.qtype}</td>
-          <td>{e.client_name ?? e.client_ip}</td>
-          <td>
-            <span class="badge {badgeClass(e)}">{e.allowlisted ? "allowed" : e.action}</span>
-          </td>
-          <td class="mono muted" title={e.rule ?? e.answers.join(", ")}>
-            {#if e.rule}{e.rule}{:else}{e.answers[0] ?? e.rcode}{/if}
-          </td>
-          <td class="muted" title={e.list_name ?? ""}>
-            {#if e.rule}{e.list_name ?? "—"}{:else}—{/if}
-          </td>
-          <td class="muted">{e.upstream ?? (e.action === "cached" ? "cache" : "—")}</td>
-          <td class="muted">{ms(e.elapsed_ms)}</td>
-          <td style="text-align:right">
-            <div class="menu-wrap">
-              <button class="menu-btn" title="Actions" onclick={(ev) => toggleMenu(e.id, ev)}>⋯</button>
-              {#if menuFor === e.id}
-                <div class="menu" onclick={(ev) => ev.stopPropagation()} role="menu" tabindex="-1" onkeydown={() => {}}>
-                  <span class="mono">{bareDomain(e.question)}</span>
-                  <button onclick={() => addRule(e, true)}>✅ Allow this domain</button>
-                  <button onclick={() => addRule(e, false)}>🚫 Block this domain</button>
-                </div>
-              {/if}
-            </div>
-          </td>
-        </tr>
-      {/each}
-      {#if entries.length === 0}
-        <tr><td colspan="10" class="muted" style="text-align:center;padding:2rem">No matching queries.</td></tr>
-      {/if}
-    </tbody>
-  </table>
+    {/snippet}
+
+    {#snippet row(e)}
+      <tr class="hoverable clickable" onclick={() => openDetail(e)}>
+        <td class="muted nowrap" title={dateTime(e.time_ms)}>{relTime(e.time_ms)}</td>
+        <td>
+          <div class="domain-cell">
+            <span class="mono domain" title={e.question}>{e.question}</span>
+            <span class="qtype">{e.qtype}</span>
+          </div>
+        </td>
+        <td class="nowrap">{e.client_name ?? e.client_ip}</td>
+        <td>
+          <div class="response-cell">
+            <Badge tone={tone(e)}>{statusLabel(e)}</Badge>
+            <span class="resp-detail mono muted" title={resultText(e)}>
+              {resultText(e)}{#if upstreamText(e)} · <span class="faint">{upstreamText(e)}</span
+                >{/if}
+            </span>
+          </div>
+        </td>
+        <td class="actions-cell" onclick={(ev) => ev.stopPropagation()}>
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger class="btn btn-icon" aria-label="Row actions">
+              <Icon name="more" size={16} />
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content class="bw-menu" align="end" sideOffset={4}>
+                <span class="bw-menu-label">{bareDomain(e.question)}</span>
+                <DropdownMenu.Item class="bw-menu-item" onSelect={() => addRule(e, true)}>
+                  <Icon name="allow" size={15} /> Allow this domain
+                </DropdownMenu.Item>
+                <DropdownMenu.Item class="bw-menu-item danger" onSelect={() => addRule(e, false)}>
+                  <Icon name="block" size={15} /> Block this domain
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        </td>
+      </tr>
+    {/snippet}
+
+    {#snippet card(e)}
+      <button class="log-card" onclick={() => openDetail(e)}>
+        <div class="log-card-top">
+          <span class="mono domain">{e.question}</span>
+          <Badge tone={tone(e)}>{statusLabel(e)}</Badge>
+        </div>
+        <div class="log-card-meta muted">
+          {relTime(e.time_ms)} · {e.qtype} · {e.client_name ?? e.client_ip}
+        </div>
+      </button>
+    {/snippet}
+
+    {#snippet empty()}
+      No matching queries.
+    {/snippet}
+  </ResponsiveTable>
 </div>
 
-<div class="toolbar" style="margin-top:1rem;justify-content:center">
-  <button disabled={offset === 0} onclick={() => (offset = Math.max(0, offset - limit))}>← Newer</button>
-  <span class="muted">{offset + 1}–{Math.min(offset + limit, total)} of {total.toLocaleString()}</span>
-  <button disabled={offset + limit >= total} onclick={() => (offset += limit)}>Older →</button>
-</div>
+<Pagination {offset} {limit} {total} onChange={(o) => (offset = o)} />
+
+<!-- Detail view: bottom sheet on mobile, centered dialog on desktop. -->
+<Sheet bind:open={sheetOpen} title="Query detail" variant={isMobile.matches ? "sheet" : "dialog"}>
+  {#if detail}
+    <div class="detail">
+      <section class="detail-group">
+        <h4 class="detail-heading">Request</h4>
+        <dl>
+          <dt>Domain</dt>
+          <dd class="mono">{bareDomain(detail.question)}</dd>
+          <dt>Type</dt>
+          <dd class="mono">{detail.qtype}</dd>
+          <dt>Client</dt>
+          <dd>
+            {#if detail.client_name}
+              {detail.client_name} <span class="muted mono">{detail.client_ip}</span>
+            {:else}
+              <span class="mono">{detail.client_ip}</span>
+            {/if}
+          </dd>
+          <dt>Time</dt>
+          <dd>{dateTime(detail.time_ms)}</dd>
+        </dl>
+      </section>
+
+      <section class="detail-group">
+        <h4 class="detail-heading">Response</h4>
+        <dl>
+          <dt>Status</dt>
+          <dd>
+            <Badge tone={tone(detail)}>{statusLabel(detail)}</Badge>
+            {#if detail.allowlisted}<span class="muted small">via @@ exception</span>{/if}
+          </dd>
+          <dt>Response code</dt>
+          <dd class="mono">{detail.rcode}</dd>
+          {#if detail.rule}
+            <dt>Rule</dt>
+            <dd class="mono wrap">{detail.rule}</dd>
+            <dt>Filter list</dt>
+            <dd>{detail.list_name ?? (detail.list_id === 0 ? "Custom rules" : "—")}</dd>
+          {/if}
+          <dt>Upstream</dt>
+          <dd class="mono">{detail.upstream ?? (detail.action === "cached" ? "cache" : "—")}</dd>
+          <dt>Elapsed</dt>
+          <dd>{ms(detail.elapsed_ms)}</dd>
+          <dt>Answers</dt>
+          <dd class="answers">
+            {#if detail.answers.length}
+              {#each detail.answers as a}<div class="mono wrap">{a}</div>{/each}
+            {:else}
+              <span class="muted">—</span>
+            {/if}
+          </dd>
+        </dl>
+      </section>
+    </div>
+
+    <div class="detail-actions">
+      <button class="btn" onclick={() => actFromSheet(true)}>
+        <Icon name="allow" size={16} /> Allow
+      </button>
+      <button class="btn btn-danger" onclick={() => actFromSheet(false)}>
+        <Icon name="block" size={16} /> Block
+      </button>
+    </div>
+  {/if}
+</Sheet>
+
+<ConfirmDialog
+  bind:open={confirmClear}
+  title="Clear query log?"
+  message="This empties the in-memory query log. Persisted history on disk is not affected."
+  confirmLabel="Clear log"
+  danger
+  onConfirm={clearLog}
+/>
+
+<style>
+  .search-field {
+    position: relative;
+    flex: 1 1 220px;
+    max-width: 280px;
+    min-width: 150px;
+  }
+  .search-field :global(.search-icon) {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-faint);
+    pointer-events: none;
+  }
+  .search-field input {
+    padding-left: 32px;
+  }
+  .client-field {
+    flex: 0 1 200px;
+    min-width: 140px;
+  }
+  .inline-switch {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--sp-2);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  /* Desktop table cells (now ~5 columns — no horizontal scroll) */
+  .clickable {
+    cursor: pointer;
+  }
+  .domain-cell {
+    display: flex;
+    align-items: baseline;
+    gap: var(--sp-2);
+    max-width: 340px;
+  }
+  .domain {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .qtype {
+    flex-shrink: 0;
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    color: var(--text-faint);
+  }
+  .response-cell {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    max-width: 420px;
+  }
+  .resp-detail {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.8rem;
+  }
+  .actions-cell {
+    text-align: right;
+    width: 1%;
+  }
+
+  /* Mobile cards */
+  .log-card {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+    text-align: left;
+    background: var(--bg-elev);
+    border: none;
+    border-bottom: 1px solid var(--border);
+    padding: 0.7rem 0.85rem;
+    cursor: pointer;
+  }
+  .log-card:active {
+    background: var(--bg-hover);
+  }
+  .log-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--sp-2);
+  }
+  .log-card-top .domain {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 0.85rem;
+  }
+  .log-card-meta {
+    font-size: 0.78rem;
+  }
+
+  /* Detail dialog / sheet */
+  .detail {
+    display: flex;
+    flex-direction: column;
+    gap: var(--sp-4);
+    margin: 0 0 var(--sp-5);
+  }
+  .detail-group dl {
+    display: grid;
+    grid-template-columns: minmax(7rem, auto) 1fr;
+    gap: 0.45rem var(--sp-4);
+    margin: 0;
+  }
+  .detail-heading {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-faint);
+    font-weight: 600;
+    margin-bottom: var(--sp-2);
+    padding-bottom: var(--sp-1);
+    border-bottom: 1px solid var(--border);
+  }
+  .detail dt {
+    color: var(--text-dim);
+    font-size: 0.82rem;
+  }
+  .detail dd {
+    margin: 0;
+    text-align: right;
+    font-size: 0.85rem;
+    min-width: 0;
+  }
+  .detail dd.wrap,
+  .detail dd .wrap {
+    word-break: break-all;
+  }
+  .detail dd.answers {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .detail .small {
+    font-size: 0.72rem;
+    margin-left: 0.35rem;
+  }
+  .detail-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--sp-3);
+  }
+  .detail-actions .btn {
+    padding: 0.7rem;
+    font-size: 0.95rem;
+  }
+</style>

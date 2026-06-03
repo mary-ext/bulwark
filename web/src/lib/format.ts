@@ -27,3 +27,11 @@ export function relTime(epochMs: number): string {
 export function dateTime(epochMs: number): string {
   return new Date(epochMs).toLocaleString();
 }
+
+/** Parse a comma-separated input into a trimmed, non-empty string list. */
+export function parseList(v: string): string[] {
+  return v
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}

@@ -9,7 +9,11 @@
     BlockingMode,
   } from "../api/generated";
   import { errMsg } from "../lib/errors";
+  import { parseList } from "../lib/format";
   import { toaster } from "../lib/toast.svelte";
+  import Field from "../components/Field.svelte";
+  import Select from "../components/Select.svelte";
+  import SwitchRow from "../components/SwitchRow.svelte";
 
   let loaded = $state(false);
 
@@ -54,141 +58,189 @@
     }
   }
 
-  const blockingModes: { v: BlockingMode; l: string }[] = [
-    { v: "nx_domain", l: "NXDOMAIN" },
-    { v: "null_ip", l: "Null IP (0.0.0.0 / ::)" },
-    { v: "custom_ip", l: "Custom IP" },
-    { v: "refused", l: "REFUSED" },
-    { v: "no_data", l: "NODATA" },
+  const blockingModes: { value: BlockingMode; label: string }[] = [
+    { value: "nx_domain", label: "NXDOMAIN" },
+    { value: "null_ip", label: "Null IP (0.0.0.0 / ::)" },
+    { value: "custom_ip", label: "Custom IP" },
+    { value: "refused", label: "REFUSED" },
+    { value: "no_data", label: "NODATA" },
   ];
 </script>
 
-<h1 class="page-title">Settings</h1>
+<div class="page-head">
+  <h1 class="page-title">Settings</h1>
+</div>
 
 {#if loaded}
   <div class="grid cols-2">
     <!-- Filtering -->
-    <div class="card">
-      <h3 style="margin-top:0">Filtering</h3>
-      <div class="field row" style="justify-content:space-between">
-        <label for="f-enabled" style="margin:0">Enable filtering</label>
-        <label class="switch"><input id="f-enabled" type="checkbox" bind:checked={filtering.enabled} /><span class="slider"></span></label>
-      </div>
-      <div class="field">
-        <label for="bm">Blocking mode</label>
-        <select id="bm" bind:value={filtering.blocking_mode}>
-          {#each blockingModes as m}<option value={m.v}>{m.l}</option>{/each}
-        </select>
-      </div>
-      {#if filtering.blocking_mode === "custom_ip"}
-        <div class="grid cols-2">
-          <div class="field"><label for="f-block4">Block IPv4</label><input id="f-block4" class="mono" bind:value={filtering.custom_block_ipv4} /></div>
-          <div class="field"><label for="f-block6">Block IPv6</label><input id="f-block6" class="mono" bind:value={filtering.custom_block_ipv6} /></div>
-        </div>
-      {/if}
-      <div class="field">
-        <label for="bt">Blocked response TTL (s)</label>
-        <input id="bt" type="number" min="0" bind:value={filtering.blocked_ttl_secs} />
-      </div>
-      <button class="primary" onclick={() => run(() => ok(api.putFiltering(filtering)), "Filtering saved")}>Save</button>
-    </div>
-
-    <!-- Cache -->
-    <div class="card">
-      <h3 style="margin-top:0">Cache</h3>
-      {#if cache}
-        <div class="field row" style="justify-content:space-between">
-          <label for="c-enabled" style="margin:0">Enable cache</label>
-          <label class="switch"><input id="c-enabled" type="checkbox" bind:checked={cache.enabled} /><span class="slider"></span></label>
-        </div>
-        <div class="field row" style="justify-content:space-between">
-          <label for="c-optimistic" style="margin:0" title="Serve stale answers while refreshing in the background">Optimistic caching</label>
-          <label class="switch">
-            <input
-              id="c-optimistic"
-              type="checkbox"
-              checked={cache.optimistic_max_age_secs > 0}
-              onchange={(e) => (cache!.optimistic_max_age_secs = e.currentTarget.checked ? 86400 : 0)}
-            />
-            <span class="slider"></span>
-          </label>
-        </div>
-        {#if cache.optimistic_max_age_secs > 0}
-          <div class="field">
-            <label for="sa">Max serve-stale age (s past expiry)</label>
-            <input id="sa" type="number" min="1" bind:value={cache.optimistic_max_age_secs} />
-            <p class="muted" style="font-size:0.78rem;margin:0.3rem 0 0">
-              Bounds how stale an answer can be; turn the toggle off to disable serve-stale.
-            </p>
+    <section class="card">
+      <div class="card-title">Filtering</div>
+      <div class="stack">
+        <SwitchRow bind:checked={filtering.enabled} label="Enable filtering" />
+        <Field label="Blocking mode" htmlFor="bm">
+          <Select id="bm" bind:value={filtering.blocking_mode} items={blockingModes} />
+        </Field>
+        {#if filtering.blocking_mode === "custom_ip"}
+          <div class="grid cols-2">
+            <Field label="Block IPv4" htmlFor="f-block4">
+              <input id="f-block4" class="mono" bind:value={filtering.custom_block_ipv4} />
+            </Field>
+            <Field label="Block IPv6" htmlFor="f-block6">
+              <input id="f-block6" class="mono" bind:value={filtering.custom_block_ipv6} />
+            </Field>
           </div>
         {/if}
-        <div class="field"><label for="cs">Max entries</label><input id="cs" type="number" min="1" bind:value={cache.size} /></div>
-        <div class="grid cols-2">
-          <div class="field"><label for="c-minttl">Min TTL (s)</label><input id="c-minttl" type="number" min="0" bind:value={cache.min_ttl_secs} /></div>
-          <div class="field"><label for="c-maxttl">Max TTL (s, 0 = none)</label><input id="c-maxttl" type="number" min="0" bind:value={cache.max_ttl_secs} /></div>
+        <Field label="Blocked response TTL (s)" htmlFor="bt">
+          <input id="bt" type="number" min="0" bind:value={filtering.blocked_ttl_secs} />
+        </Field>
+        <div>
+          <button
+            class="btn btn-primary"
+            onclick={() => run(() => ok(api.putFiltering(filtering)), "Filtering saved")}
+          >
+            Save
+          </button>
         </div>
-        <button class="primary" onclick={() => cache && run(() => ok(api.putCache(cache!)), "Cache saved")}>Save</button>
-      {/if}
-    </div>
+      </div>
+    </section>
+
+    <!-- Cache -->
+    {#if cache}
+      <section class="card">
+        <div class="card-title">Cache</div>
+        <div class="stack">
+          <SwitchRow bind:checked={cache.enabled} label="Enable cache" />
+          <SwitchRow
+            checked={cache.optimistic_max_age_secs > 0}
+            label="Optimistic caching"
+            hint="Serve stale answers while refreshing in the background."
+            onCheckedChange={(v) => cache && (cache.optimistic_max_age_secs = v ? 86400 : 0)}
+          />
+          {#if cache.optimistic_max_age_secs > 0}
+            <Field
+              label="Max serve-stale age (s past expiry)"
+              htmlFor="sa"
+              hint="Bounds how stale an answer can be; turn the toggle off to disable serve-stale."
+            >
+              <input id="sa" type="number" min="1" bind:value={cache.optimistic_max_age_secs} />
+            </Field>
+          {/if}
+          <Field label="Max entries" htmlFor="cs">
+            <input id="cs" type="number" min="1" bind:value={cache.size} />
+          </Field>
+          <div class="grid cols-2">
+            <Field label="Min TTL (s)" htmlFor="c-minttl">
+              <input id="c-minttl" type="number" min="0" bind:value={cache.min_ttl_secs} />
+            </Field>
+            <Field label="Max TTL (s, 0 = none)" htmlFor="c-maxttl">
+              <input id="c-maxttl" type="number" min="0" bind:value={cache.max_ttl_secs} />
+            </Field>
+          </div>
+          <div>
+            <button
+              class="btn btn-primary"
+              onclick={() => cache && run(() => ok(api.putCache(cache!)), "Cache saved")}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </section>
+    {/if}
 
     <!-- Query log -->
-    <div class="card">
-      <h3 style="margin-top:0">Query log</h3>
-      {#if querylog}
-        <div class="field row" style="justify-content:space-between">
-          <label for="q-enabled" style="margin:0">Enable query log</label>
-          <label class="switch"><input id="q-enabled" type="checkbox" bind:checked={querylog.enabled} /><span class="slider"></span></label>
+    {#if querylog}
+      <section class="card">
+        <div class="card-title">Query log</div>
+        <div class="stack">
+          <SwitchRow bind:checked={querylog.enabled} label="Enable query log" />
+          <SwitchRow bind:checked={querylog.persist} label="Persist to disk" />
+          <SwitchRow bind:checked={querylog.anonymize} label="Anonymize client IPs" />
+          <div class="grid cols-2">
+            <Field label="In-memory entries" htmlFor="q-size">
+              <input id="q-size" type="number" min="1" bind:value={querylog.size} />
+            </Field>
+            <Field label="Retention (days)" htmlFor="q-retention">
+              <input id="q-retention" type="number" min="0" bind:value={querylog.retention_days} />
+            </Field>
+          </div>
+          <div>
+            <button
+              class="btn btn-primary"
+              onclick={() => querylog && run(() => ok(api.putQuerylog(querylog!)), "Query log saved")}
+            >
+              Save
+            </button>
+          </div>
         </div>
-        <div class="field row" style="justify-content:space-between">
-          <label for="q-persist" style="margin:0">Persist to disk</label>
-          <label class="switch"><input id="q-persist" type="checkbox" bind:checked={querylog.persist} /><span class="slider"></span></label>
-        </div>
-        <div class="field row" style="justify-content:space-between">
-          <label for="q-anon" style="margin:0">Anonymize client IPs</label>
-          <label class="switch"><input id="q-anon" type="checkbox" bind:checked={querylog.anonymize} /><span class="slider"></span></label>
-        </div>
-        <div class="grid cols-2">
-          <div class="field"><label for="q-size">In-memory entries</label><input id="q-size" type="number" min="1" bind:value={querylog.size} /></div>
-          <div class="field"><label for="q-retention">Retention (days)</label><input id="q-retention" type="number" min="0" bind:value={querylog.retention_days} /></div>
-        </div>
-        <button class="primary" onclick={() => querylog && run(() => ok(api.putQuerylog(querylog!)), "Query log saved")}>Save</button>
-      {/if}
-    </div>
+      </section>
+    {/if}
 
     <!-- Stats -->
-    <div class="card">
-      <h3 style="margin-top:0">Statistics</h3>
-      {#if stats}
-        <div class="field row" style="justify-content:space-between">
-          <label for="s-enabled" style="margin:0">Enable statistics</label>
-          <label class="switch"><input id="s-enabled" type="checkbox" bind:checked={stats.enabled} /><span class="slider"></span></label>
+    {#if stats}
+      <section class="card">
+        <div class="card-title">Statistics</div>
+        <div class="stack">
+          <SwitchRow bind:checked={stats.enabled} label="Enable statistics" />
+          <SwitchRow bind:checked={stats.persist} label="Persist to disk" />
+          <Field
+            label="Retention (days)"
+            htmlFor="s-retention"
+            hint="Query log and statistics retention are independent."
+          >
+            <input id="s-retention" type="number" min="1" bind:value={stats.retention_days} />
+          </Field>
+          <div>
+            <button
+              class="btn btn-primary"
+              onclick={() => stats && run(() => ok(api.putStatsCfg(stats!)), "Statistics saved")}
+            >
+              Save
+            </button>
+          </div>
         </div>
-        <div class="field row" style="justify-content:space-between">
-          <label for="s-persist" style="margin:0">Persist to disk</label>
-          <label class="switch"><input id="s-persist" type="checkbox" bind:checked={stats.persist} /><span class="slider"></span></label>
-        </div>
-        <div class="field"><label for="s-retention">Retention (days)</label><input id="s-retention" type="number" min="1" bind:value={stats.retention_days} /></div>
-        <p class="muted" style="font-size:0.8rem">Query log and statistics retention are independent.</p>
-        <button class="primary" onclick={() => stats && run(() => ok(api.putStatsCfg(stats!)), "Statistics saved")}>Save</button>
-      {/if}
-    </div>
+      </section>
+    {/if}
 
     <!-- Server -->
-    <div class="card" style="grid-column:1/-1">
-      <h3 style="margin-top:0">Server <span class="muted" style="font-size:0.8rem">(changes to binds need a restart)</span></h3>
-      {#if server}
-        <div class="grid cols-3">
-          <div class="field">
-            <label for="sv-dns">DNS bind (comma-separated)</label>
-            <input id="sv-dns" class="mono" value={server.dns_bind.join(", ")}
-              onchange={(e) => server && (server.dns_bind = (e.target as HTMLInputElement).value.split(",").map((s) => s.trim()).filter(Boolean))} />
-          </div>
-          <div class="field"><label for="sv-http">HTTP bind</label><input id="sv-http" class="mono" bind:value={server.http_bind} /></div>
-          <div class="field"><label for="sv-ratelimit">Rate limit (qps/client, 0 = off)</label><input id="sv-ratelimit" type="number" min="0" bind:value={server.ratelimit} /></div>
+    {#if server}
+      <section class="card" style="grid-column:1/-1">
+        <div class="card-title">
+          Server
+          <span class="muted" style="font-weight:400;font-size:0.8rem"
+            >(changes to binds need a restart)</span
+          >
         </div>
-        <button class="primary" onclick={() => server && run(() => ok(api.putServer(server!)), "Server settings saved (restart to apply binds)")}>Save</button>
-      {/if}
-    </div>
+        <div class="grid cols-3">
+          <Field label="DNS bind (comma-separated)" htmlFor="sv-dns">
+            <input
+              id="sv-dns"
+              class="mono"
+              value={server.dns_bind.join(", ")}
+              onchange={(e) =>
+                server && (server.dns_bind = parseList((e.target as HTMLInputElement).value))}
+            />
+          </Field>
+          <Field label="HTTP bind" htmlFor="sv-http">
+            <input id="sv-http" class="mono" bind:value={server.http_bind} />
+          </Field>
+          <Field label="Rate limit (qps/client, 0 = off)" htmlFor="sv-ratelimit">
+            <input id="sv-ratelimit" type="number" min="0" bind:value={server.ratelimit} />
+          </Field>
+        </div>
+        <div style="margin-top:var(--sp-4)">
+          <button
+            class="btn btn-primary"
+            onclick={() =>
+              server &&
+              run(() => ok(api.putServer(server!)), "Server settings saved (restart to apply binds)")}
+          >
+            Save
+          </button>
+        </div>
+      </section>
+    {/if}
   </div>
 {:else}
   <p class="muted">Loading…</p>

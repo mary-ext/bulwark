@@ -11,8 +11,10 @@
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@oazapfts/runtime": "^1.2.0",
-    "chart.js": "^4.5.1"
+    "bits-ui": "^2.18.1"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.1.1",
