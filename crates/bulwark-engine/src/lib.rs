@@ -248,6 +248,11 @@ impl Engine {
         match state.pool.resolve(&query).await {
             Ok(resolved) => {
                 self.cache.insert(key, &resolved.message);
+                // Attribute the answering upstream's own round-trip to per-upstream
+                // stats, not the whole-query wall-clock: with sequential failover a
+                // query that waited out an earlier upstream's timeout would otherwise
+                // charge that ~1s to the upstream that actually answered quickly.
+                log.upstream_rtt_ms = Some(resolved.rtt_ms);
                 let action = QueryAction::Forwarded {
                     upstream: resolved.upstream,
                 };
@@ -311,9 +316,11 @@ impl Engine {
         log.rcode = rcode_label(resp.metadata.response_code);
         log.answers = resp.answers.iter().map(summarize).collect();
 
+        // Read before `build` consumes the builder; only forwarded queries set it.
+        let upstream_rtt_ms = log.upstream_rtt_ms;
         let entry = log.build(self.seq.fetch_add(1, Ordering::Relaxed), action);
         if stats_on {
-            self.stats.record(&entry);
+            self.stats.record(&entry, upstream_rtt_ms);
         }
         if log_on {
             self.log.push(entry);
@@ -333,6 +340,10 @@ struct LogBuilder {
     rcode: Cow<'static, str>,
     answers: Vec<String>,
     elapsed_ms: f64,
+    /// Answering upstream's own round-trip (ms), set only when the query was
+    /// forwarded. Kept out of the stored [`QueryLogEntry`] — it feeds per-upstream
+    /// latency stats but isn't part of the log schema.
+    upstream_rtt_ms: Option<f64>,
 }
 
 impl LogBuilder {
@@ -347,6 +358,7 @@ impl LogBuilder {
             rcode: Cow::Borrowed(""),
             answers: Vec::new(),
             elapsed_ms: 0.0,
+            upstream_rtt_ms: None,
         }
     }
 

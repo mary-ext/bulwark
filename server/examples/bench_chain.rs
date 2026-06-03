@@ -773,7 +773,7 @@ fn phase4_stats_contention(blocked: &[String]) {
         let new = Arc::new(Stats::new(true, 24));
         let new_rate = run_record_bench(c, per_thread, entries.clone(), {
             let new = new.clone();
-            move |e| new.record(e)
+            move |e| new.record(e, None)
         });
 
         println!(

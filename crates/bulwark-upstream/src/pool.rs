@@ -157,6 +157,11 @@ pub struct Resolved {
     pub message: Message,
     /// Display name of the upstream that produced the answer.
     pub upstream: String,
+    /// Round-trip time of the answering attempt, in milliseconds. This is the
+    /// single successful attempt only — it excludes any time spent on earlier
+    /// upstreams that timed out or failed before failover, so it reflects the
+    /// answering upstream's own latency rather than the whole-query wall-clock.
+    pub rtt_ms: f64,
 }
 
 type ResolveFuture = Shared<BoxFuture<'static, SharedResult<Resolved>>>;
@@ -295,10 +300,12 @@ async fn resolve_sequential(
         let start = Instant::now();
         match tokio::time::timeout(timeout, up.transport.query(&query)).await {
             Ok(Ok(resp)) => {
-                up.record_success(start.elapsed(), alpha);
+                let rtt = start.elapsed();
+                up.record_success(rtt, alpha);
                 return Ok(Resolved {
                     message: resp,
                     upstream: up.name.clone(),
+                    rtt_ms: rtt.as_secs_f64() * 1000.0,
                 });
             }
             Ok(Err(e)) => {
