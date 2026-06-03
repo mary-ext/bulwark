@@ -1,4 +1,8 @@
-//! The HTTP REST API (Axum).
+//! The HTTP REST API (Axum), annotated for OpenAPI via `utoipa`.
+//!
+//! Handlers use concrete request/response types (rather than ad-hoc
+//! `serde_json::Value`) so the generated OpenAPI spec — and the front-end client
+//! generated from it — stay in lockstep with the server.
 
 use std::time::Duration;
 
@@ -7,14 +11,18 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{middleware, Json, Router};
-use bulwark_config::{ClientConfig, FilterListConfig};
+use bulwark_config::{
+    BlockingMode, CacheConfig, ClientConfig, Config, FilterListConfig, QueryLogConfig,
+    ServerConfig, StatsConfig, UpstreamsConfig,
+};
 use bulwark_filter::{ClientInfo, Verdict};
 use bulwark_upstream::{test_spec, UpstreamSpec};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::app::{apply_config, write_list_text, AppState};
 use crate::auth::{hash_password, verify_password, SESSION_COOKIE};
+use crate::dto::{LogEntryView, QueryLogResponse, StatsResponse, UpstreamStatDto};
 
 /// API error type that renders as a JSON `{ "error": ... }` body.
 pub enum ApiError {
@@ -22,6 +30,12 @@ pub enum ApiError {
     Unauthorized,
     NotFound(String),
     Internal(String),
+}
+
+/// Error body returned for any non-2xx response.
+#[derive(Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: String,
 }
 
 impl IntoResponse for ApiError {
@@ -32,7 +46,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
-        (status, Json(json!({ "error": msg }))).into_response()
+        (status, Json(ErrorResponse { error: msg })).into_response()
     }
 }
 
@@ -40,6 +54,22 @@ type ApiResult<T> = Result<T, ApiError>;
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Shared response shapes
+// ---------------------------------------------------------------------------
+
+/// Generic success acknowledgement: `{ "ok": true }`.
+#[derive(Serialize, ToSchema)]
+pub struct OkResponse {
+    pub ok: bool,
+}
+
+impl OkResponse {
+    fn ok() -> Json<Self> {
+        Json(Self { ok: true })
+    }
 }
 
 /// Build the full API + middleware router.
@@ -108,30 +138,59 @@ async fn require_auth(
     }
 }
 
-#[derive(Deserialize)]
-struct Credentials {
-    username: String,
-    password: String,
+#[derive(Deserialize, ToSchema)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
 }
 
-async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
+/// Setup/auth status and basic server info.
+#[derive(Serialize, ToSchema)]
+pub struct StatusResponse {
+    /// Whether the initial admin account still needs to be created.
+    pub setup_needed: bool,
+    /// Whether the current request carries a valid session.
+    pub authed: bool,
+    pub version: String,
+    /// DNS listen addresses (host:port).
+    #[schema(value_type = Vec<String>)]
+    pub dns_bind: Vec<std::net::SocketAddr>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/status",
+    tag = "auth",
+    responses((status = 200, body = StatusResponse))
+)]
+pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {
     let cfg = state.config.read().await;
     let authed = cookie_token(&headers)
         .map(|t| state.sessions.validate(&t))
         .unwrap_or(false);
-    Json(json!({
-        "setup_needed": cfg.auth.needs_setup(),
-        "authed": authed,
-        "version": env!("CARGO_PKG_VERSION"),
-        "dns_bind": cfg.server.dns_bind,
-    }))
+    Json(StatusResponse {
+        setup_needed: cfg.auth.needs_setup(),
+        authed,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        dns_bind: cfg.server.dns_bind.clone(),
+    })
 }
 
 fn session_cookie(token: &str) -> String {
     format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")
 }
 
-async fn setup(
+#[utoipa::path(
+    post,
+    path = "/api/setup",
+    tag = "auth",
+    request_body = Credentials,
+    responses(
+        (status = 200, body = OkResponse, description = "Admin account created; session cookie set"),
+        (status = 400, body = ErrorResponse)
+    )
+)]
+pub async fn setup(
     State(state): State<AppState>,
     Json(creds): Json<Credentials>,
 ) -> ApiResult<Response> {
@@ -155,10 +214,20 @@ async fn setup(
     let token = state.sessions.create();
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
-    Ok((headers, Json(json!({ "ok": true }))).into_response())
+    Ok((headers, OkResponse::ok()).into_response())
 }
 
-async fn login(
+#[utoipa::path(
+    post,
+    path = "/api/login",
+    tag = "auth",
+    request_body = Credentials,
+    responses(
+        (status = 200, body = OkResponse, description = "Authenticated; session cookie set"),
+        (status = 401, body = ErrorResponse)
+    )
+)]
+pub async fn login(
     State(state): State<AppState>,
     Json(creds): Json<Credentials>,
 ) -> ApiResult<Response> {
@@ -176,10 +245,16 @@ async fn login(
     let token = state.sessions.create();
     let mut headers = HeaderMap::new();
     headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
-    Ok((headers, Json(json!({ "ok": true }))).into_response())
+    Ok((headers, OkResponse::ok()).into_response())
 }
 
-async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+#[utoipa::path(
+    post,
+    path = "/api/logout",
+    tag = "auth",
+    responses((status = 200, body = OkResponse, description = "Session cleared"))
+)]
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(t) = cookie_token(&headers) {
         state.sessions.remove(&t);
     }
@@ -190,57 +265,90 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
             .parse()
             .unwrap(),
     );
-    (out, Json(json!({ "ok": true }))).into_response()
+    (out, OkResponse::ok()).into_response()
 }
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-/// Return the config with the password hash redacted.
-async fn get_config(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    get,
+    path = "/api/config",
+    tag = "config",
+    responses(
+        (status = 200, body = Config, description = "Full config (password hash redacted)"),
+        (status = 401, body = ErrorResponse)
+    )
+)]
+pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
     let mut cfg = state.config.read().await.clone();
     cfg.auth.password_hash = None;
-    Json(serde_json::to_value(cfg).unwrap_or(Value::Null))
+    Json(cfg)
 }
 
-async fn put_upstreams(
+#[utoipa::path(
+    put,
+    path = "/api/config/upstreams",
+    tag = "config",
+    request_body = UpstreamsConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_upstreams(
     State(state): State<AppState>,
-    Json(body): Json<bulwark_config::UpstreamsConfig>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<UpstreamsConfig>,
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.upstreams = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-async fn put_cache(
+#[utoipa::path(
+    put,
+    path = "/api/config/cache",
+    tag = "config",
+    request_body = CacheConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_cache(
     State(state): State<AppState>,
-    Json(body): Json<bulwark_config::CacheConfig>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<CacheConfig>,
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.cache = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-#[derive(Deserialize)]
-struct FilteringSettings {
-    enabled: bool,
-    blocking_mode: bulwark_config::BlockingMode,
-    custom_block_ipv4: std::net::Ipv4Addr,
-    custom_block_ipv6: std::net::Ipv6Addr,
-    blocked_ttl_secs: u32,
+/// The subset of filtering settings editable from the Settings page (the lists
+/// and custom rules have their own endpoints).
+#[derive(Deserialize, ToSchema)]
+pub struct FilteringSettings {
+    pub enabled: bool,
+    pub blocking_mode: BlockingMode,
+    #[schema(value_type = String)]
+    pub custom_block_ipv4: std::net::Ipv4Addr,
+    #[schema(value_type = String)]
+    pub custom_block_ipv6: std::net::Ipv6Addr,
+    pub blocked_ttl_secs: u32,
 }
 
-async fn put_filtering(
+#[utoipa::path(
+    put,
+    path = "/api/config/filtering",
+    tag = "config",
+    request_body = FilteringSettings,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_filtering(
     State(state): State<AppState>,
     Json(body): Json<FilteringSettings>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.filtering.enabled = body.enabled;
     cfg.filtering.blocking_mode = body.blocking_mode;
@@ -250,89 +358,159 @@ async fn put_filtering(
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-async fn put_server(
+/// Response for server-config updates: bind changes only take effect on restart.
+#[derive(Serialize, ToSchema)]
+pub struct ServerUpdateResponse {
+    pub ok: bool,
+    pub restart_required: bool,
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/config/server",
+    tag = "config",
+    request_body = ServerConfig,
+    responses((status = 200, body = ServerUpdateResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_server(
     State(state): State<AppState>,
-    Json(body): Json<bulwark_config::ServerConfig>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<ServerConfig>,
+) -> ApiResult<Json<ServerUpdateResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.server = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     // Note: dns_bind / http_bind changes take effect on restart.
-    Ok(Json(json!({ "ok": true, "restart_required": true })))
+    Ok(Json(ServerUpdateResponse {
+        ok: true,
+        restart_required: true,
+    }))
 }
 
-async fn put_querylog(
+#[utoipa::path(
+    put,
+    path = "/api/config/querylog",
+    tag = "config",
+    request_body = QueryLogConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_querylog(
     State(state): State<AppState>,
-    Json(body): Json<bulwark_config::QueryLogConfig>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<QueryLogConfig>,
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.query_log = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-async fn put_stats_cfg(
+#[utoipa::path(
+    put,
+    path = "/api/config/stats",
+    tag = "config",
+    request_body = StatsConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_stats_cfg(
     State(state): State<AppState>,
-    Json(body): Json<bulwark_config::StatsConfig>,
-) -> ApiResult<Json<Value>> {
+    Json(body): Json<StatsConfig>,
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.stats = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
 // ---------------------------------------------------------------------------
 // Filters
 // ---------------------------------------------------------------------------
 
-async fn get_filters(State(state): State<AppState>) -> Json<Value> {
+/// The filtering overview: lists, custom rules, and current mode.
+#[derive(Serialize, ToSchema)]
+pub struct FiltersResponse {
+    pub lists: Vec<FilterListConfig>,
+    pub custom_rules: String,
+    pub enabled: bool,
+    pub blocking_mode: BlockingMode,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/filters",
+    tag = "filters",
+    responses((status = 200, body = FiltersResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn get_filters(State(state): State<AppState>) -> Json<FiltersResponse> {
     let cfg = state.config.read().await;
-    Json(json!({
-        "lists": cfg.filtering.lists,
-        "custom_rules": cfg.filtering.custom_rules,
-        "enabled": cfg.filtering.enabled,
-        "blocking_mode": cfg.filtering.blocking_mode,
-    }))
+    Json(FiltersResponse {
+        lists: cfg.filtering.lists.clone(),
+        custom_rules: cfg.filtering.custom_rules.clone(),
+        enabled: cfg.filtering.enabled,
+        blocking_mode: cfg.filtering.blocking_mode,
+    })
 }
 
-#[derive(Deserialize)]
-struct CustomRules {
-    rules: String,
+#[derive(Deserialize, ToSchema)]
+pub struct CustomRules {
+    pub rules: String,
 }
 
-async fn put_custom_rules(
+#[utoipa::path(
+    put,
+    path = "/api/filters/custom",
+    tag = "filters",
+    request_body = CustomRules,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_custom_rules(
     State(state): State<AppState>,
     Json(body): Json<CustomRules>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.filtering.custom_rules = body.rules;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-#[derive(Deserialize)]
-struct AddRule {
+#[derive(Deserialize, ToSchema)]
+pub struct AddRule {
     /// A single rule line to append to the custom rules, e.g. `@@||example.com^`
     /// or `||ads.example.com^`. Used by the query-log "allow/block" actions.
-    rule: String,
+    pub rule: String,
 }
 
-async fn add_custom_rule(
+/// Result of appending a single custom rule.
+#[derive(Serialize, ToSchema)]
+pub struct AddRuleResponse {
+    pub ok: bool,
+    /// The (trimmed) rule that was processed.
+    pub rule: String,
+    /// `false` when the rule already existed (the append was a no-op).
+    pub added: bool,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/filters/rule",
+    tag = "filters",
+    request_body = AddRule,
+    responses((status = 200, body = AddRuleResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn add_custom_rule(
     State(state): State<AppState>,
     Json(body): Json<AddRule>,
-) -> ApiResult<Json<Value>> {
-    let rule = body.rule.trim();
+) -> ApiResult<Json<AddRuleResponse>> {
+    let rule = body.rule.trim().to_string();
     if rule.is_empty() {
         return Err(ApiError::BadRequest("empty rule".into()));
     }
@@ -343,29 +521,41 @@ async fn add_custom_rule(
         if !cfg.filtering.custom_rules.is_empty() && !cfg.filtering.custom_rules.ends_with('\n') {
             cfg.filtering.custom_rules.push('\n');
         }
-        cfg.filtering.custom_rules.push_str(rule);
+        cfg.filtering.custom_rules.push_str(&rule);
         cfg.filtering.custom_rules.push('\n');
         apply_config(&state, cfg)
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     }
-    Ok(Json(json!({ "ok": true, "rule": rule, "added": !already })))
+    Ok(Json(AddRuleResponse {
+        ok: true,
+        rule,
+        added: !already,
+    }))
 }
 
-#[derive(Deserialize)]
-struct NewList {
-    name: String,
+#[derive(Deserialize, ToSchema)]
+pub struct NewList {
+    pub name: String,
     #[serde(default)]
-    url: Option<String>,
+    pub url: Option<String>,
     #[serde(default = "default_true")]
-    enabled: bool,
+    pub enabled: bool,
     /// Optional inline content (when no URL is given).
     #[serde(default)]
-    content: Option<String>,
+    pub content: Option<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+/// Result of creating a filter list.
+#[derive(Serialize, ToSchema)]
+pub struct AddListResponse {
+    pub ok: bool,
+    /// The id assigned to the new list.
+    pub id: u32,
 }
 
 /// Fetch a remote filter list's text.
@@ -391,10 +581,17 @@ async fn fetch_list(url: &str) -> Result<String, ApiError> {
         .map_err(|e| ApiError::BadRequest(e.to_string()))
 }
 
-async fn add_list(
+#[utoipa::path(
+    post,
+    path = "/api/filters/lists",
+    tag = "filters",
+    request_body = NewList,
+    responses((status = 200, body = AddListResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn add_list(
     State(state): State<AppState>,
     Json(body): Json<NewList>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<AddListResponse>> {
     let id = state.config.read().await.next_list_id();
 
     // Obtain the list content (remote or inline).
@@ -417,21 +614,29 @@ async fn add_list(
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true, "id": id })))
+    Ok(Json(AddListResponse { ok: true, id }))
 }
 
-#[derive(Deserialize)]
-struct ListUpdate {
-    name: Option<String>,
-    url: Option<String>,
-    enabled: Option<bool>,
+#[derive(Deserialize, ToSchema)]
+pub struct ListUpdate {
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub enabled: Option<bool>,
 }
 
-async fn update_list(
+#[utoipa::path(
+    put,
+    path = "/api/filters/lists/{id}",
+    tag = "filters",
+    params(("id" = u32, Path, description = "Filter list id")),
+    request_body = ListUpdate,
+    responses((status = 200, body = OkResponse), (status = 404, body = ErrorResponse))
+)]
+pub async fn update_list(
     State(state): State<AppState>,
     Path(id): Path<u32>,
     Json(body): Json<ListUpdate>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     let list = cfg
         .filtering
@@ -451,10 +656,20 @@ async fn update_list(
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-async fn delete_list(State(state): State<AppState>, Path(id): Path<u32>) -> ApiResult<Json<Value>> {
+#[utoipa::path(
+    delete,
+    path = "/api/filters/lists/{id}",
+    tag = "filters",
+    params(("id" = u32, Path, description = "Filter list id")),
+    responses((status = 200, body = OkResponse), (status = 404, body = ErrorResponse))
+)]
+pub async fn delete_list(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     let before = cfg.filtering.lists.len();
     cfg.filtering.lists.retain(|l| l.id != id);
@@ -465,13 +680,20 @@ async fn delete_list(State(state): State<AppState>, Path(id): Path<u32>) -> ApiR
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-async fn refresh_list(
+#[utoipa::path(
+    post,
+    path = "/api/filters/lists/{id}/refresh",
+    tag = "filters",
+    params(("id" = u32, Path, description = "Filter list id")),
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse), (status = 404, body = ErrorResponse))
+)]
+pub async fn refresh_list(
     State(state): State<AppState>,
     Path(id): Path<u32>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OkResponse>> {
     let url = {
         let cfg = state.config.read().await;
         let list = cfg
@@ -495,20 +717,40 @@ async fn refresh_list(
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
-#[derive(Deserialize)]
-struct CheckRequest {
-    domain: String,
+#[derive(Deserialize, ToSchema)]
+pub struct CheckRequest {
+    pub domain: String,
     #[serde(default)]
-    qtype: Option<String>,
+    pub qtype: Option<String>,
 }
 
-async fn check_domain(
+/// The filtering verdict for a domain probe.
+#[derive(Serialize, ToSchema)]
+pub struct CheckResponse {
+    /// One of `allow`, `block`, or `rewrite`.
+    pub action: String,
+    /// The matching rule text, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// The filter list responsible (absent for allow verdicts).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_id: Option<u32>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/filters/check",
+    tag = "filters",
+    request_body = CheckRequest,
+    responses((status = 200, body = CheckResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn check_domain(
     State(state): State<AppState>,
     Json(body): Json<CheckRequest>,
-) -> Json<Value> {
+) -> Json<CheckResponse> {
     let filter = state.engine.filter_snapshot();
     let domain = body.domain.trim_end_matches('.').to_ascii_lowercase();
     let qtype = body
@@ -517,97 +759,141 @@ async fn check_domain(
         .to_ascii_uppercase();
     let ci = ClientInfo::default();
     let verdict = filter.check(&domain, &qtype, &ci);
-    let v = match verdict {
-        Verdict::Allow { rule } => json!({
-            "action": "allow",
-            "rule": rule.map(|r| r.rule),
-        }),
-        Verdict::Block(info) => json!({
-            "action": "block",
-            "rule": info.rule,
-            "list_id": info.list_id,
-        }),
-        Verdict::Rewrite { info, .. } => json!({
-            "action": "rewrite",
-            "rule": info.rule,
-            "list_id": info.list_id,
-        }),
+    let resp = match verdict {
+        Verdict::Allow { rule } => CheckResponse {
+            action: "allow".into(),
+            rule: rule.map(|r| r.rule),
+            list_id: None,
+        },
+        Verdict::Block(info) => CheckResponse {
+            action: "block".into(),
+            rule: Some(info.rule),
+            list_id: Some(info.list_id),
+        },
+        Verdict::Rewrite { info, .. } => CheckResponse {
+            action: "rewrite".into(),
+            rule: Some(info.rule),
+            list_id: Some(info.list_id),
+        },
     };
-    Json(v)
+    Json(resp)
 }
 
 // ---------------------------------------------------------------------------
 // Clients
 // ---------------------------------------------------------------------------
 
-async fn get_clients(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    get,
+    path = "/api/clients",
+    tag = "clients",
+    responses((status = 200, body = Vec<ClientConfig>), (status = 401, body = ErrorResponse))
+)]
+pub async fn get_clients(State(state): State<AppState>) -> Json<Vec<ClientConfig>> {
     let cfg = state.config.read().await;
-    Json(serde_json::to_value(&cfg.clients).unwrap_or(Value::Null))
+    Json(cfg.clients.clone())
 }
 
-async fn put_clients(
+#[utoipa::path(
+    put,
+    path = "/api/clients",
+    tag = "clients",
+    request_body = Vec<ClientConfig>,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_clients(
     State(state): State<AppState>,
     Json(clients): Json<Vec<ClientConfig>>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.clients = clients;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(OkResponse::ok())
 }
 
 // ---------------------------------------------------------------------------
 // Stats, query log, upstreams
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct TopQuery {
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct TopQuery {
+    /// How many entries to include in each top-N list.
     #[serde(default = "default_top")]
-    top: usize,
+    pub top: usize,
 }
 
 fn default_top() -> usize {
     15
 }
 
-async fn get_stats(State(state): State<AppState>, Query(q): Query<TopQuery>) -> Json<Value> {
+#[utoipa::path(
+    get,
+    path = "/api/stats",
+    tag = "stats",
+    params(TopQuery),
+    responses((status = 200, body = StatsResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn get_stats(
+    State(state): State<AppState>,
+    Query(q): Query<TopQuery>,
+) -> Json<StatsResponse> {
     let summary = state.engine.stats().snapshot(q.top);
-    let cache_hits = state.engine.cache().hit_count();
-    let cache_misses = state.engine.cache().miss_count();
-    let mut v = serde_json::to_value(summary).unwrap_or(Value::Null);
-    if let Value::Object(map) = &mut v {
-        map.insert("cache_hits".into(), json!(cache_hits));
-        map.insert("cache_misses".into(), json!(cache_misses));
-        map.insert("cache_size".into(), json!(state.engine.cache().len()));
-    }
-    Json(v)
+    let cache = state.engine.cache();
+    Json(StatsResponse::new(
+        summary,
+        cache.hit_count(),
+        cache.miss_count(),
+        cache.len(),
+    ))
 }
 
-async fn reset_stats(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    post,
+    path = "/api/stats/reset",
+    tag = "stats",
+    responses((status = 200, body = OkResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn reset_stats(State(state): State<AppState>) -> Json<OkResponse> {
     state.engine.stats().reset();
-    Json(json!({ "ok": true }))
+    OkResponse::ok()
 }
 
-#[derive(Deserialize)]
-struct LogQuery {
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct LogQuery {
+    /// Case-insensitive substring match on the question name.
     #[serde(default)]
-    search: Option<String>,
+    pub search: Option<String>,
+    /// Match a specific client (IP or name).
     #[serde(default)]
-    client: Option<String>,
+    pub client: Option<String>,
+    /// Only return blocked entries.
     #[serde(default)]
-    blocked_only: bool,
+    pub blocked_only: bool,
     #[serde(default)]
-    offset: usize,
+    pub offset: usize,
     #[serde(default = "default_limit")]
-    limit: usize,
+    pub limit: usize,
 }
 
 fn default_limit() -> usize {
     100
 }
 
-async fn get_querylog(State(state): State<AppState>, Query(q): Query<LogQuery>) -> Json<Value> {
+#[utoipa::path(
+    get,
+    path = "/api/querylog",
+    tag = "querylog",
+    params(LogQuery),
+    responses((status = 200, body = QueryLogResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn get_querylog(
+    State(state): State<AppState>,
+    Query(q): Query<LogQuery>,
+) -> Json<QueryLogResponse> {
     let filter = bulwark_engine::querylog::LogFilter {
         search: q.search,
         client: q.client,
@@ -632,45 +918,70 @@ async fn get_querylog(State(state): State<AppState>, Query(q): Query<LogQuery>) 
         m.insert(0, "Custom rules".to_string());
         m
     };
-    let entries: Vec<Value> = page
+    let entries: Vec<LogEntryView> = page
         .entries
-        .iter()
-        .map(|e| {
-            let mut v = serde_json::to_value(e).unwrap_or(Value::Null);
-            if let (Value::Object(map), Some(id)) = (&mut v, e.list_id()) {
-                if let Some(name) = names.get(&id) {
-                    map.insert("list_name".into(), json!(name));
-                }
-            }
-            v
+        .into_iter()
+        .map(|entry| {
+            let list_name = entry.list_id().and_then(|id| names.get(&id).cloned());
+            LogEntryView::new(entry, list_name)
         })
         .collect();
-    Json(json!({ "entries": entries, "total": page.total }))
+    Json(QueryLogResponse {
+        entries,
+        total: page.total,
+    })
 }
 
-async fn clear_querylog(State(state): State<AppState>) -> Json<Value> {
+#[utoipa::path(
+    delete,
+    path = "/api/querylog",
+    tag = "querylog",
+    responses((status = 200, body = OkResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn clear_querylog(State(state): State<AppState>) -> Json<OkResponse> {
     state.engine.log().clear();
-    Json(json!({ "ok": true }))
+    OkResponse::ok()
 }
 
-async fn get_upstreams(State(state): State<AppState>) -> Json<Value> {
-    let stats = state.engine.pool().stats();
-    Json(serde_json::to_value(stats).unwrap_or(Value::Null))
+#[utoipa::path(
+    get,
+    path = "/api/upstreams",
+    tag = "upstreams",
+    responses((status = 200, body = Vec<UpstreamStatDto>), (status = 401, body = ErrorResponse))
+)]
+pub async fn get_upstreams(State(state): State<AppState>) -> Json<Vec<UpstreamStatDto>> {
+    Json(
+        state
+            .engine
+            .pool()
+            .stats()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    )
 }
 
-#[derive(Deserialize)]
-struct TestUpstream {
-    spec: String,
+#[derive(Deserialize, ToSchema)]
+pub struct TestUpstream {
+    pub spec: String,
 }
 
-#[derive(Serialize)]
-struct TestResult {
-    ok: bool,
-    rtt_ms: Option<f64>,
-    error: Option<String>,
+/// The result of a one-off upstream connectivity test.
+#[derive(Serialize, ToSchema)]
+pub struct TestResult {
+    pub ok: bool,
+    pub rtt_ms: Option<f64>,
+    pub error: Option<String>,
 }
 
-async fn test_upstream(
+#[utoipa::path(
+    post,
+    path = "/api/upstreams/test",
+    tag = "upstreams",
+    request_body = TestUpstream,
+    responses((status = 200, body = TestResult), (status = 400, body = ErrorResponse))
+)]
+pub async fn test_upstream(
     State(state): State<AppState>,
     Json(body): Json<TestUpstream>,
 ) -> ApiResult<Json<TestResult>> {

@@ -55,21 +55,30 @@ A Cargo workspace of focused, independently-tested crates:
 
 ### Build
 
-The web UI is embedded into the binary at compile time. Build its dependencies
-once, then build normally:
+The web UI is embedded into the binary at compile time, but the **web build and
+the Rust build are decoupled**: `cargo build` only embeds whatever is already in
+`web/dist` — it never runs `pnpm`. Build the front-end first, then the binary:
 
 ```sh
-cd web && pnpm install && cd ..
+cd web && pnpm install && pnpm build && cd ..
 cargo build --release
 ```
 
-`server/build.rs` automatically runs `pnpm build` during the Cargo build (when
-`pnpm` + `web/node_modules` are present) so the embedded UI always matches the
-front-end sources. The built bundle (`web/dist`) is generated, **not** committed.
-If you build without a Node toolchain, the server still compiles and runs — it
-just serves a small "UI not built" placeholder until you run `pnpm build` in
-`web/`. You can also iterate on the UI live with `cd web && pnpm dev` (it proxies
-`/api` to a running server on `:3000`).
+Or, with [`just`](https://github.com/casey/just): `just install && just dist`.
+
+The built bundle (`web/dist`) is generated, **not** committed. If you build
+without a Node toolchain (or before building the UI), the server still compiles
+and runs — it just serves a small "UI not built" placeholder, and `cargo` prints
+a warning. Iterate on the UI live with `cd web && pnpm dev` (it proxies `/api` to
+a running server on `:3000`); in that mode you don't need the embedded bundle at
+all.
+
+> **Why decoupled?** The front-end's API client is generated from an OpenAPI
+> spec that the server emits. If `cargo build` also drove `pnpm build`, building
+> the server would require the web bundle, which would require the spec, which
+> would require building the server — a cycle. Keeping the steps separate makes
+> the pipeline a straight line: spec → client codegen → `pnpm build` →
+> `cargo build`.
 
 ### Run
 
@@ -177,6 +186,31 @@ cargo fmt --all
 # Live UI dev against a running server (proxies /api to :3000):
 cd web && pnpm dev
 ```
+
+### API client (OpenAPI)
+
+The server describes its REST API with [`utoipa`](https://github.com/juhaku/utoipa)
+and emits an OpenAPI spec; the front-end's typed client
+(`web/src/api/generated.ts`) is generated from it with
+[`oazapfts`](https://github.com/oazapfts/oazapfts). Components call the generated
+functions directly and unwrap with the `ok()` helper:
+
+```ts
+import * as api from "../api/generated";
+import { ok } from "@oazapfts/runtime";
+
+const stats = await ok(api.getStats({ top: 10 }));
+```
+
+After changing any API handler or its request/response types, regenerate both
+the spec and the client:
+
+```sh
+just client     # = cargo run --bin gen-openapi > web/openapi.json && pnpm gen
+```
+
+Both `web/openapi.json` and the generated client are committed so the front-end
+builds without invoking Cargo.
 
 Network-dependent upstream tests are `#[ignore]`d by default:
 

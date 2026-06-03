@@ -1,18 +1,23 @@
 <script lang="ts">
-  import {
-    api,
-    type UpstreamStat,
-    type UpstreamsCfg,
-    type UpstreamCfg,
-    type LatencyPercentiles,
-  } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type {
+    UpstreamStatDto,
+    UpstreamsConfig,
+    UpstreamConfig,
+    LatencyPercentilesDto,
+  } from "../api/generated";
+  import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { ms, num } from "../lib/format";
   import Chart from "../lib/Chart.svelte";
   import type { ChartConfiguration } from "chart.js/auto";
 
-  let stats = $state<UpstreamStat[]>([]);
-  let pct = $state<Record<string, LatencyPercentiles>>({});
+  // The server always returns fully-populated config; treat it as required here.
+  type UpstreamsCfg = Required<UpstreamsConfig> & { servers: Required<UpstreamConfig>[] };
+
+  let stats = $state<UpstreamStatDto[]>([]);
+  let pct = $state<Record<string, LatencyPercentilesDto>>({});
   let cfg = $state<UpstreamsCfg | null>(null);
 
   // Add form
@@ -23,17 +28,17 @@
 
   async function loadStats() {
     try {
-      const [up, summary] = await Promise.all([api.getUpstreams(), api.getStats()]);
+      const [up, summary] = await Promise.all([ok(api.getUpstreams()), ok(api.getStats())]);
       stats = up;
       pct = summary.upstream_latency_pct ?? {};
-    } catch (e: any) {
-      if (e.status !== 401) toaster.show("Failed to load upstreams", true);
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load upstreams", true);
     }
   }
 
   async function loadCfg() {
-    const c = await api.getConfig();
-    cfg = c.upstreams;
+    const c = await ok(api.getConfig());
+    cfg = (c.upstreams ?? null) as UpstreamsCfg | null;
   }
 
   $effect(() => {
@@ -47,11 +52,11 @@
     if (!cfg) return;
     saving = true;
     try {
-      await api.putUpstreams(cfg);
+      await ok(api.putUpstreams(cfg));
       toaster.show("Upstreams saved");
       await loadStats();
-    } catch (e: any) {
-      toaster.show(e.message ?? "Save failed", true);
+    } catch (e) {
+      toaster.show(errMsg(e, "Save failed"), true);
     } finally {
       saving = false;
     }
@@ -59,7 +64,11 @@
 
   async function addUpstream() {
     if (!cfg || !newSpec.trim()) return;
-    cfg.servers.push({ spec: newSpec.trim(), name: newName.trim() || null, enabled: true } as UpstreamCfg);
+    cfg.servers.push({
+      spec: newSpec.trim(),
+      name: newName.trim() || null,
+      enabled: true,
+    } as Required<UpstreamConfig>);
     newSpec = "";
     newName = "";
     await save();
@@ -74,7 +83,7 @@
   async function testSpec(spec: string) {
     testing = true;
     try {
-      const r = await api.testUpstream(spec);
+      const r = await ok(api.testUpstream({ spec }));
       if (r.ok) toaster.show(`OK — ${r.rtt_ms?.toFixed(1)} ms`);
       else toaster.show(`Failed: ${r.error}`, true);
     } finally {

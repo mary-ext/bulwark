@@ -1,5 +1,14 @@
 <script lang="ts">
-  import { api, type CacheCfg, type QueryLogCfg, type StatsCfg, type ServerCfg, type BlockingMode } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type {
+    CacheConfig,
+    QueryLogConfig,
+    StatsConfig,
+    ServerConfig,
+    BlockingMode,
+  } from "../api/generated";
+  import { errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
 
   let loaded = $state(false);
@@ -11,24 +20,24 @@
     custom_block_ipv6: "::",
     blocked_ttl_secs: 10,
   });
-  let cache = $state<CacheCfg | null>(null);
-  let querylog = $state<QueryLogCfg | null>(null);
-  let stats = $state<StatsCfg | null>(null);
-  let server = $state<ServerCfg | null>(null);
+  let cache = $state<Required<CacheConfig> | null>(null);
+  let querylog = $state<Required<QueryLogConfig> | null>(null);
+  let stats = $state<Required<StatsConfig> | null>(null);
+  let server = $state<Required<ServerConfig> | null>(null);
 
   async function load() {
-    const c = await api.getConfig();
+    const c = await ok(api.getConfig());
     filtering = {
-      enabled: c.filtering.enabled,
-      blocking_mode: c.filtering.blocking_mode,
-      custom_block_ipv4: c.filtering.custom_block_ipv4,
-      custom_block_ipv6: c.filtering.custom_block_ipv6,
-      blocked_ttl_secs: c.filtering.blocked_ttl_secs,
+      enabled: c.filtering?.enabled ?? true,
+      blocking_mode: c.filtering?.blocking_mode ?? "nx_domain",
+      custom_block_ipv4: c.filtering?.custom_block_ipv4 ?? "0.0.0.0",
+      custom_block_ipv6: c.filtering?.custom_block_ipv6 ?? "::",
+      blocked_ttl_secs: c.filtering?.blocked_ttl_secs ?? 10,
     };
-    cache = c.cache;
-    querylog = c.query_log;
-    stats = c.stats;
-    server = c.server;
+    cache = (c.cache ?? null) as Required<CacheConfig> | null;
+    querylog = (c.query_log ?? null) as Required<QueryLogConfig> | null;
+    stats = (c.stats ?? null) as Required<StatsConfig> | null;
+    server = (c.server ?? null) as Required<ServerConfig> | null;
     loaded = true;
   }
 
@@ -36,12 +45,12 @@
     load();
   });
 
-  async function run(fn: () => Promise<unknown>, ok: string) {
+  async function run(fn: () => Promise<unknown>, okMsg: string) {
     try {
       await fn();
-      toaster.show(ok);
-    } catch (e: any) {
-      toaster.show(e.message ?? "Save failed", true);
+      toaster.show(okMsg);
+    } catch (e) {
+      toaster.show(errMsg(e, "Save failed"), true);
     }
   }
 
@@ -81,7 +90,7 @@
         <label for="bt">Blocked response TTL (s)</label>
         <input id="bt" type="number" min="0" bind:value={filtering.blocked_ttl_secs} />
       </div>
-      <button class="primary" onclick={() => run(() => api.putFiltering(filtering), "Filtering saved")}>Save</button>
+      <button class="primary" onclick={() => run(() => ok(api.putFiltering(filtering)), "Filtering saved")}>Save</button>
     </div>
 
     <!-- Cache -->
@@ -117,7 +126,7 @@
           <div class="field"><label>Min TTL (s)</label><input type="number" min="0" bind:value={cache.min_ttl_secs} /></div>
           <div class="field"><label>Max TTL (s, 0 = none)</label><input type="number" min="0" bind:value={cache.max_ttl_secs} /></div>
         </div>
-        <button class="primary" onclick={() => cache && run(() => api.putCache(cache!), "Cache saved")}>Save</button>
+        <button class="primary" onclick={() => cache && run(() => ok(api.putCache(cache!)), "Cache saved")}>Save</button>
       {/if}
     </div>
 
@@ -141,7 +150,7 @@
           <div class="field"><label>In-memory entries</label><input type="number" min="1" bind:value={querylog.size} /></div>
           <div class="field"><label>Retention (days)</label><input type="number" min="0" bind:value={querylog.retention_days} /></div>
         </div>
-        <button class="primary" onclick={() => querylog && run(() => api.putQuerylog(querylog!), "Query log saved")}>Save</button>
+        <button class="primary" onclick={() => querylog && run(() => ok(api.putQuerylog(querylog!)), "Query log saved")}>Save</button>
       {/if}
     </div>
 
@@ -159,7 +168,7 @@
         </div>
         <div class="field"><label>Retention (days)</label><input type="number" min="1" bind:value={stats.retention_days} /></div>
         <p class="muted" style="font-size:0.8rem">Query log and statistics retention are independent.</p>
-        <button class="primary" onclick={() => stats && run(() => api.putStatsCfg(stats!), "Statistics saved")}>Save</button>
+        <button class="primary" onclick={() => stats && run(() => ok(api.putStatsCfg(stats!)), "Statistics saved")}>Save</button>
       {/if}
     </div>
 
@@ -176,7 +185,7 @@
           <div class="field"><label>HTTP bind</label><input class="mono" bind:value={server.http_bind} /></div>
           <div class="field"><label>Rate limit (qps/client, 0 = off)</label><input type="number" min="0" bind:value={server.ratelimit} /></div>
         </div>
-        <button class="primary" onclick={() => server && run(() => api.putServer(server!), "Server settings saved (restart to apply binds)")}>Save</button>
+        <button class="primary" onclick={() => server && run(() => ok(api.putServer(server!)), "Server settings saved (restart to apply binds)")}>Save</button>
       {/if}
     </div>
   </div>

@@ -1,17 +1,20 @@
 <script lang="ts">
-  import { api, type StatsSummary, type TopEntry } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { StatsResponse, TopEntryDto } from "../api/generated";
+  import { isStatus } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { num, pct, ms } from "../lib/format";
   import Chart from "../lib/Chart.svelte";
   import type { ChartConfiguration } from "chart.js/auto";
 
-  let stats = $state<StatsSummary | null>(null);
+  let stats = $state<StatsResponse | null>(null);
 
   async function load() {
     try {
-      stats = await api.getStats(10);
-    } catch (e: any) {
-      if (e.status !== 401) toaster.show("Failed to load stats", true);
+      stats = await ok(api.getStats({ top: 10 }));
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load stats", true);
     }
   }
 
@@ -27,7 +30,7 @@
       : 0,
   );
 
-  function barConfig(entries: TopEntry[], color: string): ChartConfiguration {
+  function barConfig(entries: TopEntryDto[], color: string): ChartConfiguration {
     return {
       type: "bar",
       data: {

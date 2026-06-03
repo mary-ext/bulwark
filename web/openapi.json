@@ -1,0 +1,2150 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bulwark API",
+    "description": "REST API for the Bulwark DNS filtering resolver.",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/clients": {
+      "get": {
+        "tags": [
+          "clients"
+        ],
+        "operationId": "get_clients",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ClientConfig"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "clients"
+        ],
+        "operationId": "put_clients",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ClientConfig"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "Full config (password hash redacted)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Config"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/cache": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_cache",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CacheConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/filtering": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_filtering",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FilteringSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/querylog": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_querylog",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryLogConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/server": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_server",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServerConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerUpdateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/stats": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_stats_cfg",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StatsConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/config/upstreams": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_upstreams",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamsConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters": {
+      "get": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "get_filters",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FiltersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/check": {
+      "post": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "check_domain",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CheckResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/custom": {
+      "put": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "put_custom_rules",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CustomRules"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/lists": {
+      "post": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "add_list",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewList"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/lists/{id}": {
+      "put": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "update_list",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Filter list id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "delete_list",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Filter list id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/lists/{id}/refresh": {
+      "post": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "refresh_list",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Filter list id",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filters/rule": {
+      "post": {
+        "tags": [
+          "filters"
+        ],
+        "operationId": "add_custom_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddRule"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AddRuleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/login": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Authenticated; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/logout": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "logout",
+        "responses": {
+          "200": {
+            "description": "Session cleared",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/querylog": {
+      "get": {
+        "tags": [
+          "querylog"
+        ],
+        "operationId": "get_querylog",
+        "parameters": [
+          {
+            "name": "search",
+            "in": "query",
+            "description": "Case-insensitive substring match on the question name.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client",
+            "in": "query",
+            "description": "Match a specific client (IP or name).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "blocked_only",
+            "in": "query",
+            "description": "Only return blocked entries.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryLogResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "querylog"
+        ],
+        "operationId": "clear_querylog",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/setup": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "setup",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Admin account created; session cookie set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": [
+          "stats"
+        ],
+        "operationId": "get_stats",
+        "parameters": [
+          {
+            "name": "top",
+            "in": "query",
+            "description": "How many entries to include in each top-N list.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats/reset": {
+      "post": {
+        "tags": [
+          "stats"
+        ],
+        "operationId": "reset_stats",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/status": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "operationId": "status",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/upstreams": {
+      "get": {
+        "tags": [
+          "upstreams"
+        ],
+        "operationId": "get_upstreams",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UpstreamStatDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/upstreams/test": {
+      "post": {
+        "tags": [
+          "upstreams"
+        ],
+        "operationId": "test_upstream",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestUpstream"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AddListResponse": {
+        "type": "object",
+        "description": "Result of creating a filter list.",
+        "required": [
+          "ok",
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The id assigned to the new list.",
+            "minimum": 0
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "AddRule": {
+        "type": "object",
+        "required": [
+          "rule"
+        ],
+        "properties": {
+          "rule": {
+            "type": "string",
+            "description": "A single rule line to append to the custom rules, e.g. `@@||example.com^`\nor `||ads.example.com^`. Used by the query-log \"allow/block\" actions."
+          }
+        }
+      },
+      "AddRuleResponse": {
+        "type": "object",
+        "description": "Result of appending a single custom rule.",
+        "required": [
+          "ok",
+          "rule",
+          "added"
+        ],
+        "properties": {
+          "added": {
+            "type": "boolean",
+            "description": "`false` when the rule already existed (the append was a no-op)."
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "rule": {
+            "type": "string",
+            "description": "The (trimmed) rule that was processed."
+          }
+        }
+      },
+      "AuthConfig": {
+        "type": "object",
+        "properties": {
+          "password_hash": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Argon2 password hash; `None` until the admin sets a password (setup flow)."
+          },
+          "username": {
+            "type": "string",
+            "description": "Admin username."
+          }
+        }
+      },
+      "BlockingMode": {
+        "type": "string",
+        "description": "How blocked queries are answered.",
+        "enum": [
+          "nx_domain",
+          "null_ip",
+          "custom_ip",
+          "refused",
+          "no_data"
+        ]
+      },
+      "CacheConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "max_ttl_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clamp upper bound for TTLs (seconds); 0 means \"no upper clamp\".",
+            "minimum": 0
+          },
+          "min_ttl_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Clamp lower bound for TTLs (seconds).",
+            "minimum": 0
+          },
+          "optimistic_max_age_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Optimistic caching (serve-stale): the maximum number of seconds **past\nexpiry** that a stale entry may be served immediately while a fresh\nresolve runs in the background. `0` disables serve-stale entirely; any\nvalue `> 0` enables it and bounds how stale an answer can be (entries are\nnever served unbounded).",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "description": "Maximum number of cached entries.",
+            "minimum": 0
+          }
+        }
+      },
+      "CheckRequest": {
+        "type": "object",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "qtype": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "CheckResponse": {
+        "type": "object",
+        "description": "The filtering verdict for a domain probe.",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "One of `allow`, `block`, or `rewrite`."
+          },
+          "list_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The filter list responsible (absent for allow verdicts).",
+            "minimum": 0
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The matching rule text, if any."
+          }
+        }
+      },
+      "ClientConfig": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "filtering_enabled": {
+            "type": "boolean",
+            "description": "Whether filtering applies to this client."
+          },
+          "ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Identifiers: IP addresses or CIDR ranges."
+          },
+          "name": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "Config": {
+        "type": "object",
+        "description": "The root configuration.",
+        "properties": {
+          "auth": {
+            "$ref": "#/components/schemas/AuthConfig"
+          },
+          "cache": {
+            "$ref": "#/components/schemas/CacheConfig"
+          },
+          "clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClientConfig"
+            }
+          },
+          "filtering": {
+            "$ref": "#/components/schemas/FilteringConfig"
+          },
+          "query_log": {
+            "$ref": "#/components/schemas/QueryLogConfig"
+          },
+          "server": {
+            "$ref": "#/components/schemas/ServerConfig"
+          },
+          "stats": {
+            "$ref": "#/components/schemas/StatsConfig"
+          },
+          "upstreams": {
+            "$ref": "#/components/schemas/UpstreamsConfig"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Credentials": {
+        "type": "object",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "password": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          }
+        }
+      },
+      "CustomRules": {
+        "type": "object",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "string"
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "description": "Error body returned for any non-2xx response.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        }
+      },
+      "FilterListConfig": {
+        "type": "object",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "last_updated": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rule_count": {
+            "type": "integer",
+            "description": "Cached metadata (updated by the server; persisted for the UI).",
+            "minimum": 0
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Remote URL to fetch; if absent the list is managed purely in the UI."
+          }
+        }
+      },
+      "FilteringConfig": {
+        "type": "object",
+        "properties": {
+          "blocked_ttl_secs": {
+            "type": "integer",
+            "format": "int32",
+            "description": "TTL (seconds) for synthesized blocked responses.",
+            "minimum": 0
+          },
+          "blocking_mode": {
+            "$ref": "#/components/schemas/BlockingMode"
+          },
+          "custom_block_ipv4": {
+            "type": "string"
+          },
+          "custom_block_ipv6": {
+            "type": "string"
+          },
+          "custom_rules": {
+            "type": "string",
+            "description": "User-authored custom rules (one rule per line)."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "lists": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilterListConfig"
+            }
+          }
+        }
+      },
+      "FilteringSettings": {
+        "type": "object",
+        "description": "The subset of filtering settings editable from the Settings page (the lists\nand custom rules have their own endpoints).",
+        "required": [
+          "enabled",
+          "blocking_mode",
+          "custom_block_ipv4",
+          "custom_block_ipv6",
+          "blocked_ttl_secs"
+        ],
+        "properties": {
+          "blocked_ttl_secs": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "blocking_mode": {
+            "$ref": "#/components/schemas/BlockingMode"
+          },
+          "custom_block_ipv4": {
+            "type": "string"
+          },
+          "custom_block_ipv6": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
+      "FiltersResponse": {
+        "type": "object",
+        "description": "The filtering overview: lists, custom rules, and current mode.",
+        "required": [
+          "lists",
+          "custom_rules",
+          "enabled",
+          "blocking_mode"
+        ],
+        "properties": {
+          "blocking_mode": {
+            "$ref": "#/components/schemas/BlockingMode"
+          },
+          "custom_rules": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "lists": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FilterListConfig"
+            }
+          }
+        }
+      },
+      "LatencyPercentilesDto": {
+        "type": "object",
+        "description": "Approximate latency percentiles (milliseconds).",
+        "required": [
+          "p50",
+          "p90",
+          "p99"
+        ],
+        "properties": {
+          "p50": {
+            "type": "number",
+            "format": "double"
+          },
+          "p90": {
+            "type": "number",
+            "format": "double"
+          },
+          "p99": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "ListUpdate": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "LogEntryView": {
+        "type": "object",
+        "description": "A query-log entry, flattened for the UI, plus the resolved filter-list name.\n\nThe internal `QueryAction` is an internally-tagged enum; here it is splayed\ninto a plain `action` discriminator string and a few optional fields so the\ngenerated TypeScript type is a single flat row (rather than a discriminated\nunion) that the query-log table can consume directly.",
+        "required": [
+          "id",
+          "time_ms",
+          "client_ip",
+          "question",
+          "qtype",
+          "action",
+          "allowlisted",
+          "rcode",
+          "answers",
+          "elapsed_ms"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "One of `forwarded`, `cached`, `blocked`, `rewritten`, or `error`."
+          },
+          "allowlisted": {
+            "type": "boolean",
+            "description": "True if an `@@` exception allowed an otherwise-blocked query."
+          },
+          "answers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Short summary of answer records (e.g. `[\"A 1.2.3.4\"]`)."
+          },
+          "client_ip": {
+            "type": "string"
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "list_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Filter list id responsible (blocked/rewritten queries only).",
+            "minimum": 0
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the filter list responsible (absent unless the query was\nblocked or rewritten by a known list; id 0 is the user's custom rules)."
+          },
+          "qtype": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          },
+          "rcode": {
+            "type": "string"
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Matching rule text (blocked/rewritten queries only)."
+          },
+          "time_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix epoch milliseconds."
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Upstream that answered (forwarded queries only)."
+          }
+        }
+      },
+      "NewList": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional inline content (when no URL is given)."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "OkResponse": {
+        "type": "object",
+        "description": "Generic success acknowledgement: `{ \"ok\": true }`.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "QueryLogConfig": {
+        "type": "object",
+        "properties": {
+          "anonymize": {
+            "type": "boolean",
+            "description": "Whether to anonymize client IPs (drop last octet / suffix)."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "persist": {
+            "type": "boolean",
+            "description": "Persist the query log to disk so it survives restarts."
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many days of query log to retain on disk (independent of `stats`).\n0 keeps only the in-memory `size` window.",
+            "minimum": 0
+          },
+          "size": {
+            "type": "integer",
+            "description": "Number of recent entries kept in memory for fast browsing.",
+            "minimum": 0
+          }
+        }
+      },
+      "QueryLogResponse": {
+        "type": "object",
+        "description": "A page of query-log entries.",
+        "required": [
+          "entries",
+          "total"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LogEntryView"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "description": "Total entries currently held (before paging, after filtering).",
+            "minimum": 0
+          }
+        }
+      },
+      "SeriesPointDto": {
+        "type": "object",
+        "description": "A point in the hourly time series.",
+        "required": [
+          "hour",
+          "total",
+          "blocked",
+          "cached"
+        ],
+        "properties": {
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cached": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "hour": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "ServerConfig": {
+        "type": "object",
+        "properties": {
+          "dns_bind": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Addresses to serve plain DNS on (UDP + TCP)."
+          },
+          "http_bind": {
+            "type": "string",
+            "description": "Address to serve the web UI + API on."
+          },
+          "ratelimit": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Per-client query rate limit (queries/sec); 0 disables.",
+            "minimum": 0
+          }
+        }
+      },
+      "ServerUpdateResponse": {
+        "type": "object",
+        "description": "Response for server-config updates: bind changes only take effect on restart.",
+        "required": [
+          "ok",
+          "restart_required"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "restart_required": {
+            "type": "boolean"
+          }
+        }
+      },
+      "StatsConfig": {
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "persist": {
+            "type": "boolean",
+            "description": "Persist statistics to disk so they survive restarts."
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many days of time-bucketed statistics history to keep (independent of\nthe query-log retention).",
+            "minimum": 0
+          }
+        }
+      },
+      "StatsResponse": {
+        "type": "object",
+        "description": "A statistics snapshot plus live cache counters.",
+        "required": [
+          "total",
+          "blocked",
+          "cached",
+          "rewritten",
+          "errors",
+          "block_rate",
+          "avg_processing_ms",
+          "latency_buckets",
+          "latency_hist",
+          "top_domains",
+          "top_blocked_domains",
+          "top_clients",
+          "top_upstreams",
+          "qtypes",
+          "upstream_avg_rtt_ms",
+          "upstream_latency_pct",
+          "series",
+          "cache_hits",
+          "cache_misses",
+          "cache_size"
+        ],
+        "properties": {
+          "avg_processing_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "block_rate": {
+            "type": "number",
+            "format": "double"
+          },
+          "blocked": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cache_hits": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cache_misses": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cache_size": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cached": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "errors": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "latency_buckets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "latency_hist": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          "qtypes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopEntryDto"
+            }
+          },
+          "rewritten": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SeriesPointDto"
+            }
+          },
+          "top_blocked_domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopEntryDto"
+            }
+          },
+          "top_clients": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopEntryDto"
+            }
+          },
+          "top_domains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopEntryDto"
+            }
+          },
+          "top_upstreams": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TopEntryDto"
+            }
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "upstream_avg_rtt_ms": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "format": "double"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "upstream_latency_pct": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LatencyPercentilesDto"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "StatusResponse": {
+        "type": "object",
+        "description": "Setup/auth status and basic server info.",
+        "required": [
+          "setup_needed",
+          "authed",
+          "version",
+          "dns_bind"
+        ],
+        "properties": {
+          "authed": {
+            "type": "boolean",
+            "description": "Whether the current request carries a valid session."
+          },
+          "dns_bind": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DNS listen addresses (host:port)."
+          },
+          "setup_needed": {
+            "type": "boolean",
+            "description": "Whether the initial admin account still needs to be created."
+          },
+          "version": {
+            "type": "string"
+          }
+        }
+      },
+      "TestResult": {
+        "type": "object",
+        "description": "The result of a one-off upstream connectivity test.",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "rtt_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
+      "TestUpstream": {
+        "type": "object",
+        "required": [
+          "spec"
+        ],
+        "properties": {
+          "spec": {
+            "type": "string"
+          }
+        }
+      },
+      "TopEntryDto": {
+        "type": "object",
+        "description": "A name + count pair for top-N lists.",
+        "required": [
+          "name",
+          "count"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "TransportKindDto": {
+        "type": "string",
+        "description": "The wire protocol used to reach an upstream.",
+        "enum": [
+          "udp",
+          "tcp",
+          "tls",
+          "https",
+          "quic"
+        ]
+      },
+      "UpstreamConfig": {
+        "type": "object",
+        "required": [
+          "spec"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional friendly name for the UI."
+          },
+          "spec": {
+            "type": "string",
+            "description": "Spec string, e.g. `1.1.1.1`, `tls://dns.google`, `https://.../dns-query`."
+          }
+        }
+      },
+      "UpstreamStatDto": {
+        "type": "object",
+        "description": "Per-upstream statistics for the UI.",
+        "required": [
+          "spec",
+          "name",
+          "kind",
+          "up",
+          "total_queries",
+          "total_failures"
+        ],
+        "properties": {
+          "avg_rtt_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/TransportKindDto"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_rtt_ms": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
+          },
+          "spec": {
+            "type": "string"
+          },
+          "total_failures": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total_queries": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "up": {
+            "type": "boolean"
+          }
+        }
+      },
+      "UpstreamsConfig": {
+        "type": "object",
+        "properties": {
+          "bootstrap": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames."
+          },
+          "probe_interval_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Interval between background latency probes (seconds); 0 disables probing.",
+            "minimum": 0
+          },
+          "servers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamConfig"
+            }
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-attempt query timeout (seconds).",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "auth",
+      "description": "Setup, login, and session management"
+    },
+    {
+      "name": "config",
+      "description": "Read and update configuration sections"
+    },
+    {
+      "name": "filters",
+      "description": "Filter lists, custom rules, and domain checks"
+    },
+    {
+      "name": "clients",
+      "description": "Client naming, tags, and per-client filtering"
+    },
+    {
+      "name": "stats",
+      "description": "Aggregate statistics"
+    },
+    {
+      "name": "querylog",
+      "description": "Query log browsing"
+    },
+    {
+      "name": "upstreams",
+      "description": "Upstream resolver status and testing"
+    }
+  ]
+}

@@ -1,5 +1,7 @@
 <script lang="ts">
-  import { api, type Status } from "./lib/api";
+  import * as api from "./api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { StatusResponse } from "./api/generated";
   import { toaster } from "./lib/toast.svelte";
   import Login from "./views/Login.svelte";
   import Dashboard from "./views/Dashboard.svelte";
@@ -9,7 +11,7 @@
   import Clients from "./views/Clients.svelte";
   import Settings from "./views/Settings.svelte";
 
-  let status = $state<Status | null>(null);
+  let status = $state<StatusResponse | null>(null);
   let route = $state(currentRoute());
   let loading = $state(true);
 
@@ -38,7 +40,7 @@
 
   async function refreshStatus() {
     try {
-      status = await api.status();
+      status = await ok(api.status());
     } catch (e) {
       toaster.show("Failed to reach server", true);
     } finally {
@@ -47,7 +49,7 @@
   }
 
   async function logout() {
-    await api.logout().catch(() => {});
+    await ok(api.logout()).catch(() => {});
     await refreshStatus();
   }
 

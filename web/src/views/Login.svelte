@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { api, type Status } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { StatusResponse } from "../api/generated";
+  import { errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
 
-  let { status, onAuthed }: { status: Status | null; onAuthed: () => void } = $props();
+  let { status, onAuthed }: { status: StatusResponse | null; onAuthed: () => void } = $props();
 
   let username = $state("");
   let password = $state("");
@@ -20,14 +23,14 @@
           toaster.show("Passwords do not match", true);
           return;
         }
-        await api.setup(username, password);
+        await ok(api.setup({ username, password }));
         toaster.show("Welcome to Bulwark!");
       } else {
-        await api.login(username, password);
+        await ok(api.login({ username, password }));
       }
       onAuthed();
-    } catch (err: any) {
-      toaster.show(err.message ?? "Authentication failed", true);
+    } catch (err) {
+      toaster.show(errMsg(err, "Authentication failed"), true);
     } finally {
       busy = false;
     }
