@@ -49,17 +49,21 @@ RUN --mount=type=cache,target=/cargo/registry \
 FROM debian:trixie-slim AS runtime
 # ca-certificates: harmless extra trust roots (TLS upstreams bundle webpki-roots).
 # curl: used by the HEALTHCHECK. libcap2-bin: grant the port-53 bind capability.
+# gosu: drop from root to `bulwark` in the entrypoint after fixing /data perms.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libcap2-bin \
+    && apt-get install -y --no-install-recommends ca-certificates curl libcap2-bin gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /usr/local/bin/bulwark /usr/local/bin/bulwark
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 # Let the unprivileged process bind 53 without running as root.
 RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/bulwark \
     && useradd --system --uid 10001 --home-dir /data --no-create-home bulwark \
-    && mkdir -p /data && chown bulwark:bulwark /data
+    && mkdir -p /data && chown bulwark:bulwark /data \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
 
-USER bulwark
+# Stays root only long enough for the entrypoint to chown /data (so bind mounts
+# work), then gosu drops to `bulwark` for the actual daemon.
 ENV BULWARK_DATA_DIR=/data
 # Config, filter lists, query log, and stats live here — mount a volume.
 VOLUME ["/data"]
@@ -71,4 +75,4 @@ EXPOSE 53/udp 53/tcp 3000/tcp
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD curl -fsS http://127.0.0.1:3000/api/status || exit 1
 
-ENTRYPOINT ["/usr/local/bin/bulwark"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]

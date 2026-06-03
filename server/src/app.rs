@@ -177,8 +177,10 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
 
 /// Ensure the data directory and lists subdirectory exist.
 pub fn ensure_dirs(paths: &Paths) -> anyhow::Result<()> {
-    std::fs::create_dir_all(&paths.data_dir)?;
-    std::fs::create_dir_all(&paths.lists_dir)?;
+    std::fs::create_dir_all(&paths.data_dir)
+        .with_context(|| format!("creating data dir {}", paths.data_dir.display()))?;
+    std::fs::create_dir_all(&paths.lists_dir)
+        .with_context(|| format!("creating lists dir {}", paths.lists_dir.display()))?;
     Ok(())
 }
 
