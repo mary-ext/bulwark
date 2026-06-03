@@ -735,10 +735,8 @@ pub struct CheckResponse {
     /// The matching rule text, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
-    /// The filter list responsible (absent for allow verdicts).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub list_id: Option<u32>,
-    /// Friendly name of the responsible list (`Custom rules` for `list_id` 0).
+    /// The filter list responsible (`Custom rules` for user-written rules;
+    /// absent for allow verdicts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_name: Option<String>,
 }
@@ -781,13 +779,11 @@ pub async fn check_domain(
         action: action.into(),
         rule: Some(info.rule),
         list_name: names.get(&info.list_id).cloned(),
-        list_id: Some(info.list_id),
     };
     let resp = match verdict {
         Verdict::Allow { rule } => CheckResponse {
             action: "allow".into(),
             rule: rule.map(|r| r.rule),
-            list_id: None,
             list_name: None,
         },
         Verdict::Block(info) => attribute(info, "block"),
