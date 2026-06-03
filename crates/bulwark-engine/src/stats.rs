@@ -265,7 +265,7 @@ impl Stats {
             bump(&mut s.blocked_domains, domain, 1, cap);
         }
         bump(&mut s.clients, client, 1, cap);
-        bump(&mut s.qtypes, &entry.qtype, 1, cap);
+        bump(&mut s.qtypes, entry.qtype.as_ref(), 1, cap);
         if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
             // Avoid cloning the upstream name on the hot (existing-key) path.

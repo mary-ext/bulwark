@@ -16,6 +16,7 @@ pub mod querylog;
 pub mod server;
 pub mod stats;
 
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -67,9 +68,10 @@ fn summarize(rec: &hickory_proto::rr::Record) -> String {
     format!("{} {}", rec.record_type(), rec.data)
 }
 
-/// The display label for a response code, avoiding a `format!`/`to_uppercase`
-/// allocation pair on the hot path for the codes we actually emit.
-fn rcode_label(code: ResponseCode) -> String {
+/// The display label for a response code. Returns a borrowed `&'static str` for
+/// the codes we actually emit, so the common hot path allocates nothing; only an
+/// exotic code falls back to an owned `format!`.
+fn rcode_label(code: ResponseCode) -> Cow<'static, str> {
     let s = match code {
         ResponseCode::NoError => "NOERROR",
         ResponseCode::FormErr => "FORMERR",
@@ -77,9 +79,36 @@ fn rcode_label(code: ResponseCode) -> String {
         ResponseCode::NXDomain => "NXDOMAIN",
         ResponseCode::NotImp => "NOTIMP",
         ResponseCode::Refused => "REFUSED",
-        other => return format!("{other:?}").to_uppercase(),
+        other => return Cow::Owned(format!("{other:?}").to_uppercase()),
     };
-    s.to_string()
+    Cow::Borrowed(s)
+}
+
+/// The display label for a record type. Returns a borrowed `&'static str` for the
+/// common types (which covers essentially all real traffic), avoiding the
+/// per-query `RecordType::to_string()` heap allocation; rare types fall back to an
+/// owned string.
+fn rtype_label(rt: RecordType) -> Cow<'static, str> {
+    let s = match rt {
+        RecordType::A => "A",
+        RecordType::AAAA => "AAAA",
+        RecordType::CNAME => "CNAME",
+        RecordType::MX => "MX",
+        RecordType::NS => "NS",
+        RecordType::PTR => "PTR",
+        RecordType::SOA => "SOA",
+        RecordType::SRV => "SRV",
+        RecordType::TXT => "TXT",
+        RecordType::CAA => "CAA",
+        RecordType::HTTPS => "HTTPS",
+        RecordType::SVCB => "SVCB",
+        RecordType::DS => "DS",
+        RecordType::DNSKEY => "DNSKEY",
+        RecordType::NAPTR => "NAPTR",
+        RecordType::TLSA => "TLSA",
+        other => return Cow::Owned(other.to_string()),
+    };
+    Cow::Borrowed(s)
 }
 
 impl Engine {
@@ -133,7 +162,7 @@ impl Engine {
             return resp;
         };
         let rtype = question.query_type();
-        let rtype_str = rtype.to_string();
+        let rtype_str = rtype_label(rtype);
         let qname_display = question.name().to_ascii();
         // Normalize the name once (lowercased, dot-terminated) and reuse it for
         // both filtering and the cache/single-flight key. `domain` is a borrow
@@ -141,7 +170,9 @@ impl Engine {
         let name_lower = qname_display.to_ascii_lowercase();
         let domain = name_lower.trim_end_matches('.');
 
-        let mut log = LogBuilder::new(&client, qname_display, &rtype_str);
+        // Cloning a borrowed Cow is a pointer copy (no allocation) for the common
+        // record types; `rtype_str` itself is reused by `filter.check` below.
+        let mut log = LogBuilder::new(&client, qname_display, rtype_str.clone());
 
         // ---- Filtering ----
         if state.filtering_enabled && client.filtering_enabled {
@@ -150,7 +181,7 @@ impl Engine {
                 name: client.name.as_deref(),
                 tags: &client.tags,
             };
-            match state.filter.check(domain, &rtype_str, &ci) {
+            match state.filter.check(domain, rtype_str.as_ref(), &ci) {
                 Verdict::Block(info) => {
                     let resp = block_response(
                         &query,
@@ -262,13 +293,26 @@ impl Engine {
         mut log: LogBuilder,
         start: Instant,
     ) -> Message {
+        // If nothing will consume the entry, don't pay to build it: the answer
+        // summaries, rcode label, client-IP string, and the entry itself are all
+        // pure logging/stats overhead.
+        let stats_on = self.stats.is_enabled();
+        let log_on = self.log.is_enabled();
+        if !stats_on && !log_on {
+            return resp;
+        }
+
         log.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         log.rcode = rcode_label(resp.metadata.response_code);
         log.answers = resp.answers.iter().map(summarize).collect();
 
         let entry = log.build(self.seq.fetch_add(1, Ordering::Relaxed), action);
-        self.stats.record(&entry);
-        self.log.push(entry);
+        if stats_on {
+            self.stats.record(&entry);
+        }
+        if log_on {
+            self.log.push(entry);
+        }
         resp
     }
 }
@@ -277,25 +321,27 @@ impl Engine {
 /// processing. The outcome-specific data lives in the [`QueryAction`] passed to
 /// [`build`](LogBuilder::build).
 struct LogBuilder {
-    client_ip: String,
+    client_ip: IpAddr,
     client_name: Option<String>,
     question: String,
-    qtype: String,
+    qtype: Cow<'static, str>,
     allowlisted: bool,
-    rcode: String,
+    rcode: Cow<'static, str>,
     answers: Vec<String>,
     elapsed_ms: f64,
 }
 
 impl LogBuilder {
-    fn new(client: &ResolvedClient, question: String, qtype: &str) -> Self {
+    fn new(client: &ResolvedClient, question: String, qtype: Cow<'static, str>) -> Self {
         Self {
-            client_ip: client.ip.to_string(),
+            // Kept as an `IpAddr` (Copy); only stringified in `build()`, which the
+            // caller skips entirely when neither logging nor stats is enabled.
+            client_ip: client.ip,
             client_name: client.name.clone(),
             question,
-            qtype: qtype.to_string(),
+            qtype,
             allowlisted: false,
-            rcode: String::new(),
+            rcode: Cow::Borrowed(""),
             answers: Vec::new(),
             elapsed_ms: 0.0,
         }
@@ -305,7 +351,7 @@ impl LogBuilder {
         QueryLogEntry {
             id,
             time_ms: now_ms(),
-            client_ip: self.client_ip,
+            client_ip: self.client_ip.to_string(),
             client_name: self.client_name,
             question: self.question,
             qtype: self.qtype,

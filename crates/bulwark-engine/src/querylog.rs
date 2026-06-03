@@ -1,6 +1,7 @@
 //! In-memory query log: a bounded ring buffer of recent queries with filtering
 //! and pagination for the UI.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 use parking_lot::Mutex;
@@ -35,7 +36,9 @@ pub struct QueryLogEntry {
     pub client_ip: String,
     pub client_name: Option<String>,
     pub question: String,
-    pub qtype: String,
+    /// Record type label (`"A"`, `"AAAA"`, …). A `Cow` so the common types are
+    /// stored as `&'static str` without a per-query allocation.
+    pub qtype: Cow<'static, str>,
     /// The outcome and its associated data. Flattened on the wire so the
     /// discriminator appears as a top-level `"action"` string with the
     /// variant's fields alongside it.
@@ -44,7 +47,9 @@ pub struct QueryLogEntry {
     /// True if an `@@` exception allowed an otherwise-blocked query. Orthogonal
     /// to `action`: an allowlisted query is still forwarded or cached.
     pub allowlisted: bool,
-    pub rcode: String,
+    /// Response code label (`"NOERROR"`, `"NXDOMAIN"`, …); `Cow` for the same
+    /// no-allocation reason as `qtype`.
+    pub rcode: Cow<'static, str>,
     /// Short summary of answer records (e.g. `["A 1.2.3.4"]`).
     pub answers: Vec<String>,
     pub elapsed_ms: f64,

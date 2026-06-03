@@ -401,6 +401,28 @@ fn phase0_ab(blocked: &[String]) {
         "  rcode label                 old={old_r:>4} ns/op   new={new_r:>4} ns/op   ({:+.0}%)",
         (new_r as f64 - old_r as f64) / old_r as f64 * 100.0
     );
+
+    // --- Record-type label, per query (runs on every query: filter + log) ---
+    // OLD: RecordType::to_string() heap-allocates. NEW: a borrowed &'static str
+    // for the common types.
+    let rtypes = [RecordType::A, RecordType::AAAA, RecordType::HTTPS, RecordType::TXT];
+    let old_t = best_ns_per_op(5, n, |i| rtypes[i % rtypes.len()].to_string().len());
+    let new_t = best_ns_per_op(5, n, |i| rtype_label(rtypes[i % rtypes.len()]).len());
+    println!(
+        "  rtype label                 old={old_t:>4} ns/op   new={new_t:>4} ns/op   ({:+.0}%)",
+        (new_t as f64 - old_t as f64) / old_t as f64 * 100.0
+    );
+}
+
+/// Local copy of the engine's new `rtype_label` (private there) for the A/B.
+fn rtype_label(rt: RecordType) -> &'static str {
+    match rt {
+        RecordType::A => "A",
+        RecordType::AAAA => "AAAA",
+        RecordType::HTTPS => "HTTPS",
+        RecordType::TXT => "TXT",
+        _ => "OTHER",
+    }
 }
 
 // ---------------------------------------------------------------------------
