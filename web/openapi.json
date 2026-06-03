@@ -1207,7 +1207,7 @@
               "string",
               "null"
             ],
-            "description": "The filter list responsible (`Custom rules` for user-written rules;\nabsent only when no rule matched). Set for `@@` exception allows too."
+            "description": "The filter list responsible, present whenever a rule matched\n(`Custom rules` for user-written rules)."
           },
           "rule": {
             "type": [
