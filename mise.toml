@@ -1,0 +1,71 @@
+[tools]
+# Rust toolchain — matches workspace.package.rust-version in Cargo.toml.
+rust = { version = "1.94", components = "rustfmt,clippy" }
+
+# Web stack for the Vite + Svelte app under web/.
+node = "26"
+pnpm = "11.5.1"
+
+# Tasks. Run `mise tasks` to list, `mise run <name>` to execute.
+#
+# The Rust build and the web build are decoupled: `cargo build` embeds whatever
+# is already in `web/dist` and never runs pnpm. Build the front-end explicitly
+# (`mise run web`) before building a release binary, or use `mise run dist`.
+
+[tasks.install]
+description = "Install front-end dependencies."
+dir = "web"
+run = "pnpm install"
+
+[tasks.spec]
+description = "Regenerate the OpenAPI spec the front-end API client is generated from."
+run = "cargo run -p bulwark --bin gen-openapi > web/openapi.json"
+
+[tasks.gen]
+description = "Regenerate the typed API client (web/src/api/generated.ts) from the spec."
+dir = "web"
+run = "pnpm gen"
+
+[tasks.client]
+description = "Regenerate the spec and the client it feeds. Run after changing the API."
+run = ["mise run spec", "mise run gen"]
+
+[tasks.web]
+description = "Build the front-end bundle into web/dist (embedded by the Rust build)."
+dir = "web"
+run = "pnpm build"
+
+[tasks.build]
+description = "Build the release binary, embedding the current web/dist."
+run = "cargo build --release"
+
+[tasks.dist]
+description = "Full release pipeline: spec -> client codegen -> UI bundle -> embedding binary."
+run = ["mise run spec", "mise run gen", "mise run web", "mise run build"]
+
+[tasks.run]
+description = "Run the server (debug). Binds locally for unprivileged testing."
+env = { BULWARK_DNS_BIND = "127.0.0.1:5353", BULWARK_HTTP_BIND = "127.0.0.1:3000" }
+run = "cargo run"
+
+[tasks.dev]
+description = "Live UI dev: Vite dev server, proxying /api to a server on :3000. Run `mise run run` in another terminal."
+dir = "web"
+run = "pnpm dev"
+
+[tasks.test]
+description = "Run the Rust test suite across the workspace."
+run = "cargo test --workspace"
+
+[tasks.lint]
+description = "Lint Rust (clippy) and the web app (svelte-check)."
+run = ["cargo clippy --workspace --all-targets", "mise run lint-web"]
+
+[tasks.lint-web]
+dir = "web"
+hide = true
+run = "pnpm check"
+
+[tasks.fmt]
+description = "Format all Rust code."
+run = "cargo fmt --all"

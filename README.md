@@ -64,7 +64,7 @@ cd web && pnpm install && pnpm build && cd ..
 cargo build --release
 ```
 
-Or, with [`just`](https://github.com/casey/just): `just install && just dist`.
+Or, with [`mise`](https://mise.jdx.dev): `mise run install && mise run dist`.
 
 The built bundle (`web/dist`) is generated, **not** committed. If you build
 without a Node toolchain (or before building the UI), the server still compiles
@@ -206,7 +206,7 @@ After changing any API handler or its request/response types, regenerate both
 the spec and the client:
 
 ```sh
-just client     # = cargo run --bin gen-openapi > web/openapi.json && pnpm gen
+mise run client     # = cargo run --bin gen-openapi > web/openapi.json && pnpm gen
 ```
 
 Both `web/openapi.json` and the generated client are committed so the front-end

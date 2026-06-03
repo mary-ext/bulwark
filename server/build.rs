@@ -45,7 +45,7 @@ fn main() {
     if !built {
         println!(
             "cargo:warning=web/dist has no UI bundle — embedding the \"UI not built\" placeholder. \
-             Build the front-end first (`just web` or `cd web && pnpm install && pnpm build`)."
+             Build the front-end first (`mise run web` or `cd web && pnpm install && pnpm build`)."
         );
     }
 }
