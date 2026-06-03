@@ -220,8 +220,12 @@ impl Stats {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Record one completed query.
-    pub fn record(&self, entry: &QueryLogEntry) {
+    /// Record one completed query. `upstream_rtt_ms` is the answering upstream's
+    /// own round-trip time, used for the per-upstream latency stats; it should be
+    /// `None` for queries that weren't forwarded (cached/blocked/error). The
+    /// whole-query `entry.elapsed_ms` still drives the global processing-time
+    /// stats and the query log itself.
+    pub fn record(&self, entry: &QueryLogEntry, upstream_rtt_ms: Option<f64>) {
         if !self.is_enabled() {
             return;
         }
@@ -237,6 +241,11 @@ impl Stats {
         // doesn't split its history into a separate bucket.
         let client = entry.client_ip.as_str();
         let idx = hist_index(entry.elapsed_ms);
+        // Per-upstream latency is keyed off the answering upstream's own RTT, not
+        // the whole-query wall-clock. Fall back to `elapsed_ms` if a forwarded
+        // entry arrives without one (e.g. older imported data / tests).
+        let up_ms = upstream_rtt_ms.unwrap_or(entry.elapsed_ms);
+        let up_idx = hist_index(up_ms);
         let hour = entry.time_ms / 1000 / 3600;
         let max = self.max_buckets.load(Ordering::Relaxed);
         let cap = self.key_cap;
@@ -271,9 +280,9 @@ impl Stats {
             bump(&mut s.upstreams, up, 1, cap);
             // Avoid cloning the upstream name on the hot (existing-key) path.
             match s.upstream_rtt_sum.get_mut(up) {
-                Some(v) => *v += entry.elapsed_ms,
+                Some(v) => *v += up_ms,
                 None => {
-                    s.upstream_rtt_sum.insert(up.to_string(), entry.elapsed_ms);
+                    s.upstream_rtt_sum.insert(up.to_string(), up_ms);
                 }
             }
             match s.upstream_rtt_count.get_mut(up) {
@@ -283,10 +292,10 @@ impl Stats {
                 }
             }
             match s.upstream_latency_hist.get_mut(up) {
-                Some(h) => h[idx] += 1,
+                Some(h) => h[up_idx] += 1,
                 None => {
                     let mut h = vec![0; LATENCY_BUCKETS_MS.len() + 1];
-                    h[idx] += 1;
+                    h[up_idx] += 1;
                     s.upstream_latency_hist.insert(up.to_string(), h);
                 }
             }
@@ -600,10 +609,10 @@ mod tests {
     #[test]
     fn counts_and_top_n() {
         let s = Stats::new(true, 30);
-        s.record(&entry("ads.com.", blocked(), 0.5));
-        s.record(&entry("ads.com.", blocked(), 0.5));
-        s.record(&entry("good.com.", forwarded("1.1.1.1"), 12.0));
-        s.record(&entry("good.com.", QueryAction::Cached, 0.1));
+        s.record(&entry("ads.com.", blocked(), 0.5), None);
+        s.record(&entry("ads.com.", blocked(), 0.5), None);
+        s.record(&entry("good.com.", forwarded("1.1.1.1"), 12.0), Some(12.0));
+        s.record(&entry("good.com.", QueryAction::Cached, 0.1), None);
 
         let snap = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(snap.total, 4);
@@ -629,10 +638,10 @@ mod tests {
 
         let s = Stats::new(true, 30);
         // Two distinct IPs in the same /24, plus an unrelated one.
-        s.record(&entry_ip("10.0.0.1", forwarded("u")));
-        s.record(&entry_ip("10.0.0.2", forwarded("u")));
-        s.record(&entry_ip("10.0.0.2", forwarded("u")));
-        s.record(&entry_ip("192.168.1.5", forwarded("u")));
+        s.record(&entry_ip("10.0.0.1", forwarded("u")), None);
+        s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
+        s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
+        s.record(&entry_ip("192.168.1.5", forwarded("u")), None);
 
         // No client config: each IP is its own row, keyed by the bare IP.
         let bare = s.snapshot(10, &ClientMatcher::default());
@@ -661,7 +670,7 @@ mod tests {
     #[test]
     fn export_import_roundtrip() {
         let s = Stats::new(true, 30);
-        s.record(&entry("x.com.", forwarded("8.8.8.8"), 3.0));
+        s.record(&entry("x.com.", forwarded("8.8.8.8"), 3.0), Some(3.0));
         let dump = s.export();
         let s2 = Stats::new(true, 30);
         s2.import(&dump);
@@ -673,10 +682,10 @@ mod tests {
         let s = Stats::new(true, 30);
         // 100 fast samples (~5ms) and a few slow ones to push the tail up.
         for _ in 0..95 {
-            s.record(&entry("a.com.", forwarded("up"), 5.0));
+            s.record(&entry("a.com.", forwarded("up"), 5.0), Some(5.0));
         }
         for _ in 0..5 {
-            s.record(&entry("a.com.", forwarded("up"), 300.0));
+            s.record(&entry("a.com.", forwarded("up"), 300.0), Some(300.0));
         }
         let snap = s.snapshot(10, &ClientMatcher::default());
         let p = snap.upstream_latency_pct.get("up").expect("upstream present");
@@ -687,10 +696,44 @@ mod tests {
     }
 
     #[test]
+    fn per_upstream_latency_ignores_failover_wall_clock() {
+        // Every query answered in ~5ms, but the whole-query elapsed_ms is ~1010ms
+        // because an earlier upstream timed out (1s) before failover. The answering
+        // upstream's percentiles must reflect its own 5ms RTT, not the 1s timeout
+        // it had nothing to do with.
+        let s = Stats::new(true, 30);
+        for _ in 0..100 {
+            s.record(&entry("a.com.", forwarded("fast"), 1010.0), Some(5.0));
+        }
+        let snap = s.snapshot(10, &ClientMatcher::default());
+        let p = snap
+            .upstream_latency_pct
+            .get("fast")
+            .expect("upstream present");
+        assert!(
+            p.p99 <= 5.0,
+            "p99 = {} (should track RTT, not timeout)",
+            p.p99
+        );
+        // The per-upstream average tracks RTT too, not the whole-query wall-clock.
+        assert!(
+            snap.upstream_avg_rtt_ms["fast"] <= 5.0,
+            "avg = {}",
+            snap.upstream_avg_rtt_ms["fast"]
+        );
+        // The global processing-time histogram still sees the real 1010ms total.
+        assert!(
+            snap.avg_processing_ms > 1000.0,
+            "avg_proc = {}",
+            snap.avg_processing_ms
+        );
+    }
+
+    #[test]
     fn time_series_buckets_by_hour() {
         let s = Stats::new(true, 1);
-        s.record(&entry("x.com.", forwarded("1.1.1.1"), 1.0));
-        s.record(&entry("y.com.", blocked(), 1.0));
+        s.record(&entry("x.com.", forwarded("1.1.1.1"), 1.0), Some(1.0));
+        s.record(&entry("y.com.", blocked(), 1.0), None);
         let snap = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].total, 2);
@@ -707,7 +750,7 @@ mod tests {
             let s = s.clone();
             handles.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
-                    s.record(&entry("ads.com.", blocked(), 0.5));
+                    s.record(&entry("ads.com.", blocked(), 0.5), None);
                 }
             }));
         }
