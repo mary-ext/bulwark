@@ -84,7 +84,7 @@
     },
   });
 
-  const qtypeConfig = $derived<ChartConfiguration>({
+  const qtypeConfig = $derived<ChartConfiguration<"doughnut">>({
     type: "doughnut",
     data: {
       labels: (stats?.qtypes ?? []).map((e) => e.name),
