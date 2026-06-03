@@ -146,7 +146,7 @@ export type CheckResponse = {
     /** One of `allow`, `block`, or `rewrite`. */
     action: string;
     /** The filter list responsible (`Custom rules` for user-written rules;
-    absent for allow verdicts). */
+    absent only when no rule matched). Set for `@@` exception allows too. */
     list_name?: string | null;
     /** The matching rule text, if any. */
     rule?: string | null;

@@ -736,7 +736,7 @@ pub struct CheckResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<String>,
     /// The filter list responsible (`Custom rules` for user-written rules;
-    /// absent for allow verdicts).
+    /// absent only when no rule matched). Set for `@@` exception allows too.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_name: Option<String>,
 }
@@ -781,9 +781,12 @@ pub async fn check_domain(
         list_name: names.get(&info.list_id).cloned(),
     };
     let resp = match verdict {
-        Verdict::Allow { rule } => CheckResponse {
+        // An `@@` exception can come from a list (e.g. an allowlist), so attribute
+        // it too; a bare allow (no rule matched) has nothing to attribute.
+        Verdict::Allow { rule: Some(info) } => attribute(info, "allow"),
+        Verdict::Allow { rule: None } => CheckResponse {
             action: "allow".into(),
-            rule: rule.map(|r| r.rule),
+            rule: None,
             list_name: None,
         },
         Verdict::Block(info) => attribute(info, "block"),
