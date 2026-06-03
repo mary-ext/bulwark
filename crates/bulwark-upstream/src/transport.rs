@@ -63,13 +63,89 @@ pub fn matches_query(query: &Message, response: &Message) -> bool {
         (Some(q), Some(r)) => {
             q.query_type() == r.query_type()
                 && q.query_class() == r.query_class()
-                && q.name()
-                    .to_ascii()
-                    .eq_ignore_ascii_case(&r.name().to_ascii())
+                // Compare by DNS labels (case-insensitive), ignoring the
+                // FQDN/relative distinction. A response decoded off the wire is
+                // always FQDN; an internally built query (e.g. the bootstrap
+                // resolver) may be relative. `eq_ignore_ascii_case` on
+                // `to_ascii()` would treat "a.com" and "a.com." as different and
+                // wrongly reject the reply.
+                && q.name().eq_ignore_root(r.name())
         }
         // A response with no question section (rare but legal for some errors)
         // is accepted as long as the id matched.
         (Some(_), None) => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query};
+    use hickory_proto::rr::{DNSClass, Name, RecordType};
+    use std::str::FromStr;
+
+    /// Build a query the way the bootstrap resolver does: a dotless host parsed
+    /// with `Name::from_str`, then sent over the wire.
+    fn query(id: u16, host: &str, fqdn: bool, rtype: RecordType) -> Message {
+        let mut name = Name::from_str(host).unwrap();
+        name.set_fqdn(fqdn);
+        let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+        let mut q = Query::query(name, rtype);
+        q.set_query_class(DNSClass::IN);
+        msg.queries.push(q);
+        msg
+    }
+
+    /// Round-trip a message through wire encode/decode. The decoded question is
+    /// always FQDN, mirroring a real upstream response.
+    fn wire_roundtrip(msg: &Message) -> Message {
+        decode(&encode(msg).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn bootstrap_relative_query_matches_fqdn_response() {
+        // Reproduces the bootstrap bug: a relative query name must still match
+        // the FQDN question echoed back in the decoded response.
+        let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
+        assert!(!q.queries[0].name().is_fqdn(), "query should be relative");
+        let resp = wire_roundtrip(&q);
+        assert!(resp.queries[0].name().is_fqdn(), "wire response is FQDN");
+        assert!(matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn fqdn_query_matches_fqdn_response() {
+        let q = query(0x1234, "cloudflare-dns.com", true, RecordType::A);
+        let resp = wire_roundtrip(&q);
+        assert!(matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn case_insensitive_name_match() {
+        let q = query(0x1234, "Cloudflare-DNS.com", false, RecordType::A);
+        let resp = wire_roundtrip(&query(0x1234, "cloudflare-dns.com", true, RecordType::A));
+        assert!(matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn rejects_mismatched_id() {
+        let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
+        let resp = wire_roundtrip(&query(0x5678, "cloudflare-dns.com", true, RecordType::A));
+        assert!(!matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn rejects_mismatched_name() {
+        let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
+        let resp = wire_roundtrip(&query(0x1234, "dns.google", true, RecordType::A));
+        assert!(!matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn rejects_mismatched_type() {
+        let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
+        let resp = wire_roundtrip(&query(0x1234, "cloudflare-dns.com", true, RecordType::AAAA));
+        assert!(!matches_query(&q, &resp));
     }
 }

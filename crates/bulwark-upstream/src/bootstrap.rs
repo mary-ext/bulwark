@@ -90,7 +90,14 @@ impl Bootstrap {
     }
 
     async fn lookup(&self, host: &str, rtype: RecordType) -> Result<Vec<IpAddr>> {
-        let name = Name::from_str(host).map_err(|e| UpstreamError::Proto(e.to_string()))?;
+        // Bootstrap hosts are absolute DNS names, so mark the name fully
+        // qualified. `Name::from_str` leaves a dotless host relative, and a
+        // relative name's `to_ascii()` has no trailing dot — it would never
+        // match the FQDN question echoed back in the response, so the reply
+        // would be rejected and the query would hang until timeout. The on-wire
+        // bytes are unchanged either way (names always emit a root terminator).
+        let mut name = Name::from_str(host).map_err(|e| UpstreamError::Proto(e.to_string()))?;
+        name.set_fqdn(true);
         let mut msg = Message::new(rand::rng().random(), MessageType::Query, OpCode::Query);
         msg.metadata.recursion_desired = true;
         let mut q = Query::query(name, rtype);
