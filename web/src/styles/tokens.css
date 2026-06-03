@@ -88,8 +88,8 @@
 
   /* Z-index */
   --z-sticky: 50;
-  --z-drawer: 100;
   --z-overlay: 200;
+  --z-drawer: 210;
   --z-dialog: 210;
   --z-menu: 220;
   --z-toast: 300;
