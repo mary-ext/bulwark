@@ -134,6 +134,34 @@ impl UpstreamsConfig {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
     }
+
+    /// Tidy the freeform [`servers`](Self::servers) text in place: trim each
+    /// line, drop leading/trailing blank lines, and collapse runs of blank
+    /// lines so at most one blank line (two consecutive newlines) survives. The
+    /// result always ends in a single trailing newline, or is empty.
+    pub fn normalize(&mut self) {
+        let mut out = String::with_capacity(self.servers.len());
+        let mut blanks = 0u32;
+        for line in self.servers.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                blanks += 1;
+                if blanks > 1 {
+                    continue;
+                }
+            } else {
+                blanks = 0;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        let trimmed = out.trim_matches('\n');
+        self.servers = if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}\n")
+        };
+    }
 }
 
 /// Deserialize the freeform upstream list leniently: accept a string as-is, and
@@ -467,6 +495,25 @@ mod tests {
         cfg.save(&path).unwrap();
         let loaded = Config::load_or_default(&path).unwrap();
         assert_eq!(loaded.upstreams.servers, cfg.upstreams.servers);
+    }
+
+    #[test]
+    fn normalize_trims_lines_and_collapses_blanks() {
+        let mut cfg = UpstreamsConfig::default();
+        cfg.servers = "\n\n  # Cloudflare  \n\n\n  https://cloudflare-dns.com/dns-query  \n\n\n\n#tls://one.one.one.one\n\n".into();
+        cfg.normalize();
+        assert_eq!(
+            cfg.servers,
+            "# Cloudflare\n\nhttps://cloudflare-dns.com/dns-query\n\n#tls://one.one.one.one\n"
+        );
+    }
+
+    #[test]
+    fn normalize_empty_stays_empty() {
+        let mut cfg = UpstreamsConfig::default();
+        cfg.servers = "\n  \n\n".into();
+        cfg.normalize();
+        assert_eq!(cfg.servers, "");
     }
 
     #[test]

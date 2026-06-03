@@ -29,7 +29,7 @@ pub(crate) fn default_http_bind() -> SocketAddr {
 }
 
 pub(crate) fn default_upstreams() -> String {
-    "# Quad9 (DoH)\nhttps://dns.quad9.net/dns-query\n# Cloudflare\n1.1.1.1\n".into()
+    "# Quad9 (DoH)\nhttps://dns.quad9.net/dns-query\n# Cloudflare (DoH)\nhttps://cloudflare-dns.com/dns-query\n".into()
 }
 
 pub(crate) fn default_bootstrap() -> Vec<SocketAddr> {

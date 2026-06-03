@@ -137,6 +137,7 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
 
 /// Validate, persist, and hot-apply a new configuration.
 pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Result<()> {
+    new_cfg.upstreams.normalize();
     new_cfg.validate().context("config validation")?;
 
     // Refresh per-list rule counts so the UI reflects reality.
