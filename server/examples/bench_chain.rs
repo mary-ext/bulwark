@@ -709,11 +709,7 @@ impl OldStats {
         if blocked {
             old_bump(&mut s.blocked_domains, &domain, 1);
         }
-        let client = entry
-            .client_name
-            .clone()
-            .unwrap_or_else(|| entry.client_ip.clone());
-        old_bump(&mut s.clients, &client, 1);
+        old_bump(&mut s.clients, &entry.client_ip, 1);
         old_bump(&mut s.qtypes, &entry.qtype, 1);
         if let Some(up) = entry.upstream() {
             old_bump(&mut s.upstreams, up, 1);
@@ -728,7 +724,6 @@ fn entry_for(domain: &str, blocked: bool) -> QueryLogEntry {
         id: 0,
         time_ms: 1_700_000_000_000,
         client_ip: "192.168.1.50".into(),
-        client_name: Some("laptop".into()),
         question: format!("{domain}."),
         qtype: "A".into(),
         action: if blocked {

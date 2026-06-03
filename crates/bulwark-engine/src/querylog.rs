@@ -36,7 +36,6 @@ pub struct QueryLogEntry {
     /// Unix epoch milliseconds.
     pub time_ms: i64,
     pub client_ip: String,
-    pub client_name: Option<String>,
     pub question: String,
     /// Record type label (`"A"`, `"AAAA"`, …). A `Cow` so the common types are
     /// stored as `&'static str` without a per-query allocation.
@@ -194,10 +193,12 @@ impl QueryLog {
         self.len() == 0
     }
 
-    /// Query the log with filtering + pagination (newest first). `clients` is the
-    /// current client matcher: stored entries hold only the client IP, and the
-    /// friendly name is resolved here (for both the client filter and the
-    /// returned entries) so renames/removals apply retroactively.
+    /// Query the log with filtering + pagination (newest first). Stored entries
+    /// hold only the client IP; `clients` is the current client matcher, used to
+    /// resolve the friendly name for the client filter so a filter by name
+    /// matches entries logged before that name existed. The returned entries are
+    /// nameless — the caller resolves the display name the same way (see
+    /// `LogEntryView` in the server) so renames/removals apply retroactively.
     pub fn query(
         &self,
         filter: &LogFilter,
@@ -233,16 +234,7 @@ impl QueryLog {
             .collect();
 
         let total = matched.len();
-        let entries = matched
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|e| {
-                let mut e = e.clone();
-                e.client_name = clients.name_for_str(&e.client_ip).map(str::to_string);
-                e
-            })
-            .collect();
+        let entries = matched.into_iter().skip(offset).take(limit).cloned().collect();
         LogPage { entries, total }
     }
 }
@@ -256,7 +248,6 @@ mod tests {
             id,
             time_ms: id as i64,
             client_ip: "10.0.0.1".into(),
-            client_name: Some("laptop".into()),
             question: q.into(),
             qtype: "A".into(),
             action: if blocked {
@@ -318,32 +309,36 @@ mod tests {
     }
 
     #[test]
-    fn client_name_resolved_at_read_time() {
+    fn client_filter_resolves_names_retroactively() {
         use bulwark_config::ClientConfig;
 
         let log = QueryLog::new(10, true);
         // Stored with only an IP; no name baked in.
         let mut e = entry(1, "x.com", false);
         e.client_ip = "10.0.0.5".into();
-        e.client_name = None;
         log.push(e);
 
-        // No config: the entry shows the bare IP and matches an IP filter.
-        let bare = log.query(&LogFilter::default(), 0, 10, &ClientMatcher::default());
-        assert_eq!(bare.entries[0].client_name, None);
+        // Without config, filtering by the (future) name finds nothing.
+        let none = log.query(
+            &LogFilter {
+                client: Some("phone".into()),
+                ..Default::default()
+            },
+            0,
+            10,
+            &ClientMatcher::default(),
+        );
+        assert_eq!(none.total, 0);
 
-        // Name 10.0.0.5 "phone": the name now shows and a name filter matches —
-        // retroactively, for an entry logged before the name existed.
+        // Name 10.0.0.5 "phone": a name filter now matches an entry logged
+        // before the name existed.
         let m = ClientMatcher::build(&[ClientConfig {
             name: "phone".into(),
             ids: vec!["10.0.0.5".into()],
             tags: vec![],
             filtering_enabled: true,
         }]);
-        let named = log.query(&LogFilter::default(), 0, 10, &m);
-        assert_eq!(named.entries[0].client_name.as_deref(), Some("phone"));
-
-        let by_name = log.query(
+        let hit = log.query(
             &LogFilter {
                 client: Some("phone".into()),
                 ..Default::default()
@@ -352,7 +347,7 @@ mod tests {
             10,
             &m,
         );
-        assert_eq!(by_name.total, 1);
+        assert_eq!(hit.total, 1);
     }
 
     #[test]
@@ -376,7 +371,6 @@ mod wire_tests {
             id: 1,
             time_ms: 0,
             client_ip: "10.0.0.1".into(),
-            client_name: None,
             question: "ads.com.".into(),
             qtype: "A".into(),
             action: QueryAction::Blocked {

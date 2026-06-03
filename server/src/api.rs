@@ -900,10 +900,11 @@ pub async fn get_querylog(
         client: q.client,
         blocked_only: q.blocked_only,
     };
+    let clients = state.engine.clients();
     let page = state
         .engine
         .log()
-        .query(&filter, q.offset, q.limit.min(1000), &state.engine.clients());
+        .query(&filter, q.offset, q.limit.min(1000), &clients);
 
     // Resolve list ids to friendly names so the UI can show which list (and
     // which rule) was responsible. A block is one winning rule from one list;
@@ -924,7 +925,10 @@ pub async fn get_querylog(
         .into_iter()
         .map(|entry| {
             let list_name = entry.list_id().and_then(|id| names.get(&id).cloned());
-            LogEntryView::new(entry, list_name)
+            // Resolve the client's friendly name from its IP against the current
+            // config, so renames/removals show retroactively.
+            let client_name = clients.name_for_str(&entry.client_ip).map(str::to_string);
+            LogEntryView::new(entry, list_name, client_name)
         })
         .collect();
     Json(QueryLogResponse {

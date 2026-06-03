@@ -574,7 +574,6 @@ mod tests {
             id: 0,
             time_ms: 1_700_000_000_000,
             client_ip: "10.0.0.1".into(),
-            client_name: Some("laptop".into()),
             question: q.into(),
             qtype: "A".into(),
             action,
