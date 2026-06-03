@@ -194,15 +194,21 @@ fn server_tls(certs: &Certs, alpn: &[&[u8]], tls13_only: bool) -> rustls::Server
 // ---------------------------------------------------------------------------
 
 async fn mock_udp(delay: Duration) -> String {
-    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = sock.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 4096];
         loop {
             let Ok((n, peer)) = sock.recv_from(&mut buf).await else { break };
-            if let Some(out) = respond(&buf[..n], delay).await {
-                let _ = sock.send_to(&out, peer).await;
-            }
+            // Handle each datagram in its own task so an upstream-RTT delay does
+            // not serialize the recv loop (bulwark sends UDP queries concurrently).
+            let data = buf[..n].to_vec();
+            let sock = sock.clone();
+            tokio::spawn(async move {
+                if let Some(out) = respond(&data, delay).await {
+                    let _ = sock.send_to(&out, peer).await;
+                }
+            });
         }
     });
     format!("udp://{addr}")
