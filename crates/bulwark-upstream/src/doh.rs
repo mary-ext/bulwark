@@ -119,10 +119,19 @@ impl DohTransport {
             // for cleartext h2c and breaks over TLS).
             builder = builder.http2_keep_alive_interval(Duration::from_secs(30));
         }
-        // Pin the resolved addresses for the host:port.
-        for ip in ips {
-            builder = builder.resolve(&host, SocketAddr::new(*ip, self.spec.port));
-        }
+        // Pin the resolved addresses for the host:port in a single call.
+        // `resolve()` in a loop would not accumulate: reqwest keys the override
+        // by host and *overwrites* on each call, so only the last IP would
+        // survive. Given bootstrap's A-then-AAAA order that last IP is the IPv6
+        // address, pinning the client to IPv6 only — which stalls on hosts
+        // without working IPv6 egress (e.g. an IPv4-only container) even though
+        // DoT/DoQ to the same upstream succeed over IPv4. `resolve_to_addrs`
+        // keeps the whole set so the connector can fall back across families.
+        let addrs: Vec<SocketAddr> = ips
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, self.spec.port))
+            .collect();
+        builder = builder.resolve_to_addrs(&host, &addrs);
         // Additive test/benchmark trust anchors (feature-gated, absent from the
         // shipped binary). Lets the DoH client trust a local mock's private CA.
         #[cfg(feature = "test-trust-roots")]
