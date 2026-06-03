@@ -355,10 +355,6 @@ impl LogBuilder {
             id,
             time_ms: now_ms(),
             client_ip: self.client_ip.to_string(),
-            // The friendly name is resolved at read time from the current client
-            // config (see `QueryLog::query`), not frozen in at log time, so
-            // renames/removals apply retroactively.
-            client_name: None,
             question: self.question,
             qtype: self.qtype,
             action,

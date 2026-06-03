@@ -176,7 +176,9 @@ pub struct LogEntryView {
 }
 
 impl LogEntryView {
-    pub fn new(e: QueryLogEntry, list_name: Option<String>) -> Self {
+    /// `client_name` is resolved by the caller from the entry's IP against the
+    /// current client config, so it reflects renames/removals retroactively.
+    pub fn new(e: QueryLogEntry, list_name: Option<String>, client_name: Option<String>) -> Self {
         let (action, upstream, rule, list_id) = match e.action {
             QueryAction::Forwarded { upstream } => ("forwarded", Some(upstream), None, None),
             QueryAction::Cached => ("cached", None, None, None),
@@ -190,7 +192,7 @@ impl LogEntryView {
             id: e.id,
             time_ms: e.time_ms,
             client_ip: e.client_ip,
-            client_name: e.client_name,
+            client_name,
             question: e.question,
             qtype: e.qtype.into_owned(),
             action: action.to_string(),
