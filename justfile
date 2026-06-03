@@ -12,6 +12,10 @@ default:
 install:
     cd web && pnpm install
 
+# Regenerate the OpenAPI spec the front-end API client is generated from.
+spec:
+    cargo run -p bulwark --bin gen-openapi > web/openapi.json
+
 # Build the front-end bundle into web/dist (embedded by the Rust build).
 web:
     cd web && pnpm build

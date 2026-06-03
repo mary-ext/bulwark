@@ -1,17 +1,12 @@
 //! Bulwark server: runs the DNS engine and serves the web UI + REST API.
 
-mod api;
-mod app;
-mod assets;
-mod auth;
-mod persist;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use app::{AppState, Paths};
+use bulwark::app::{self, AppState, Paths};
+use bulwark::{api, assets, auth, persist};
 use bulwark_config::Config;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};

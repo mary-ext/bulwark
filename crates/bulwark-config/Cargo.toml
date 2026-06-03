@@ -13,6 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 ipnet.workspace = true
 humantime.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -28,7 +28,7 @@ pub enum ConfigError {
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The root configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Config {
     #[serde(default = "one")]
     pub version: u32,
@@ -68,13 +68,15 @@ impl Default for Config {
 
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServerConfig {
     /// Addresses to serve plain DNS on (UDP + TCP).
     #[serde(default = "default_dns_bind")]
+    #[schema(value_type = Vec<String>)]
     pub dns_bind: Vec<SocketAddr>,
     /// Address to serve the web UI + API on.
     #[serde(default = "default_http_bind")]
+    #[schema(value_type = String)]
     pub http_bind: SocketAddr,
     /// Per-client query rate limit (queries/sec); 0 disables.
     #[serde(default)]
@@ -91,7 +93,7 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpstreamConfig {
     /// Spec string, e.g. `1.1.1.1`, `tls://dns.google`, `https://.../dns-query`.
     pub spec: String,
@@ -102,12 +104,13 @@ pub struct UpstreamConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpstreamsConfig {
     #[serde(default = "default_upstreams")]
     pub servers: Vec<UpstreamConfig>,
     /// Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames.
     #[serde(default = "default_bootstrap")]
+    #[schema(value_type = Vec<String>)]
     pub bootstrap: Vec<SocketAddr>,
     /// Per-attempt query timeout (seconds).
     #[serde(default = "five")]
@@ -128,7 +131,7 @@ impl Default for UpstreamsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct CacheConfig {
     #[serde(default = "btrue")]
     pub enabled: bool,
@@ -163,7 +166,7 @@ impl Default for CacheConfig {
 }
 
 /// How blocked queries are answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockingMode {
     /// Respond with NXDOMAIN.
@@ -179,7 +182,7 @@ pub enum BlockingMode {
     NoData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FilterListConfig {
     pub id: u32,
     pub name: String,
@@ -195,15 +198,17 @@ pub struct FilterListConfig {
     pub last_updated: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct FilteringConfig {
     #[serde(default = "btrue")]
     pub enabled: bool,
     #[serde(default)]
     pub blocking_mode: BlockingMode,
     #[serde(default = "default_block_ipv4")]
+    #[schema(value_type = String)]
     pub custom_block_ipv4: std::net::Ipv4Addr,
     #[serde(default = "default_block_ipv6")]
+    #[schema(value_type = String)]
     pub custom_block_ipv6: std::net::Ipv6Addr,
     /// TTL (seconds) for synthesized blocked responses.
     #[serde(default = "ten")]
@@ -229,7 +234,7 @@ impl Default for FilteringConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ClientConfig {
     pub name: String,
     /// Identifiers: IP addresses or CIDR ranges.
@@ -242,7 +247,7 @@ pub struct ClientConfig {
     pub filtering_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct QueryLogConfig {
     #[serde(default = "btrue")]
     pub enabled: bool,
@@ -273,7 +278,7 @@ impl Default for QueryLogConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct StatsConfig {
     #[serde(default = "btrue")]
     pub enabled: bool,
@@ -296,7 +301,7 @@ impl Default for StatsConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct AuthConfig {
     /// Admin username.
     #[serde(default)]
