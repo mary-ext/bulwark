@@ -4,10 +4,6 @@ services:
     image: bulwark:latest
     container_name: bulwark
     restart: unless-stopped
-    # cap_net_bind_service is also baked onto the binary, but adding it to the
-    # container's bounding set keeps file capabilities working across runtimes.
-    cap_add:
-      - NET_BIND_SERVICE
     ports:
       - "53:53/udp"
       - "53:53/tcp"
