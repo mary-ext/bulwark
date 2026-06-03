@@ -2007,28 +2007,6 @@
           "quic"
         ]
       },
-      "UpstreamConfig": {
-        "type": "object",
-        "required": [
-          "spec"
-        ],
-        "properties": {
-          "enabled": {
-            "type": "boolean"
-          },
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Optional friendly name for the UI."
-          },
-          "spec": {
-            "type": "string",
-            "description": "Spec string, e.g. `1.1.1.1`, `tls://dns.google`, `https://.../dns-query`."
-          }
-        }
-      },
       "UpstreamStatDto": {
         "type": "object",
         "description": "Per-upstream statistics for the UI.",
@@ -2102,10 +2080,8 @@
             "minimum": 0
           },
           "servers": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/UpstreamConfig"
-            }
+            "type": "string",
+            "description": "Freeform upstream list: one spec per line. Lines starting with `#` are\ncomments and blank lines are ignored — both are preserved verbatim so\nyou can annotate and toggle entries by commenting them out. e.g.\n`https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`."
           },
           "timeout_secs": {
             "type": "integer",

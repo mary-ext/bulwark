@@ -97,19 +97,16 @@ export type StatsConfig = {
     the query-log retention). */
     retention_days?: number;
 };
-export type UpstreamConfig = {
-    enabled?: boolean;
-    /** Optional friendly name for the UI. */
-    name?: string | null;
-    /** Spec string, e.g. `1.1.1.1`, `tls://dns.google`, `https://.../dns-query`. */
-    spec: string;
-};
 export type UpstreamsConfig = {
     /** Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames. */
     bootstrap?: string[];
     /** Interval between background latency probes (seconds); 0 disables probing. */
     probe_interval_secs?: number;
-    servers?: UpstreamConfig[];
+    /** Freeform upstream list: one spec per line. Lines starting with `#` are
+    comments and blank lines are ignored — both are preserved verbatim so
+    you can annotate and toggle entries by commenting them out. e.g.
+    `https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`. */
+    servers?: string;
     /** Per-attempt query timeout (seconds). */
     timeout_secs?: number;
 };
