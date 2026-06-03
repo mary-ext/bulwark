@@ -86,6 +86,23 @@ impl ClientMatcher {
             filtering_enabled: true,
         }
     }
+
+    /// The configured name for `ip`, if it matches a client. Borrows from the
+    /// matcher (no allocation). Used to resolve display names at read time so a
+    /// rename or removal in the client config applies retroactively.
+    pub fn name_for(&self, ip: IpAddr) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.nets.iter().any(|n| n.contains(&ip)))
+            .map(|e| e.name.as_str())
+    }
+
+    /// Resolve a stored client-IP string to its current configured name, if any.
+    /// Convenience over [`name_for`](Self::name_for) for data (stats, query log)
+    /// that holds the client IP as a string.
+    pub fn name_for_str(&self, ip: &str) -> Option<&str> {
+        ip.parse::<IpAddr>().ok().and_then(|ip| self.name_for(ip))
+    }
 }
 
 #[cfg(test)]

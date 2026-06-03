@@ -7,6 +7,8 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::clients::ClientMatcher;
+
 /// What happened to a query, together with the data specific to that outcome.
 ///
 /// Modeling the per-outcome fields inside each variant makes invalid
@@ -192,8 +194,17 @@ impl QueryLog {
         self.len() == 0
     }
 
-    /// Query the log with filtering + pagination (newest first).
-    pub fn query(&self, filter: &LogFilter, offset: usize, limit: usize) -> LogPage {
+    /// Query the log with filtering + pagination (newest first). `clients` is the
+    /// current client matcher: stored entries hold only the client IP, and the
+    /// friendly name is resolved here (for both the client filter and the
+    /// returned entries) so renames/removals apply retroactively.
+    pub fn query(
+        &self,
+        filter: &LogFilter,
+        offset: usize,
+        limit: usize,
+        clients: &ClientMatcher,
+    ) -> LogPage {
         let q = self.inner.lock();
         let search = filter.search.as_ref().map(|s| s.to_ascii_lowercase());
         let client = filter.client.as_ref().map(|s| s.to_ascii_lowercase());
@@ -210,9 +221,8 @@ impl QueryLog {
                     }
                 }
                 if let Some(c) = &client {
-                    let name_match = e
-                        .client_name
-                        .as_ref()
+                    let name_match = clients
+                        .name_for_str(&e.client_ip)
                         .is_some_and(|n| n.to_ascii_lowercase().contains(c));
                     if !e.client_ip.to_ascii_lowercase().contains(c) && !name_match {
                         return false;
@@ -227,7 +237,11 @@ impl QueryLog {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .cloned()
+            .map(|e| {
+                let mut e = e.clone();
+                e.client_name = clients.name_for_str(&e.client_ip).map(str::to_string);
+                e
+            })
             .collect();
         LogPage { entries, total }
     }
@@ -269,7 +283,7 @@ mod tests {
             log.push(entry(i, "x.com", false));
         }
         assert_eq!(log.len(), 3);
-        let page = log.query(&LogFilter::default(), 0, 10);
+        let page = log.query(&LogFilter::default(), 0, 10, &ClientMatcher::default());
         // Newest first.
         assert_eq!(page.entries[0].id, 4);
         assert_eq!(page.total, 3);
@@ -287,6 +301,7 @@ mod tests {
             },
             0,
             10,
+            &ClientMatcher::default(),
         );
         assert_eq!(blocked.total, 1);
         let search = log.query(
@@ -296,9 +311,48 @@ mod tests {
             },
             0,
             10,
+            &ClientMatcher::default(),
         );
         assert_eq!(search.total, 1);
         assert_eq!(search.entries[0].id, 2);
+    }
+
+    #[test]
+    fn client_name_resolved_at_read_time() {
+        use bulwark_config::ClientConfig;
+
+        let log = QueryLog::new(10, true);
+        // Stored with only an IP; no name baked in.
+        let mut e = entry(1, "x.com", false);
+        e.client_ip = "10.0.0.5".into();
+        e.client_name = None;
+        log.push(e);
+
+        // No config: the entry shows the bare IP and matches an IP filter.
+        let bare = log.query(&LogFilter::default(), 0, 10, &ClientMatcher::default());
+        assert_eq!(bare.entries[0].client_name, None);
+
+        // Name 10.0.0.5 "phone": the name now shows and a name filter matches —
+        // retroactively, for an entry logged before the name existed.
+        let m = ClientMatcher::build(&[ClientConfig {
+            name: "phone".into(),
+            ids: vec!["10.0.0.5".into()],
+            tags: vec![],
+            filtering_enabled: true,
+        }]);
+        let named = log.query(&LogFilter::default(), 0, 10, &m);
+        assert_eq!(named.entries[0].client_name.as_deref(), Some("phone"));
+
+        let by_name = log.query(
+            &LogFilter {
+                client: Some("phone".into()),
+                ..Default::default()
+            },
+            0,
+            10,
+            &m,
+        );
+        assert_eq!(by_name.total, 1);
     }
 
     #[test]

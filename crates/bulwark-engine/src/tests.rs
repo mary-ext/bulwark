@@ -132,7 +132,9 @@ async fn blocks_filtered_domain() {
     // Blocked queries never touch the upstream.
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    let page = engine.log().query(&Default::default(), 0, 10);
+    let page = engine
+        .log()
+        .query(&Default::default(), 0, 10, &engine.clients());
     assert!(matches!(
         page.entries[0].action,
         QueryAction::Blocked { .. }
@@ -164,7 +166,7 @@ async fn records_statistics() {
         .handle(query("good.com.", RecordType::A), local())
         .await;
 
-    let snap = engine.stats().snapshot(10);
+    let snap = engine.stats().snapshot(10, &engine.clients());
     assert_eq!(snap.total, 2);
     assert_eq!(snap.blocked, 1);
     assert!(snap.top_blocked_domains.iter().any(|t| t.name == "bad.com"));
