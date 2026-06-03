@@ -545,7 +545,7 @@ async fn phase3_concurrency(
     let mut msgs: Vec<Message> = Vec::with_capacity(total);
     for i in 0..total {
         let m = match i % 10 {
-            0 | 1 | 2 => query(&blocked[i % blocked.len()], RecordType::A),
+            0..=2 => query(&blocked[i % blocked.len()], RecordType::A),
             3..=7 => query(POPULAR[i % POPULAR.len()], RecordType::A),
             _ => query(&format!("c{i}-{}.bench-fwd.example", rand::random::<u32>()), RecordType::A),
         };
@@ -662,8 +662,7 @@ struct OldStats {
 
 impl OldStats {
     fn new() -> Self {
-        let mut inner = OldInner::default();
-        inner.latency_hist = vec![0; 11];
+        let inner = OldInner { latency_hist: vec![0; 11], ..Default::default() };
         Self { inner: parking_lot::Mutex::new(inner) }
     }
 
@@ -672,9 +671,8 @@ impl OldStats {
         let mut s = self.inner.lock();
         s.total += 1;
         let blocked = entry.is_blocked();
-        match entry.action {
-            QueryAction::Cached => s.cached += 1,
-            _ => {}
+        if entry.action == QueryAction::Cached {
+            s.cached += 1;
         }
         if blocked {
             s.blocked += 1;
