@@ -4,7 +4,6 @@
   import type {
     UpstreamStatDto,
     UpstreamsConfig,
-    UpstreamConfig,
     LatencyPercentilesDto,
   } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
@@ -14,15 +13,12 @@
   import type { ChartConfiguration } from "chart.js/auto";
 
   // The server always returns fully-populated config; treat it as required here.
-  type UpstreamsCfg = Required<UpstreamsConfig> & { servers: Required<UpstreamConfig>[] };
+  type UpstreamsCfg = Required<UpstreamsConfig>;
 
   let stats = $state<UpstreamStatDto[]>([]);
   let pct = $state<Record<string, LatencyPercentilesDto>>({});
   let cfg = $state<UpstreamsCfg | null>(null);
 
-  // Add form
-  let newSpec = $state("");
-  let newName = $state("");
   let testing = $state(false);
   let saving = $state(false);
 
@@ -60,24 +56,6 @@
     } finally {
       saving = false;
     }
-  }
-
-  async function addUpstream() {
-    if (!cfg || !newSpec.trim()) return;
-    cfg.servers.push({
-      spec: newSpec.trim(),
-      name: newName.trim() || null,
-      enabled: true,
-    } as Required<UpstreamConfig>);
-    newSpec = "";
-    newName = "";
-    await save();
-  }
-
-  function removeUpstream(i: number) {
-    if (!cfg) return;
-    cfg.servers.splice(i, 1);
-    save();
   }
 
   async function testSpec(spec: string) {
@@ -146,25 +124,14 @@
   <div class="card" style="margin-top:1rem">
     <h3 style="margin-top:0">Configured upstreams</h3>
     <p class="muted" style="margin-top:0">
-      Each query goes to the single fastest healthy upstream, failing over
-      sequentially — never fanned out in parallel. Supports plain DNS, <code>tls://</code>,
-      <code>https://…/dns-query</code>, and <code>quic://</code>.
+      One upstream per line. Each query goes to the single fastest healthy
+      upstream, failing over sequentially — never fanned out in parallel.
+      Supports plain DNS, <code>tls://</code>, <code>https://…/dns-query</code>,
+      and <code>quic://</code>. Lines starting with <code>#</code> are comments
+      (preserved on save) — handy for labelling or disabling an entry.
     </p>
-    {#each cfg.servers as u, i}
-      <div class="toolbar" style="margin-bottom:0.5rem">
-        <input bind:value={u.spec} style="flex:1" class="mono" />
-        <input bind:value={u.name} placeholder="name" style="max-width:160px" />
-        <label class="switch"><input type="checkbox" bind:checked={u.enabled} /><span class="slider"></span></label>
-        <button onclick={() => testSpec(u.spec)}>Test</button>
-        <button class="danger" onclick={() => removeUpstream(i)}>✕</button>
-      </div>
-    {/each}
-
-    <div class="toolbar">
-      <input placeholder="1.1.1.1 or https://dns.google/dns-query" bind:value={newSpec} style="flex:1" class="mono" />
-      <input placeholder="name (optional)" bind:value={newName} style="max-width:160px" />
-      <button onclick={addUpstream}>Add</button>
-    </div>
+    <textarea bind:value={cfg.servers} rows="8" class="mono" spellcheck="false"
+      placeholder={"# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one"}></textarea>
 
     <div class="grid cols-3" style="margin-top:1rem">
       <div class="field">
