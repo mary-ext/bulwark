@@ -50,7 +50,9 @@
     try {
       await ok(api.putUpstreams(cfg));
       toaster.show("Upstreams saved");
-      await loadStats();
+      // Reflect the server-normalized text (trimmed lines, collapsed blanks)
+      // back into the editor.
+      await Promise.all([loadCfg(), loadStats()]);
     } catch (e) {
       toaster.show(errMsg(e, "Save failed"), true);
     } finally {
