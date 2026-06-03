@@ -212,6 +212,11 @@
         <Badge tone={checkTone(checkResult.action)}>{checkResult.action}</Badge>
         {#if checkResult.rule}
           <div class="mono" style="margin-top:var(--sp-2)">{checkResult.rule}</div>
+          {#if checkResult.list_name}
+            <div class="muted" style="margin-top:var(--sp-1)">
+              from <strong>{checkResult.list_name}</strong>
+            </div>
+          {/if}
         {:else}
           <div class="muted" style="margin-top:var(--sp-2)">
             No matching rule — would be resolved normally.

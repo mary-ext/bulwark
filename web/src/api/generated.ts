@@ -147,6 +147,8 @@ export type CheckResponse = {
     action: string;
     /** The filter list responsible (absent for allow verdicts). */
     list_id?: number | null;
+    /** Friendly name of the responsible list (`Custom rules` for `list_id` 0). */
+    list_name?: string | null;
     /** The matching rule text, if any. */
     rule?: string | null;
 };

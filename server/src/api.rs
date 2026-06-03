@@ -738,6 +738,23 @@ pub struct CheckResponse {
     /// The filter list responsible (absent for allow verdicts).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_id: Option<u32>,
+    /// Friendly name of the responsible list (`Custom rules` for `list_id` 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_name: Option<String>,
+}
+
+/// Build the `list_id -> friendly name` map used to attribute a match to its
+/// source list. A block (or rewrite) is one winning rule from one list; id 0 is
+/// the user's own custom rules.
+fn list_names(cfg: &Config) -> std::collections::HashMap<u32, String> {
+    let mut m: std::collections::HashMap<u32, String> = cfg
+        .filtering
+        .lists
+        .iter()
+        .map(|l| (l.id, l.name.clone()))
+        .collect();
+    m.insert(0, "Custom rules".to_string());
+    m
 }
 
 #[utoipa::path(
@@ -759,22 +776,22 @@ pub async fn check_domain(
         .to_ascii_uppercase();
     let ci = ClientInfo::default();
     let verdict = filter.check(&domain, &qtype, &ci);
+    let names = list_names(&*state.config.read().await);
+    let attribute = |info: bulwark_filter::MatchInfo, action: &str| CheckResponse {
+        action: action.into(),
+        rule: Some(info.rule),
+        list_name: names.get(&info.list_id).cloned(),
+        list_id: Some(info.list_id),
+    };
     let resp = match verdict {
         Verdict::Allow { rule } => CheckResponse {
             action: "allow".into(),
             rule: rule.map(|r| r.rule),
             list_id: None,
+            list_name: None,
         },
-        Verdict::Block(info) => CheckResponse {
-            action: "block".into(),
-            rule: Some(info.rule),
-            list_id: Some(info.list_id),
-        },
-        Verdict::Rewrite { info, .. } => CheckResponse {
-            action: "rewrite".into(),
-            rule: Some(info.rule),
-            list_id: Some(info.list_id),
-        },
+        Verdict::Block(info) => attribute(info, "block"),
+        Verdict::Rewrite { info, .. } => attribute(info, "rewrite"),
     };
     Json(resp)
 }
@@ -907,19 +924,8 @@ pub async fn get_querylog(
         .query(&filter, q.offset, q.limit.min(1000), &clients);
 
     // Resolve list ids to friendly names so the UI can show which list (and
-    // which rule) was responsible. A block is one winning rule from one list;
-    // id 0 is the user's custom rules.
-    let names: std::collections::HashMap<u32, String> = {
-        let cfg = state.config.read().await;
-        let mut m: std::collections::HashMap<u32, String> = cfg
-            .filtering
-            .lists
-            .iter()
-            .map(|l| (l.id, l.name.clone()))
-            .collect();
-        m.insert(0, "Custom rules".to_string());
-        m
-    };
+    // which rule) was responsible.
+    let names = list_names(&*state.config.read().await);
     let entries: Vec<LogEntryView> = page
         .entries
         .into_iter()
