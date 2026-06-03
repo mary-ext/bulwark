@@ -123,6 +123,14 @@ impl DohTransport {
         for ip in ips {
             builder = builder.resolve(&host, SocketAddr::new(*ip, self.spec.port));
         }
+        // Additive test/benchmark trust anchors (feature-gated, absent from the
+        // shipped binary). Lets the DoH client trust a local mock's private CA.
+        #[cfg(feature = "test-trust-roots")]
+        for der in crate::tlsconf::test_roots::extra_roots() {
+            if let Ok(cert) = reqwest::Certificate::from_der(&der) {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
         builder
             .build()
             .map_err(|e| UpstreamError::Http(e.to_string()))
@@ -173,13 +181,13 @@ impl DohTransport {
 
         // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
-            return self.exchange(self.h3().await?, &body, original_id, false).await;
+            return self.exchange(self.h3().await?, &body, original_id, false, true).await;
         }
 
         // Auto-upgrade: prefer HTTP/3 while a fresh advertisement stands, but fall
         // back to h1/h2 (and forget the advertisement) if the h3 attempt fails.
         if self.h3_fresh() {
-            match self.exchange(self.h3().await?, &body, original_id, false).await {
+            match self.exchange(self.h3().await?, &body, original_id, false, true).await {
                 Ok(msg) => return Ok(msg),
                 Err(e) => {
                     self.learn_alt_svc(AltSvcH3::Clear);
@@ -189,23 +197,33 @@ impl DohTransport {
         }
 
         // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
-        self.exchange(self.h12().await?, &body, original_id, true).await
+        self.exchange(self.h12().await?, &body, original_id, true, false).await
     }
 
     /// Send one DoH request over `client`, optionally learning HTTP/3 availability
     /// from the response's `Alt-Svc` header.
+    ///
+    /// `http3` must be set when `client` is the HTTP/3 client: reqwest's
+    /// `http3_prior_knowledge()` still routes a request over TCP (h1/h2) unless
+    /// the request explicitly opts into `Version::HTTP_3`, so without this an
+    /// `h3://` upstream would silently never use QUIC.
     async fn exchange(
         &self,
         client: &reqwest::Client,
         body: &[u8],
         original_id: u16,
         learn_alt_svc: bool,
+        http3: bool,
     ) -> Result<Message> {
-        let resp = client
+        let mut req = client
             .post(&self.url)
             .header(reqwest::header::CONTENT_TYPE, DNS_MESSAGE)
             .header(reqwest::header::ACCEPT, DNS_MESSAGE)
-            .body(body.to_vec())
+            .body(body.to_vec());
+        if http3 {
+            req = req.version(reqwest::Version::HTTP_3);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| UpstreamError::Http(e.to_string()))?;

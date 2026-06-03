@@ -40,3 +40,24 @@ base64.workspace = true
 rand.workspace = true
 humantime.workspace = true
 mime_guess = "2"
+
+[dev-dependencies]
+# Enables the additive trust-root hook only for examples/tests/benches — NOT the
+# shipped binary (dev-dependencies are absent from a normal `cargo build`).
+bulwark-upstream = { workspace = true, features = ["test-trust-roots"] }
+# Self-signed cert generation for the mock upstreams in `bench_transports`.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# TLS / QUIC server sides of the mock upstreams.
+rustls.workspace = true
+rustls-pki-types.workspace = true
+tokio-rustls.workspace = true
+quinn.workspace = true
+# DoH (h1/h2) mock server.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+http-body-util = "0.1"
+http = "1"
+# DoH (HTTP/3) mock server.
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+bytes.workspace = true

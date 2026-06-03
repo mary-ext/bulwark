@@ -27,5 +27,8 @@ pub use pool::{
 pub use spec::{Host, TransportKind, UpstreamSpec};
 pub use transport::{QueryKey, Transport};
 
+#[cfg(feature = "test-trust-roots")]
+pub use tlsconf::test_roots::add_trust_root;
+
 #[cfg(test)]
 mod tests;
