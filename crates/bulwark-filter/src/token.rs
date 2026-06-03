@@ -32,11 +32,13 @@ fn fast_hash(s: &[u8]) -> u32 {
     h
 }
 
-/// Tokenize a concrete query name: every maximal alphanumeric run of length
-/// `>= MIN_TOKEN_LEN`. Returns de-duplicated token hashes.
-pub fn tokenize_query(name: &str) -> Vec<u32> {
+/// Tokenize a concrete query name into `tokens` (cleared first): every maximal
+/// alphanumeric run of length `>= MIN_TOKEN_LEN`, de-duplicated. Taking a caller
+/// buffer lets the query hot path reuse a thread-local scratch `Vec` instead of
+/// allocating on every lookup.
+pub fn tokenize_query_into(name: &str, tokens: &mut Vec<u32>) {
+    tokens.clear();
     let bytes = name.as_bytes();
-    let mut tokens = Vec::new();
     let mut start = None;
     for (i, &b) in bytes.iter().enumerate() {
         if is_token_char(b) {
@@ -44,14 +46,22 @@ pub fn tokenize_query(name: &str) -> Vec<u32> {
                 start = Some(i);
             }
         } else if let Some(s) = start.take() {
-            push_run(&mut tokens, &bytes[s..i]);
+            push_run(tokens, &bytes[s..i]);
         }
     }
     if let Some(s) = start {
-        push_run(&mut tokens, &bytes[s..]);
+        push_run(tokens, &bytes[s..]);
     }
     tokens.sort_unstable();
     tokens.dedup();
+}
+
+/// Tokenize a concrete query name: every maximal alphanumeric run of length
+/// `>= MIN_TOKEN_LEN`. Returns de-duplicated token hashes. Convenience wrapper
+/// over [`tokenize_query_into`] for callers that don't hold a scratch buffer.
+pub fn tokenize_query(name: &str) -> Vec<u32> {
+    let mut tokens = Vec::new();
+    tokenize_query_into(name, &mut tokens);
     tokens
 }
 

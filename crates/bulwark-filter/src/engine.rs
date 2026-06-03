@@ -10,6 +10,33 @@ use std::collections::HashMap;
 
 use crate::rule::{Action, ClientInfo, Pattern, RewriteData, Rule};
 
+/// A pass-through hasher for keys that are *already* well-distributed hashes.
+/// `scan_index` is keyed by FNV-1a token hashes (see [`crate::token`]), so
+/// running them through a general-purpose hasher again is wasted work on every
+/// probe; this just forwards the `u32`.
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl std::hash::Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = i as u64;
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        // The map only ever uses `u32` keys (which route through `write_u32`);
+        // this arm exists only to satisfy the trait.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+}
+
+type BuildIdentityHasher = std::hash::BuildHasherDefault<IdentityHasher>;
+
 /// Where a matching rule came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchInfo {
@@ -44,8 +71,9 @@ pub struct FilterEngine {
     /// domain -> rule ids (exact match only).
     exact: HashMap<String, Vec<u32>, ahash::RandomState>,
     /// Reverse index: token hash -> wildcard rule ids bucketed under that token.
-    /// Only queries sharing a token need check these rules.
-    scan_index: HashMap<u32, Vec<u32>, ahash::RandomState>,
+    /// Only queries sharing a token need check these rules. Keyed by an FNV token
+    /// hash, so it uses an identity hasher (no re-hashing on probe).
+    scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher>,
     /// Wildcard rules without a safe token + all regex rules: checked for every
     /// query (kept small in practice). `fallback_set` (a `RegexSet`) matches all
     /// of them in a single pass and reports *which* matched (preserving rule
@@ -73,9 +101,8 @@ impl FilterEngine {
         let mut subdomain: HashMap<String, Vec<u32>, ahash::RandomState> =
             HashMap::with_hasher(hasher.clone());
         let mut exact: HashMap<String, Vec<u32>, ahash::RandomState> =
-            HashMap::with_hasher(hasher.clone());
-        let mut scan_index: HashMap<u32, Vec<u32>, ahash::RandomState> =
             HashMap::with_hasher(hasher);
+        let mut scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher> = HashMap::default();
         let mut scan_fallback = Vec::new();
         let mut scan_rules: Vec<u32> = Vec::new();
 
@@ -191,13 +218,22 @@ impl FilterEngine {
             }
         }
         if !self.scan_index.is_empty() {
-            for tok in crate::token::tokenize_query(domain) {
-                if let Some(ids) = self.scan_index.get(&tok) {
-                    for &id in ids {
-                        check(id, out);
+            // Reuse a per-thread token buffer so the common query path doesn't
+            // allocate a fresh Vec on every lookup.
+            thread_local! {
+                static TOKENS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            TOKENS.with(|cell| {
+                let mut tokens = cell.borrow_mut();
+                crate::token::tokenize_query_into(domain, &mut tokens);
+                for &tok in tokens.iter() {
+                    if let Some(ids) = self.scan_index.get(&tok) {
+                        for &id in ids {
+                            check(id, out);
+                        }
                     }
                 }
-            }
+            });
         }
     }
 
