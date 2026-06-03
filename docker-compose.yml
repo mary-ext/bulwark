@@ -15,3 +15,11 @@ services:
 
 volumes:
   bulwark-data:
+
+networks:
+  # Dual-stack so upstreams can be reached over IPv6 (avoids the per-connection
+  # happy-eyeballs fallback to IPv4). Docker 27+ auto-assigns a ULA prefix and
+  # sets up IPv6 NAT, so egress works without extra host plumbing. If v6 egress
+  # is unavailable the DoH client still falls back to IPv4.
+  default:
+    enable_ipv6: true
