@@ -1,9 +1,12 @@
 <script lang="ts">
-  import { api, type FilterList } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { FilterListConfig, CheckResponse } from "../api/generated";
+  import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { num, relTime } from "../lib/format";
 
-  let lists = $state<FilterList[]>([]);
+  let lists = $state<Required<FilterListConfig>[]>([]);
   let customRules = $state("");
   let savingRules = $state(false);
 
@@ -15,15 +18,15 @@
   // Check tool
   let checkDomain = $state("");
   let checkType = $state("A");
-  let checkResult = $state<{ action: string; rule?: string } | null>(null);
+  let checkResult = $state<CheckResponse | null>(null);
 
   async function load() {
     try {
-      const f = await api.getFilters();
-      lists = f.lists;
+      const f = await ok(api.getFilters());
+      lists = f.lists as Required<FilterListConfig>[];
       customRules = f.custom_rules;
-    } catch (e: any) {
-      if (e.status !== 401) toaster.show("Failed to load filters", true);
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load filters", true);
     }
   }
 
@@ -36,48 +39,48 @@
     if (!newName.trim()) return;
     adding = true;
     try {
-      await api.addList({ name: newName, url: newUrl || undefined, enabled: true });
+      await ok(api.addList({ name: newName, url: newUrl || undefined, enabled: true }));
       toaster.show("List added");
       newName = "";
       newUrl = "";
       await load();
-    } catch (err: any) {
-      toaster.show(err.message ?? "Failed to add list", true);
+    } catch (err) {
+      toaster.show(errMsg(err, "Failed to add list"), true);
     } finally {
       adding = false;
     }
   }
 
-  async function toggleList(l: FilterList) {
-    await api.updateList(l.id, { enabled: !l.enabled });
+  async function toggleList(l: FilterListConfig) {
+    await ok(api.updateList(l.id, { enabled: !l.enabled }));
     await load();
   }
 
-  async function refresh(l: FilterList) {
+  async function refresh(l: FilterListConfig) {
     toaster.show(`Refreshing ${l.name}…`);
     try {
-      await api.refreshList(l.id);
+      await ok(api.refreshList(l.id));
       toaster.show("Refreshed");
       await load();
-    } catch (err: any) {
-      toaster.show(err.message ?? "Refresh failed", true);
+    } catch (err) {
+      toaster.show(errMsg(err, "Refresh failed"), true);
     }
   }
 
-  async function remove(l: FilterList) {
+  async function remove(l: FilterListConfig) {
     if (!confirm(`Delete list "${l.name}"?`)) return;
-    await api.deleteList(l.id);
+    await ok(api.deleteList(l.id));
     await load();
   }
 
   async function saveRules() {
     savingRules = true;
     try {
-      await api.putCustomRules(customRules);
+      await ok(api.putCustomRules({ rules: customRules }));
       toaster.show("Custom rules saved");
       await load();
-    } catch (err: any) {
-      toaster.show(err.message ?? "Failed to save", true);
+    } catch (err) {
+      toaster.show(errMsg(err, "Failed to save"), true);
     } finally {
       savingRules = false;
     }
@@ -85,9 +88,9 @@
 
   async function runCheck() {
     try {
-      checkResult = await api.checkDomain(checkDomain.trim(), checkType);
-    } catch (err: any) {
-      toaster.show(err.message ?? "Check failed", true);
+      checkResult = await ok(api.checkDomain({ domain: checkDomain.trim(), qtype: checkType }));
+    } catch (err) {
+      toaster.show(errMsg(err, "Check failed"), true);
     }
   }
 </script>

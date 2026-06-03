@@ -16,6 +16,13 @@ install:
 spec:
     cargo run -p bulwark --bin gen-openapi > web/openapi.json
 
+# Regenerate the typed API client (web/src/api/generated.ts) from the spec.
+gen:
+    cd web && pnpm gen
+
+# Regenerate the spec and the client it feeds. Run after changing the API.
+client: spec gen
+
 # Build the front-end bundle into web/dist (embedded by the Rust build).
 web:
     cd web && pnpm build
@@ -24,8 +31,8 @@ web:
 build:
     cargo build --release
 
-# Full release pipeline: build the UI, then the binary that embeds it.
-dist: web build
+# Full release pipeline: spec -> client codegen -> UI bundle -> embedding binary.
+dist: spec gen web build
 
 # Run the server (debug). Override binds for local, unprivileged testing.
 run:

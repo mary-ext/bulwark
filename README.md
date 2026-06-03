@@ -187,6 +187,31 @@ cargo fmt --all
 cd web && pnpm dev
 ```
 
+### API client (OpenAPI)
+
+The server describes its REST API with [`utoipa`](https://github.com/juhaku/utoipa)
+and emits an OpenAPI spec; the front-end's typed client
+(`web/src/api/generated.ts`) is generated from it with
+[`oazapfts`](https://github.com/oazapfts/oazapfts). Components call the generated
+functions directly and unwrap with the `ok()` helper:
+
+```ts
+import * as api from "../api/generated";
+import { ok } from "@oazapfts/runtime";
+
+const stats = await ok(api.getStats({ top: 10 }));
+```
+
+After changing any API handler or its request/response types, regenerate both
+the spec and the client:
+
+```sh
+just client     # = cargo run --bin gen-openapi > web/openapi.json && pnpm gen
+```
+
+Both `web/openapi.json` and the generated client are committed so the front-end
+builds without invoking Cargo.
+
 Network-dependent upstream tests are `#[ignore]`d by default:
 
 ```sh

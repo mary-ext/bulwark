@@ -1,15 +1,18 @@
 <script lang="ts">
-  import { api, type ClientCfg } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { ClientConfig } from "../api/generated";
+  import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
 
-  let clients = $state<ClientCfg[]>([]);
+  let clients = $state<Required<ClientConfig>[]>([]);
   let saving = $state(false);
 
   async function load() {
     try {
-      clients = await api.getClients();
-    } catch (e: any) {
-      if (e.status !== 401) toaster.show("Failed to load clients", true);
+      clients = (await ok(api.getClients())) as Required<ClientConfig>[];
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load clients", true);
     }
   }
 
@@ -32,11 +35,11 @@
       const cleaned = clients
         .filter((c) => c.name.trim() && c.ids.length)
         .map((c) => ({ ...c, name: c.name.trim() }));
-      await api.putClients(cleaned);
+      await ok(api.putClients(cleaned));
       clients = cleaned;
       toaster.show("Clients saved");
-    } catch (e: any) {
-      toaster.show(e.message ?? "Save failed", true);
+    } catch (e) {
+      toaster.show(errMsg(e, "Save failed"), true);
     } finally {
       saving = false;
     }

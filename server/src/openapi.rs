@@ -70,7 +70,6 @@ use crate::{api, dto};
         dto::LatencyPercentilesDto,
         dto::QueryLogResponse,
         dto::LogEntryView,
-        dto::ActionDto,
         dto::UpstreamStatDto,
         dto::TransportKindDto,
         // The public configuration contract.

@@ -1,9 +1,12 @@
 <script lang="ts">
-  import { api, type LogEntry } from "../lib/api";
+  import * as api from "../api/generated";
+  import { ok } from "@oazapfts/runtime";
+  import type { LogEntryView } from "../api/generated";
+  import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
   import { relTime, ms } from "../lib/format";
 
-  let entries = $state<LogEntry[]>([]);
+  let entries = $state<LogEntryView[]>([]);
   let total = $state(0);
   let search = $state("");
   let client = $state("");
@@ -15,17 +18,19 @@
 
   async function load() {
     try {
-      const r = await api.getQuerylog({
-        search: search || undefined,
-        client: client || undefined,
-        blocked_only: blockedOnly,
-        offset,
-        limit,
-      });
+      const r = await ok(
+        api.getQuerylog({
+          search: search || undefined,
+          client: client || undefined,
+          blockedOnly,
+          offset,
+          limit,
+        }),
+      );
       entries = r.entries;
       total = r.total;
-    } catch (e: any) {
-      if (e.status !== 401) toaster.show("Failed to load query log", true);
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load query log", true);
     }
   }
 
@@ -48,12 +53,12 @@
 
   async function clearLog() {
     if (!confirm("Clear the in-memory query log?")) return;
-    await api.clearQuerylog();
+    await ok(api.clearQuerylog());
     offset = 0;
     load();
   }
 
-  function badgeClass(e: LogEntry): string {
+  function badgeClass(e: LogEntryView): string {
     if (e.action === "blocked") return "block";
     return e.action;
   }
@@ -63,16 +68,16 @@
   }
 
   // Match AdGuard Home: allow => @@||host^$important, block => ||host^$important.
-  async function addRule(e: LogEntry, allow: boolean) {
+  async function addRule(e: LogEntryView, allow: boolean) {
     menuFor = null;
     const domain = bareDomain(e.question);
     const rule = `${allow ? "@@" : ""}||${domain}^$important`;
     try {
-      const r = await api.addRule(rule);
+      const r = await ok(api.addCustomRule({ rule }));
       toaster.show(r.added ? `Added: ${rule}` : `Already present: ${rule}`);
       load();
-    } catch (err: any) {
-      toaster.show(err.message ?? "Failed to add rule", true);
+    } catch (err) {
+      toaster.show(errMsg(err, "Failed to add rule"), true);
     }
   }
 

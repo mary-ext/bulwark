@@ -7,16 +7,21 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "gen": "oazapfts openapi.json src/api/generated.ts",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
   "dependencies": {
+    "@oazapfts/runtime": "^1.2.0",
     "chart.js": "^4.4.7"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "oazapfts": "^7.5.0",
     "svelte": "^5.19.0",
     "svelte-check": "^4.1.4",
     "typescript": "^5.7.3",

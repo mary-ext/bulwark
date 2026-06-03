@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::app::{apply_config, write_list_text, AppState};
-use crate::dto::{LogEntryView, QueryLogResponse, StatsResponse, UpstreamStatDto};
 use crate::auth::{hash_password, verify_password, SESSION_COOKIE};
+use crate::dto::{LogEntryView, QueryLogResponse, StatsResponse, UpstreamStatDto};
 
 /// API error type that renders as a JSON `{ "error": ... }` body.
 pub enum ApiError {

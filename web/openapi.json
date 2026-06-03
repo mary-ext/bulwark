@@ -1063,105 +1063,6 @@
   },
   "components": {
     "schemas": {
-      "ActionDto": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "upstream",
-              "action"
-            ],
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "forwarded"
-                ]
-              },
-              "upstream": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "action"
-            ],
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "cached"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "rule",
-              "list_id",
-              "action"
-            ],
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "blocked"
-                ]
-              },
-              "list_id": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "rule": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "rule",
-              "list_id",
-              "action"
-            ],
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "rewritten"
-                ]
-              },
-              "list_id": {
-                "type": "integer",
-                "format": "int32",
-                "minimum": 0
-              },
-              "rule": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "action"
-            ],
-            "properties": {
-              "action": {
-                "type": "string",
-                "enum": [
-                  "error"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "The outcome of a logged query. Serialized flat (`{ \"action\": \"...\", ... }`)\nto match the on-the-wire shape of `bulwark_engine::querylog::QueryAction`."
-      },
       "AddListResponse": {
         "type": "object",
         "description": "Result of creating a filter list.",
@@ -1599,78 +1500,99 @@
         }
       },
       "LogEntryView": {
-        "allOf": [
-          {
-            "$ref": "#/components/schemas/ActionDto"
-          },
-          {
-            "type": "object",
-            "required": [
-              "id",
-              "time_ms",
-              "client_ip",
-              "question",
-              "qtype",
-              "allowlisted",
-              "rcode",
-              "answers",
-              "elapsed_ms"
-            ],
-            "properties": {
-              "allowlisted": {
-                "type": "boolean",
-                "description": "True if an `@@` exception allowed an otherwise-blocked query."
-              },
-              "answers": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                },
-                "description": "Short summary of answer records (e.g. `[\"A 1.2.3.4\"]`)."
-              },
-              "client_ip": {
-                "type": "string"
-              },
-              "client_name": {
-                "type": [
-                  "string",
-                  "null"
-                ]
-              },
-              "elapsed_ms": {
-                "type": "number",
-                "format": "double"
-              },
-              "id": {
-                "type": "integer",
-                "format": "int64",
-                "minimum": 0
-              },
-              "list_name": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "description": "Friendly name of the filter list responsible (absent unless the query was\nblocked or rewritten by a known list; id 0 is the user's custom rules)."
-              },
-              "qtype": {
-                "type": "string"
-              },
-              "question": {
-                "type": "string"
-              },
-              "rcode": {
-                "type": "string"
-              },
-              "time_ms": {
-                "type": "integer",
-                "format": "int64",
-                "description": "Unix epoch milliseconds."
-              }
-            }
-          }
+        "type": "object",
+        "description": "A query-log entry, flattened for the UI, plus the resolved filter-list name.\n\nThe internal `QueryAction` is an internally-tagged enum; here it is splayed\ninto a plain `action` discriminator string and a few optional fields so the\ngenerated TypeScript type is a single flat row (rather than a discriminated\nunion) that the query-log table can consume directly.",
+        "required": [
+          "id",
+          "time_ms",
+          "client_ip",
+          "question",
+          "qtype",
+          "action",
+          "allowlisted",
+          "rcode",
+          "answers",
+          "elapsed_ms"
         ],
-        "description": "A query-log entry plus the resolved filter-list name."
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "One of `forwarded`, `cached`, `blocked`, `rewritten`, or `error`."
+          },
+          "allowlisted": {
+            "type": "boolean",
+            "description": "True if an `@@` exception allowed an otherwise-blocked query."
+          },
+          "answers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Short summary of answer records (e.g. `[\"A 1.2.3.4\"]`)."
+          },
+          "client_ip": {
+            "type": "string"
+          },
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "elapsed_ms": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "list_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Filter list id responsible (blocked/rewritten queries only).",
+            "minimum": 0
+          },
+          "list_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Friendly name of the filter list responsible (absent unless the query was\nblocked or rewritten by a known list; id 0 is the user's custom rules)."
+          },
+          "qtype": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          },
+          "rcode": {
+            "type": "string"
+          },
+          "rule": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Matching rule text (blocked/rewritten queries only)."
+          },
+          "time_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix epoch milliseconds."
+          },
+          "upstream": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Upstream that answered (forwarded queries only)."
+          }
+        }
       },
       "NewList": {
         "type": "object",

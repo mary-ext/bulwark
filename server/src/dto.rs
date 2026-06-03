@@ -137,31 +137,12 @@ impl StatsResponse {
 // Query log
 // ---------------------------------------------------------------------------
 
-/// The outcome of a logged query. Serialized flat (`{ "action": "...", ... }`)
-/// to match the on-the-wire shape of `bulwark_engine::querylog::QueryAction`.
-#[derive(Serialize, ToSchema)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum ActionDto {
-    Forwarded { upstream: String },
-    Cached,
-    Blocked { rule: String, list_id: u32 },
-    Rewritten { rule: String, list_id: u32 },
-    Error,
-}
-
-impl From<QueryAction> for ActionDto {
-    fn from(a: QueryAction) -> Self {
-        match a {
-            QueryAction::Forwarded { upstream } => ActionDto::Forwarded { upstream },
-            QueryAction::Cached => ActionDto::Cached,
-            QueryAction::Blocked { rule, list_id } => ActionDto::Blocked { rule, list_id },
-            QueryAction::Rewritten { rule, list_id } => ActionDto::Rewritten { rule, list_id },
-            QueryAction::Error => ActionDto::Error,
-        }
-    }
-}
-
-/// A query-log entry plus the resolved filter-list name.
+/// A query-log entry, flattened for the UI, plus the resolved filter-list name.
+///
+/// The internal `QueryAction` is an internally-tagged enum; here it is splayed
+/// into a plain `action` discriminator string and a few optional fields so the
+/// generated TypeScript type is a single flat row (rather than a discriminated
+/// union) that the query-log table can consume directly.
 #[derive(Serialize, ToSchema)]
 pub struct LogEntryView {
     pub id: u64,
@@ -171,8 +152,17 @@ pub struct LogEntryView {
     pub client_name: Option<String>,
     pub question: String,
     pub qtype: String,
-    #[serde(flatten)]
-    pub action: ActionDto,
+    /// One of `forwarded`, `cached`, `blocked`, `rewritten`, or `error`.
+    pub action: String,
+    /// Upstream that answered (forwarded queries only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
+    /// Matching rule text (blocked/rewritten queries only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// Filter list id responsible (blocked/rewritten queries only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_id: Option<u32>,
     /// True if an `@@` exception allowed an otherwise-blocked query.
     pub allowlisted: bool,
     pub rcode: String,
@@ -187,6 +177,15 @@ pub struct LogEntryView {
 
 impl LogEntryView {
     pub fn new(e: QueryLogEntry, list_name: Option<String>) -> Self {
+        let (action, upstream, rule, list_id) = match e.action {
+            QueryAction::Forwarded { upstream } => ("forwarded", Some(upstream), None, None),
+            QueryAction::Cached => ("cached", None, None, None),
+            QueryAction::Blocked { rule, list_id } => ("blocked", None, Some(rule), Some(list_id)),
+            QueryAction::Rewritten { rule, list_id } => {
+                ("rewritten", None, Some(rule), Some(list_id))
+            }
+            QueryAction::Error => ("error", None, None, None),
+        };
         Self {
             id: e.id,
             time_ms: e.time_ms,
@@ -194,7 +193,10 @@ impl LogEntryView {
             client_name: e.client_name,
             question: e.question,
             qtype: e.qtype,
-            action: e.action.into(),
+            action: action.to_string(),
+            upstream,
+            rule,
+            list_id,
             allowlisted: e.allowlisted,
             rcode: e.rcode,
             answers: e.answers,
