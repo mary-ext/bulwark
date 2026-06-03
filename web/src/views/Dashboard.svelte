@@ -8,6 +8,7 @@
   import Icon from "../components/Icon.svelte";
   import StatCard from "../components/StatCard.svelte";
   import RankedList from "../components/RankedList.svelte";
+  import UpstreamRanked from "../components/UpstreamRanked.svelte";
 
   let stats = $state<StatsResponse | null>(null);
   let loading = $state(false);
@@ -84,7 +85,23 @@
       <div class="card-title">Top clients</div>
       <RankedList items={stats.top_clients} total={stats.total} color="var(--chart-3)" />
     </div>
+    <div class="card">
+      <div class="card-title">Top upstreams</div>
+      <p class="up-hint muted">Sorted by median latency · bar shows query share</p>
+      <UpstreamRanked
+        upstreams={stats.top_upstreams}
+        pct={stats.upstream_latency_pct}
+        color="var(--chart-4)"
+      />
+    </div>
   </div>
 {:else}
   <p class="muted">Loading…</p>
 {/if}
+
+<style>
+  .up-hint {
+    margin: -2px 0 var(--sp-3);
+    font-size: 0.74rem;
+  }
+</style>
