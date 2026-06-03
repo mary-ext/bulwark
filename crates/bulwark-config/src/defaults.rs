@@ -2,7 +2,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::{UpstreamConfig, UpstreamsConfig};
+use crate::UpstreamsConfig;
 
 pub(crate) fn one() -> u32 {
     1
@@ -28,19 +28,8 @@ pub(crate) fn default_http_bind() -> SocketAddr {
     "0.0.0.0:3000".parse().unwrap()
 }
 
-pub(crate) fn default_upstreams() -> Vec<UpstreamConfig> {
-    vec![
-        UpstreamConfig {
-            spec: "https://dns.quad9.net/dns-query".into(),
-            name: Some("Quad9 (DoH)".into()),
-            enabled: true,
-        },
-        UpstreamConfig {
-            spec: "1.1.1.1".into(),
-            name: Some("Cloudflare".into()),
-            enabled: true,
-        },
-    ]
+pub(crate) fn default_upstreams() -> String {
+    "# Quad9 (DoH)\nhttps://dns.quad9.net/dns-query\n# Cloudflare\n1.1.1.1\n".into()
 }
 
 pub(crate) fn default_bootstrap() -> Vec<SocketAddr> {

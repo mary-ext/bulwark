@@ -81,12 +81,10 @@ pub fn compile_filters(
 pub async fn build_pool(cfg: &Config) -> anyhow::Result<UpstreamPool> {
     let entries: Vec<PoolEntry> = cfg
         .upstreams
-        .servers
-        .iter()
-        .filter(|u| u.enabled)
-        .map(|u| PoolEntry {
-            spec: u.spec.clone(),
-            name: u.name.clone(),
+        .active_specs()
+        .map(|spec| PoolEntry {
+            spec: spec.to_string(),
+            name: None,
         })
         .collect();
     let settings = PoolSettings {

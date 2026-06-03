@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 mod defaults;
 use defaults::*;
@@ -94,20 +94,13 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct UpstreamConfig {
-    /// Spec string, e.g. `1.1.1.1`, `tls://dns.google`, `https://.../dns-query`.
-    pub spec: String,
-    /// Optional friendly name for the UI.
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default = "btrue")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpstreamsConfig {
-    #[serde(default = "default_upstreams")]
-    pub servers: Vec<UpstreamConfig>,
+    /// Freeform upstream list: one spec per line. Lines starting with `#` are
+    /// comments and blank lines are ignored — both are preserved verbatim so
+    /// you can annotate and toggle entries by commenting them out. e.g.
+    /// `https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`.
+    #[serde(default = "default_upstreams", deserialize_with = "de_upstreams")]
+    pub servers: String,
     /// Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames.
     #[serde(default = "default_bootstrap")]
     #[schema(value_type = Vec<String>)]
@@ -129,6 +122,32 @@ impl Default for UpstreamsConfig {
             probe_interval_secs: 60,
         }
     }
+}
+
+impl UpstreamsConfig {
+    /// The active upstream specs: non-blank lines that aren't comments (`#`),
+    /// trimmed. Comment and blank lines in [`servers`](Self::servers) are
+    /// ignored here but preserved on disk.
+    pub fn active_specs(&self) -> impl Iterator<Item = &str> {
+        self.servers
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    }
+}
+
+/// Deserialize the freeform upstream list leniently: accept a string as-is, and
+/// fall back to the default for anything else (e.g. a config written by an older
+/// build that stored a structured list). This keeps one stale field from failing
+/// the whole config load — only the upstreams reset.
+fn de_upstreams<'de, D>(de: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match serde_yaml::Value::deserialize(de)? {
+        serde_yaml::Value::String(s) => s,
+        _ => default_upstreams(),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -361,13 +380,12 @@ impl Config {
                 self.cache.min_ttl_secs, self.cache.max_ttl_secs
             )));
         }
-        // Validate upstream specs early so misconfig is caught on save.
-        for u in &self.upstreams.servers {
-            if u.spec.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "upstream spec must not be empty".into(),
-                ));
-            }
+        // Require at least one active (non-comment) upstream spec so we never
+        // silently end up with nothing to resolve against.
+        if self.upstreams.active_specs().next().is_none() {
+            return Err(ConfigError::Invalid(
+                "at least one upstream must be configured".into(),
+            ));
         }
         Ok(())
     }
@@ -430,5 +448,41 @@ mod tests {
     fn missing_file_is_default() {
         let cfg = Config::load_or_default("/nonexistent/path/to/config.yaml").unwrap();
         assert_eq!(cfg.version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn active_specs_skips_comments_and_blanks() {
+        let mut cfg = UpstreamsConfig::default();
+        cfg.servers = "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n\n#tls://one.one.one.one\n  1.1.1.1  \n".into();
+        let specs: Vec<&str> = cfg.active_specs().collect();
+        assert_eq!(specs, ["https://cloudflare-dns.com/dns-query", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn freeform_upstreams_preserve_comments_across_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let mut cfg = Config::default();
+        cfg.upstreams.servers = "# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one\n".into();
+        cfg.save(&path).unwrap();
+        let loaded = Config::load_or_default(&path).unwrap();
+        assert_eq!(loaded.upstreams.servers, cfg.upstreams.servers);
+    }
+
+    #[test]
+    fn all_comments_fails_validation() {
+        let mut cfg = Config::default();
+        cfg.upstreams.servers = "# everything is off\n#1.1.1.1\n".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_structured_servers_reset_without_breaking_load() {
+        // A config from an older build stored `servers` as a structured list.
+        // It must not fail the whole load — only the upstreams reset.
+        let yaml = "version: 1\ncache:\n  size: 1234\nupstreams:\n  servers:\n    - spec: 1.1.1.1\n      name: Cloudflare\n      enabled: true\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.cache.size, 1234);
+        assert_eq!(cfg.upstreams.servers, default_upstreams());
     }
 }

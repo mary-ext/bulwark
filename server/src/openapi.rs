@@ -75,7 +75,6 @@ use crate::{api, dto};
         // The public configuration contract.
         bulwark_config::Config,
         bulwark_config::ServerConfig,
-        bulwark_config::UpstreamConfig,
         bulwark_config::UpstreamsConfig,
         bulwark_config::CacheConfig,
         bulwark_config::BlockingMode,
