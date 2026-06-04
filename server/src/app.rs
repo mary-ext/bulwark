@@ -58,6 +58,21 @@ pub struct AppState {
     /// Disk-backed query-log store, read by the API and written by the
     /// background writer task.
     pub store: Arc<crate::store::QueryStore>,
+    /// Serializes config read-modify-write updates. Held across a handler's
+    /// clone → mutate → [`apply_config`] sequence so concurrent edits can't lose
+    /// each other's writes or allocate the same list id twice.
+    pub update_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl AppState {
+    /// Begin a serialized config update: take the update lock, then clone the
+    /// current config to mutate. Hold the returned guard until [`apply_config`]
+    /// completes — the whole read-modify-write must happen under it.
+    pub async fn begin_update(&self) -> (Config, tokio::sync::OwnedMutexGuard<()>) {
+        let guard = self.update_lock.clone().lock_owned().await;
+        let cfg = self.config.read().await.clone();
+        (cfg, guard)
+    }
 }
 
 /// Read a filter list's stored text (empty if it doesn't exist yet).
@@ -163,8 +178,13 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         }
     }
 
-    // Rebuild the hot-swappable engine state.
+    // Build the new engine state first (this can fail on a bad upstream/filter),
+    // then persist to disk BEFORE swapping any live state. If the save fails we
+    // return the error with the running engine and stored config untouched, so a
+    // disk problem can't leave the engine running a config the API reported as
+    // failed (and that isn't on disk for the next restart).
     let engine_state = build_engine_state(&new_cfg, &state.paths).await?;
+    new_cfg.save(&state.paths.config).context("saving config")?;
     state.engine.swap_state(engine_state);
 
     // Reconfigure persistent components.
@@ -188,7 +208,6 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         new_cfg.privacy.anonymize_client_ips,
     );
 
-    new_cfg.save(&state.paths.config).context("saving config")?;
     *state.config.write().await = new_cfg;
     Ok(())
 }
@@ -199,8 +218,22 @@ pub fn ensure_dirs(paths: &Paths) -> anyhow::Result<()> {
         .with_context(|| format!("creating data dir {}", paths.data_dir.display()))?;
     std::fs::create_dir_all(&paths.lists_dir)
         .with_context(|| format!("creating lists dir {}", paths.lists_dir.display()))?;
+    // The data dir holds the admin password hash (config), browsing history
+    // (query log), and the DNS cache — restrict it to the owner so other local
+    // users can't read any of it. 0700 on the dir protects every file within.
+    restrict_to_owner(&paths.data_dir);
+    restrict_to_owner(&paths.lists_dir);
     Ok(())
 }
+
+/// Set `0700` (owner-only) on a directory. No-op on non-Unix; best-effort.
+#[cfg(unix)]
+fn restrict_to_owner(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &std::path::Path) {}
 
 /// Resolve an env-or-default socket override, for testing on non-privileged
 /// ports without editing config.

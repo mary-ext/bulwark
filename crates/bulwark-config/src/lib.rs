@@ -412,6 +412,14 @@ impl Config {
         let yaml = serde_yaml::to_string(self)?;
         let tmp = path.with_extension("yaml.tmp");
         std::fs::write(&tmp, yaml.as_bytes())?;
+        // The config holds the admin password hash, so keep it owner-only. Set
+        // perms on the temp file before the atomic rename so the final file is
+        // never briefly world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, path)?;
         Ok(())
     }

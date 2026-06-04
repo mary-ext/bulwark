@@ -208,7 +208,7 @@ pub async fn setup(
         ));
     }
     let hash = hash_password(&creds.password).map_err(internal)?;
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.auth.username = creds.username;
     cfg.auth.password_hash = Some(hash);
     apply_config(&state, cfg).await.map_err(internal)?;
@@ -284,7 +284,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
     )
 )]
 pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.auth.password_hash = None;
     Json(cfg)
 }
@@ -300,7 +300,7 @@ pub async fn put_upstreams(
     State(state): State<AppState>,
     Json(body): Json<UpstreamsConfig>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.upstreams = body;
     apply_config(&state, cfg)
         .await
@@ -319,7 +319,7 @@ pub async fn put_cache(
     State(state): State<AppState>,
     Json(body): Json<CacheConfig>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.cache = body;
     apply_config(&state, cfg)
         .await
@@ -351,7 +351,7 @@ pub async fn put_filtering(
     State(state): State<AppState>,
     Json(body): Json<FilteringSettings>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.filtering.enabled = body.enabled;
     cfg.filtering.blocking_mode = body.blocking_mode;
     cfg.filtering.custom_block_ipv4 = body.custom_block_ipv4;
@@ -381,7 +381,7 @@ pub async fn put_server(
     State(state): State<AppState>,
     Json(body): Json<ServerConfig>,
 ) -> ApiResult<Json<ServerUpdateResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.server = body;
     apply_config(&state, cfg)
         .await
@@ -404,7 +404,7 @@ pub async fn put_querylog(
     State(state): State<AppState>,
     Json(body): Json<QueryLogConfig>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.query_log = body;
     apply_config(&state, cfg)
         .await
@@ -423,7 +423,7 @@ pub async fn put_stats_cfg(
     State(state): State<AppState>,
     Json(body): Json<StatsConfig>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.stats = body;
     apply_config(&state, cfg)
         .await
@@ -442,7 +442,7 @@ pub async fn put_privacy(
     State(state): State<AppState>,
     Json(body): Json<PrivacyConfig>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.privacy = body;
     apply_config(&state, cfg)
         .await
@@ -495,7 +495,7 @@ pub async fn put_custom_rules(
     State(state): State<AppState>,
     Json(body): Json<CustomRules>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     cfg.filtering.custom_rules = body.rules;
     apply_config(&state, cfg)
         .await
@@ -535,7 +535,7 @@ pub async fn add_custom_rule(
     if rule.is_empty() {
         return Err(ApiError::BadRequest("empty rule".into()));
     }
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     // Idempotent: don't append a rule that's already present as a line.
     let already = cfg.filtering.custom_rules.lines().any(|l| l.trim() == rule);
     if !already {
@@ -613,17 +613,19 @@ pub async fn add_list(
     State(state): State<AppState>,
     Json(body): Json<NewList>,
 ) -> ApiResult<Json<AddListResponse>> {
-    let id = state.config.read().await.next_list_id();
-
-    // Obtain the list content (remote or inline).
+    // Obtain the list content (remote or inline) before taking the update lock —
+    // a remote fetch can be slow and must not serialize other config updates.
     let text = if let Some(url) = &body.url {
         fetch_list(url).await?
     } else {
         body.content.clone().unwrap_or_default()
     };
-    write_list_text(&state.paths, id, &text).map_err(internal)?;
 
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
+    // Allocate the id under the update lock so two concurrent adds can't collide
+    // on the same id (and clobber each other's list file).
+    let id = cfg.next_list_id();
+    write_list_text(&state.paths, id, &text).map_err(internal)?;
     cfg.filtering.lists.push(FilterListConfig {
         id,
         name: body.name,
@@ -658,7 +660,7 @@ pub async fn update_list(
     Path(id): Path<u32>,
     Json(body): Json<ListUpdate>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     let list = cfg
         .filtering
         .lists
@@ -691,7 +693,7 @@ pub async fn delete_list(
     State(state): State<AppState>,
     Path(id): Path<u32>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     let before = cfg.filtering.lists.len();
     cfg.filtering.lists.retain(|l| l.id != id);
     if cfg.filtering.lists.len() == before {
@@ -731,7 +733,7 @@ pub async fn refresh_list(
     let text = fetch_list(&url).await?;
     write_list_text(&state.paths, id, &text).map_err(internal)?;
 
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     if let Some(list) = cfg.filtering.lists.iter_mut().find(|l| l.id == id) {
         list.last_updated = Some(now_ms());
     }
@@ -870,7 +872,7 @@ pub async fn post_client(
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("client name must not be empty".into()));
     }
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     let client = ClientConfig {
         id: new_client_id(&cfg.clients),
         name: body.name,
@@ -905,7 +907,7 @@ pub async fn put_client(
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("client name must not be empty".into()));
     }
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     let client = cfg
         .clients
         .iter_mut()
@@ -932,7 +934,7 @@ pub async fn delete_client(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<OkResponse>> {
-    let mut cfg = state.config.read().await.clone();
+    let (mut cfg, _update) = state.begin_update().await;
     let before = cfg.clients.len();
     cfg.clients.retain(|c| c.id != id);
     if cfg.clients.len() == before {

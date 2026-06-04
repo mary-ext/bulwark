@@ -69,6 +69,7 @@ async fn main() -> anyhow::Result<()> {
         paths: paths.clone(),
         sessions: Arc::new(auth::Sessions::new(Duration::from_secs(7 * 24 * 3600))),
         store: store.clone(),
+        update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     // Background tasks.
