@@ -803,6 +803,72 @@ fn phase2c_finalize_components() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2d: query-log build + push cost at steady state (deterministic).
+//
+// Isolates exactly the per-query log work — constructing a QueryLogEntry (its
+// string allocations) and pushing it into a *pre-filled* ring (so every push
+// evicts + frees one entry, the real production steady state). Measuring against
+// a pre-filled log avoids the VecDeque growth reallocs that inflate the
+// whole-chain Phase 2b number on a fresh engine. Same-run A/B, so it is immune
+// to the cross-run thermal drift that makes Phase 2 means hard to compare.
+// ---------------------------------------------------------------------------
+
+fn phase2d_log_microbench() {
+    println!("\n== Phase 2d: query-log build + push, steady state (best-of-5) ==");
+    let n = 200_000usize;
+
+    // A representative cached A response: one answer record.
+    let name = Name::from_str("cache-hot.example.").unwrap();
+    let recs = vec![Record::from_rdata(
+        name.clone(),
+        300,
+        RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+    )];
+    let ip: IpAddr = "192.168.1.50".parse().unwrap();
+
+    // Build a fresh entry exactly as `finalize()` + `LogBuilder::build()` do:
+    // client-IP string, the question string, and the formatted answer summaries
+    // are the allocations of interest.
+    let make_entry = || QueryLogEntry {
+        id: 0,
+        time_ms: 1_700_000_000_000,
+        client_ip: ip.to_string(),
+        question: "cache-hot.example.".to_string(),
+        qtype: std::borrow::Cow::Borrowed("A"),
+        action: QueryAction::Cached,
+        allowlisted: false,
+        rcode: std::borrow::Cow::Borrowed("NOERROR"),
+        answers: recs
+            .iter()
+            .map(|r| format!("{} {}", r.record_type(), r.data))
+            .collect(),
+        elapsed_ms: 0.5,
+    };
+
+    // (a) Build the entry only (allocations, no insert).
+    let build = best_ns_per_op(5, n, |_| {
+        let e = make_entry();
+        e.client_ip.len() + e.question.len() + e.answers.iter().map(|s| s.len()).sum::<usize>()
+    });
+
+    // (b) Build + push into a ring pre-filled to capacity (steady-state evict).
+    let log = QueryLog::new(10_000, true);
+    for _ in 0..12_000 {
+        log.push(make_entry());
+    }
+    let buildpush = best_ns_per_op(5, n, |_| {
+        log.push(make_entry());
+        0
+    });
+
+    println!("  build entry only            {build:>4} ns/op");
+    println!(
+        "  build + push (steady state) {buildpush:>4} ns/op   (push+evict alone ~{} ns)",
+        buildpush.saturating_sub(build)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3: concurrent throughput + single-flight.
 // ---------------------------------------------------------------------------
 
@@ -1193,6 +1259,7 @@ async fn main() {
     phase2_scenarios(filter.clone(), &blocked, upstream, n).await;
     phase2b_finalize(filter.clone(), upstream, n).await;
     phase2c_finalize_components();
+    phase2d_log_microbench();
     phase3_concurrency(
         filter.clone(),
         &blocked,
