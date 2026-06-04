@@ -14,8 +14,11 @@
   import Field from "../components/Field.svelte";
   import Select from "../components/Select.svelte";
   import SwitchRow from "../components/SwitchRow.svelte";
+  import ConfirmDialog from "../components/ConfirmDialog.svelte";
 
   let loaded = $state(false);
+  let confirmClearLog = $state(false);
+  let confirmResetStats = $state(false);
 
   let filtering = $state({
     enabled: true,
@@ -56,6 +59,14 @@
     } catch (e) {
       toaster.show(errMsg(e, "Save failed"), true);
     }
+  }
+
+  function clearLog() {
+    run(() => ok(api.clearQuerylog()), "Query log cleared");
+  }
+
+  function resetStats() {
+    run(() => ok(api.resetStats()), "Statistics cleared");
   }
 
   const blockingModes: { value: BlockingMode; label: string }[] = [
@@ -165,12 +176,15 @@
               <input id="q-retention" type="number" min="0" bind:value={querylog.retention_days} />
             </Field>
           </div>
-          <div>
+          <div class="btn-row">
             <button
               class="btn btn-primary"
               onclick={() => querylog && run(() => ok(api.putQuerylog(querylog!)), "Query log saved")}
             >
               Save
+            </button>
+            <button class="btn btn-danger" onclick={() => (confirmClearLog = true)}>
+              Clear log
             </button>
           </div>
         </div>
@@ -191,12 +205,15 @@
           >
             <input id="s-retention" type="number" min="1" bind:value={stats.retention_days} />
           </Field>
-          <div>
+          <div class="btn-row">
             <button
               class="btn btn-primary"
               onclick={() => stats && run(() => ok(api.putStatsCfg(stats!)), "Statistics saved")}
             >
               Save
+            </button>
+            <button class="btn btn-danger" onclick={() => (confirmResetStats = true)}>
+              Clear statistics
             </button>
           </div>
         </div>
@@ -245,3 +262,28 @@
 {:else}
   <p class="muted">Loading…</p>
 {/if}
+
+<ConfirmDialog
+  bind:open={confirmClearLog}
+  title="Clear query log?"
+  message="This empties the in-memory query log. Persisted history on disk is not affected."
+  confirmLabel="Clear log"
+  danger
+  onConfirm={clearLog}
+/>
+
+<ConfirmDialog
+  bind:open={confirmResetStats}
+  title="Clear statistics?"
+  message="This resets all collected statistics counters and top-domain tallies. This cannot be undone."
+  confirmLabel="Clear statistics"
+  danger
+  onConfirm={resetStats}
+/>
+
+<style>
+  .btn-row {
+    display: flex;
+    gap: var(--sp-3);
+  }
+</style>

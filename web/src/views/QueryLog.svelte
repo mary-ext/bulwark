@@ -11,7 +11,6 @@
   import Badge from "../components/Badge.svelte";
   import Switch from "../components/Switch.svelte";
   import Sheet from "../components/Sheet.svelte";
-  import ConfirmDialog from "../components/ConfirmDialog.svelte";
   import Pagination from "../components/Pagination.svelte";
   import ResponsiveTable from "../components/ResponsiveTable.svelte";
 
@@ -27,7 +26,6 @@
   let loading = $state(false);
   let detail = $state<LogEntryView | null>(null);
   let sheetOpen = $state(false);
-  let confirmClear = $state(false);
 
   async function load() {
     loading = true;
@@ -67,12 +65,6 @@
     }, 4000);
     return () => clearInterval(t);
   });
-
-  async function clearLog() {
-    await ok(api.clearQuerylog());
-    offset = 0;
-    load();
-  }
 
   function bareDomain(question: string): string {
     return question.replace(/\.$/, "");
@@ -164,9 +156,6 @@
   <span class="spacer"></span>
   <button class="btn btn-sm" onclick={load} disabled={loading || live} title={live ? "Auto-refreshing while Live is on" : "Refresh"}>
     <Icon name="refresh" size={15} /> Refresh
-  </button>
-  <button class="btn btn-sm btn-danger" onclick={() => (confirmClear = true)}>
-    <Icon name="trash" size={15} /> Clear log
   </button>
 </div>
 
@@ -308,15 +297,6 @@
     </div>
   {/if}
 </Sheet>
-
-<ConfirmDialog
-  bind:open={confirmClear}
-  title="Clear query log?"
-  message="This empties the in-memory query log. Persisted history on disk is not affected."
-  confirmLabel="Clear log"
-  danger
-  onConfirm={clearLog}
-/>
 
 <style>
   .search-field {
