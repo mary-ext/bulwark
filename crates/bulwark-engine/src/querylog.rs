@@ -57,6 +57,25 @@ pub struct QueryLogEntry {
 }
 
 impl QueryLogEntry {
+    /// An empty entry whose heap buffers can be filled in place. Used as the
+    /// starting point when no recycled entry is available; every field is
+    /// overwritten before the entry is stored, so the placeholder `Cached`
+    /// action is never observed.
+    pub fn empty() -> Self {
+        Self {
+            id: 0,
+            time_ms: 0,
+            client_ip: String::new(),
+            question: String::new(),
+            qtype: Cow::Borrowed(""),
+            action: QueryAction::Cached,
+            allowlisted: false,
+            rcode: Cow::Borrowed(""),
+            answers: Vec::new(),
+            elapsed_ms: 0.0,
+        }
+    }
+
     pub fn is_blocked(&self) -> bool {
         matches!(self.action, QueryAction::Blocked { .. }) && !self.allowlisted
     }
@@ -112,6 +131,11 @@ pub struct LogPage {
     pub total: usize,
 }
 
+/// Maximum number of evicted entries kept around for buffer reuse. Bounds the
+/// memory the recycle pool can hold while still covering the steady-state churn
+/// (one entry evicted per push once the ring is full).
+const RECYCLE_POOL_CAP: usize = 256;
+
 /// Bounded, newest-first query log.
 pub struct QueryLog {
     inner: Mutex<VecDeque<QueryLogEntry>>,
@@ -120,6 +144,12 @@ pub struct QueryLog {
     /// Optional sink for persistence: each pushed entry is also forwarded here so
     /// a background writer can append it to disk.
     sink: Mutex<Option<tokio::sync::mpsc::UnboundedSender<QueryLogEntry>>>,
+    /// Evicted entries kept for their heap buffers so the next entry can be
+    /// filled in place (clear + rewrite) instead of allocating fresh strings.
+    /// This is what keeps the hot path from thrashing the allocator: at steady
+    /// state every push evicts one entry, which lands here and is handed back to
+    /// the next [`recycled_entry`](QueryLog::recycled_entry) caller.
+    recycled: Mutex<Vec<QueryLogEntry>>,
 }
 
 impl QueryLog {
@@ -129,7 +159,26 @@ impl QueryLog {
             capacity: parking_lot::RwLock::new(capacity.max(1)),
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             sink: Mutex::new(None),
+            recycled: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Take an entry whose heap buffers can be reused, if one is pooled. The
+    /// caller must overwrite every field before storing it. Returns `None` when
+    /// the pool is empty (caller should start from [`QueryLogEntry::empty`]).
+    pub fn recycled_entry(&self) -> Option<QueryLogEntry> {
+        self.recycled.lock().pop()
+    }
+
+    /// Return an entry's buffers to the recycle pool instead of freeing them.
+    /// Used for the stats-only path (entry built but not stored in the ring) and
+    /// internally for evicted entries.
+    pub fn recycle(&self, entry: QueryLogEntry) {
+        let mut pool = self.recycled.lock();
+        if pool.len() < RECYCLE_POOL_CAP {
+            pool.push(entry);
+        }
+        // Otherwise let it drop (free) — the pool is full enough.
     }
 
     /// Attach a persistence sink. Entries pushed afterwards are also sent here.
@@ -166,18 +215,32 @@ impl QueryLog {
     }
 
     /// Append a new entry (newest at the front), evicting the oldest if full.
+    /// The single entry evicted at steady state is routed to the recycle pool so
+    /// its heap buffers can be reused rather than freed.
     pub fn push(&self, entry: QueryLogEntry) {
         if !self.is_enabled() {
+            // Not stored, but its buffers are still worth recycling.
+            self.recycle(entry);
             return;
         }
         if let Some(tx) = self.sink.lock().as_ref() {
             let _ = tx.send(entry.clone());
         }
         let cap = *self.capacity.read();
-        let mut q = self.inner.lock();
-        q.push_front(entry);
-        while q.len() > cap {
-            q.pop_back();
+        let evicted = {
+            let mut q = self.inner.lock();
+            q.push_front(entry);
+            // The common steady-state case: exactly one over capacity. Hold onto
+            // it to recycle after dropping the lock; any extra (e.g. just after a
+            // capacity shrink) is simply freed.
+            let evicted = if q.len() > cap { q.pop_back() } else { None };
+            while q.len() > cap {
+                q.pop_back();
+            }
+            evicted
+        };
+        if let Some(old) = evicted {
+            self.recycle(old);
         }
     }
 

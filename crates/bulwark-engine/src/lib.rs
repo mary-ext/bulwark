@@ -63,9 +63,21 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Summarise an answer record as e.g. `"A 1.2.3.4"`.
-fn summarize(rec: &hickory_proto::rr::Record) -> String {
-    format!("{} {}", rec.record_type(), rec.data)
+/// Fill `dst` with one `"A 1.2.3.4"`-style summary per answer record, reusing
+/// `dst`'s existing `String` buffers (clear + rewrite) instead of allocating
+/// fresh ones. `dst` comes from a recycled log entry, so at steady state this
+/// allocates nothing.
+fn fill_answer_summaries(dst: &mut Vec<String>, src: &[hickory_proto::rr::Record]) {
+    use std::fmt::Write as _;
+    for (i, rec) in src.iter().enumerate() {
+        if let Some(s) = dst.get_mut(i) {
+            s.clear();
+            let _ = write!(s, "{} {}", rec.record_type(), rec.data);
+        } else {
+            dst.push(format!("{} {}", rec.record_type(), rec.data));
+        }
+    }
+    dst.truncate(src.len());
 }
 
 /// The display label for a response code. Returns a borrowed `&'static str` for
@@ -312,18 +324,39 @@ impl Engine {
             return resp;
         }
 
-        log.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        log.rcode = rcode_label(resp.metadata.response_code);
-        log.answers = resp.answers.iter().map(summarize).collect();
-
-        // Read before `build` consumes the builder; only forwarded queries set it.
+        // Only forwarded queries set the per-upstream RTT.
         let upstream_rtt_ms = log.upstream_rtt_ms;
-        let entry = log.build(self.seq.fetch_add(1, Ordering::Relaxed), action);
+        let id = self.seq.fetch_add(1, Ordering::Relaxed);
+
+        // Fill a recycled entry in place when one is available, reusing its
+        // `client_ip` and `answers` heap buffers rather than allocating fresh
+        // strings on every query. The `question` buffer is moved in from the name
+        // we already normalised, so it costs no extra allocation either.
+        let mut entry = self.log.recycled_entry().unwrap_or_else(QueryLogEntry::empty);
+        entry.id = id;
+        entry.time_ms = now_ms();
+        entry.client_ip.clear();
+        {
+            use std::fmt::Write as _;
+            let _ = write!(entry.client_ip, "{}", log.client_ip);
+        }
+        entry.question = log.question;
+        entry.qtype = log.qtype;
+        entry.action = action;
+        entry.allowlisted = log.allowlisted;
+        entry.rcode = rcode_label(resp.metadata.response_code);
+        fill_answer_summaries(&mut entry.answers, &resp.answers);
+        entry.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
         if stats_on {
             self.stats.record(&entry, upstream_rtt_ms);
         }
         if log_on {
             self.log.push(entry);
+        } else {
+            // Stats-only: the entry isn't stored, but its buffers are still worth
+            // returning to the pool instead of freeing them.
+            self.log.recycle(entry);
         }
         resp
     }
@@ -333,13 +366,12 @@ impl Engine {
 /// processing. The outcome-specific data lives in the [`QueryAction`] passed to
 /// [`build`](LogBuilder::build).
 struct LogBuilder {
+    /// Kept as an `IpAddr` (Copy); only stringified in `finalize`, which the
+    /// caller skips entirely when neither logging nor stats is enabled.
     client_ip: IpAddr,
     question: String,
     qtype: Cow<'static, str>,
     allowlisted: bool,
-    rcode: Cow<'static, str>,
-    answers: Vec<String>,
-    elapsed_ms: f64,
     /// Answering upstream's own round-trip (ms), set only when the query was
     /// forwarded. Kept out of the stored [`QueryLogEntry`] — it feeds per-upstream
     /// latency stats but isn't part of the log schema.
@@ -349,31 +381,11 @@ struct LogBuilder {
 impl LogBuilder {
     fn new(client: &ResolvedClient, question: String, qtype: Cow<'static, str>) -> Self {
         Self {
-            // Kept as an `IpAddr` (Copy); only stringified in `build()`, which the
-            // caller skips entirely when neither logging nor stats is enabled.
             client_ip: client.ip,
             question,
             qtype,
             allowlisted: false,
-            rcode: Cow::Borrowed(""),
-            answers: Vec::new(),
-            elapsed_ms: 0.0,
             upstream_rtt_ms: None,
-        }
-    }
-
-    fn build(self, id: u64, action: QueryAction) -> QueryLogEntry {
-        QueryLogEntry {
-            id,
-            time_ms: now_ms(),
-            client_ip: self.client_ip.to_string(),
-            question: self.question,
-            qtype: self.qtype,
-            action,
-            allowlisted: self.allowlisted,
-            rcode: self.rcode,
-            answers: self.answers,
-            elapsed_ms: self.elapsed_ms,
         }
     }
 }

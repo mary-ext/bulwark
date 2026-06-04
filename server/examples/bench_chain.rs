@@ -866,6 +866,46 @@ fn phase2d_log_microbench() {
         "  build + push (steady state) {buildpush:>4} ns/op   (push+evict alone ~{} ns)",
         buildpush.saturating_sub(build)
     );
+
+    // (c) Pooled reuse: fill a recycled entry in place, exactly as the engine's
+    // finalize() does. Pre-fill so both the ring and the recycle pool are at
+    // steady state. Same-run A/B against (b), so it is thermal-drift-immune.
+    let log2 = QueryLog::new(10_000, true);
+    for _ in 0..12_000 {
+        log2.push(make_entry());
+    }
+    let pooled = best_ns_per_op(5, n, |_| {
+        use std::fmt::Write as _;
+        let mut e = log2
+            .recycled_entry()
+            .unwrap_or_else(bulwark_engine::querylog::QueryLogEntry::empty);
+        e.id = 0;
+        e.time_ms = 1_700_000_000_000;
+        e.client_ip.clear();
+        let _ = write!(e.client_ip, "{ip}");
+        e.question.clear();
+        e.question.push_str("cache-hot.example.");
+        e.qtype = std::borrow::Cow::Borrowed("A");
+        e.action = QueryAction::Cached;
+        e.allowlisted = false;
+        e.rcode = std::borrow::Cow::Borrowed("NOERROR");
+        for (i, rec) in recs.iter().enumerate() {
+            if let Some(s) = e.answers.get_mut(i) {
+                s.clear();
+                let _ = write!(s, "{} {}", rec.record_type(), rec.data);
+            } else {
+                e.answers.push(format!("{} {}", rec.record_type(), rec.data));
+            }
+        }
+        e.answers.truncate(recs.len());
+        e.elapsed_ms = 0.5;
+        log2.push(e);
+        0
+    });
+    println!(
+        "  build + push (pooled reuse) {pooled:>4} ns/op   ({:+.0}% vs non-pooled)",
+        (pooled as f64 - buildpush as f64) / buildpush as f64 * 100.0
+    );
 }
 
 // ---------------------------------------------------------------------------
