@@ -87,6 +87,45 @@ async fn mock_upstream_cname(cname_target: &str, answer_ip: Ipv4Addr) -> SocketA
     addr
 }
 
+/// A mock upstream that answers HTTPS queries with a single HTTPS record
+/// carrying an `ipv4hint` listing every IP in `hints`.
+async fn mock_upstream_https(hints: Vec<Ipv4Addr>) -> SocketAddr {
+    use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue, SVCB};
+    use hickory_proto::rr::rdata::HTTPS;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut resp = query.clone();
+            resp.metadata.message_type = MessageType::Response;
+            resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(q) = query.queries.first() {
+                let svcb = SVCB::new(
+                    1,
+                    Name::root(),
+                    vec![(
+                        SvcParamKey::Ipv4Hint,
+                        SvcParamValue::Ipv4Hint(IpHint(hints.iter().copied().map(A).collect())),
+                    )],
+                );
+                resp.answers.push(Record::from_rdata(
+                    q.name().clone(),
+                    300,
+                    RData::HTTPS(HTTPS(svcb)),
+                ));
+            }
+            let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+        }
+    });
+    addr
+}
+
 async fn make_engine(rules: &str, upstream: SocketAddr) -> Arc<Engine> {
     let filter = Arc::new(compile_one(rules));
     let pool = Arc::new(
@@ -274,6 +313,40 @@ async fn blocks_response_by_resolved_ip() {
         ResponseCode::NXDomain,
         "an answer resolving to a blocked IP should be blocked"
     );
+}
+
+#[tokio::test]
+async fn blocks_response_on_blocked_https_hint() {
+    // The HTTPS record hints at a blocklisted IP. As in AdGuard Home, a hinted
+    // blocked IP blocks the whole response (a hint is a way to reach the IP
+    // without a separate A lookup, so it must be treated like a blocked A).
+    let up = mock_upstream_https(vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(6, 6, 6, 6)]).await;
+    let engine = make_engine("||6.6.6.6^", up).await;
+
+    let r = engine
+        .handle(ingest(query("site.com.", RecordType::HTTPS)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r.metadata.response_code,
+        ResponseCode::NXDomain,
+        "a blocked ipv4hint should block the whole response"
+    );
+}
+
+#[tokio::test]
+async fn clean_https_hint_is_forwarded() {
+    // An HTTPS record whose hints are all clean must pass through untouched.
+    let up = mock_upstream_https(vec![Ipv4Addr::new(1, 1, 1, 1)]).await;
+    let engine = make_engine("||6.6.6.6^", up).await;
+
+    let r = engine
+        .handle(ingest(query("site.com.", RecordType::HTTPS)), local())
+        .await
+        .into_message();
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(r.answers.len(), 1, "the HTTPS record should pass through");
+    assert!(matches!(&r.answers[0].data, RData::HTTPS(_)));
 }
 
 #[tokio::test]

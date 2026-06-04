@@ -27,6 +27,7 @@ use bulwark_config::BlockingMode;
 use bulwark_filter::{ClientInfo, FilterEngine, MatchInfo, Verdict};
 use bulwark_upstream::{QueryKey, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+use hickory_proto::rr::rdata::svcb::{SvcParamValue, SVCB};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use crate::block::{block_response, error_response, rewrite_response, Rewritten};
@@ -83,6 +84,10 @@ fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
 ///   (`data.brand.com -> tracker.evil.net`); the query-name check never sees it.
 /// - *IP blocking*: the resolved `A`/`AAAA` address itself matches a rule (e.g.
 ///   a known ad-serving IP), regardless of the name that resolved to it.
+/// - *HTTPS/SVCB hints*: RFC 9460 `ipv4hint`/`ipv6hint` params let a client
+///   reach an address without a separate `A`/`AAAA` lookup, so a hinted blocked
+///   IP is the same threat as a blocked `A`/`AAAA` — and, as in AdGuard Home,
+///   blocks the whole response.
 ///
 /// Returns the matching rule for the first blocked record, or `None` if the
 /// whole answer chain is clean. The records are already parsed (the upstream
@@ -99,18 +104,53 @@ fn filter_answers(
         name: client.name.as_deref(),
         tags: &client.tags,
     };
+    let block_of = |v: Verdict| match v {
+        Verdict::Block(info) => Some(info),
+        _ => None,
+    };
     for rec in answers {
         // `Name::to_ascii` carries a trailing dot; `filter.check` normalises it,
         // but trim here so the comparison is unambiguous. IP literals stringify
         // without a trailing dot, so the trim is a no-op for them.
-        let (target, rtype) = match &rec.data {
-            RData::CNAME(cname) => (cname.0.to_ascii(), "CNAME"),
-            RData::A(ip) => (ip.0.to_string(), "A"),
-            RData::AAAA(ip) => (ip.0.to_string(), "AAAA"),
+        let hit = match &rec.data {
+            RData::CNAME(cname) => {
+                block_of(filter.check(cname.0.to_ascii().trim_end_matches('.'), "CNAME", &ci))
+            }
+            RData::A(ip) => block_of(filter.check(&ip.0.to_string(), "A", &ci)),
+            RData::AAAA(ip) => block_of(filter.check(&ip.0.to_string(), "AAAA", &ci)),
+            RData::HTTPS(https) => hint_block(&https.0, filter, &ci),
+            RData::SVCB(svcb) => hint_block(svcb, filter, &ci),
             _ => continue,
         };
-        if let Verdict::Block(info) = filter.check(target.trim_end_matches('.'), rtype, &ci) {
-            return Some(info);
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
+}
+
+/// Return the matching rule if any `ipv4hint`/`ipv6hint` address in an
+/// HTTPS/SVCB record is blocklisted. The rtype mirrors AdGuard Home, which
+/// checks hint IPs as `HTTPS`.
+fn hint_block(svcb: &SVCB, filter: &FilterEngine, ci: &ClientInfo<'_>) -> Option<MatchInfo> {
+    for (_, value) in &svcb.svc_params {
+        let blocked = match value {
+            SvcParamValue::Ipv4Hint(h) => h.0.iter().map(|a| a.0.to_string()).find_map(|ip| {
+                match filter.check(&ip, "HTTPS", ci) {
+                    Verdict::Block(info) => Some(info),
+                    _ => None,
+                }
+            }),
+            SvcParamValue::Ipv6Hint(h) => h.0.iter().map(|a| a.0.to_string()).find_map(|ip| {
+                match filter.check(&ip, "HTTPS", ci) {
+                    Verdict::Block(info) => Some(info),
+                    _ => None,
+                }
+            }),
+            _ => None,
+        };
+        if blocked.is_some() {
+            return blocked;
         }
     }
     None
@@ -340,10 +380,11 @@ impl Engine {
                 // charge that ~1s to the upstream that actually answered quickly.
                 log.upstream_rtt_ms = Some(resolved.rtt_ms);
 
-                // Response-side filtering (CNAME uncloaking): the query name passed
-                // the request-side check, but the answer may point at a blocked
-                // target. Decide *before* caching so the cached entry is the block,
-                // not the cloaked answer — otherwise every later cache hit leaks it.
+                // Response-side filtering: the query name passed the request-side
+                // check, but the answer may point at a blocked target (a cloaked
+                // CNAME, a blocklisted A/AAAA, or an HTTPS/SVCB IP hint). Decide
+                // *before* caching so the cached entry is the block, not the cloaked
+                // answer — otherwise every later cache hit leaks it.
                 if state.filtering_enabled && client.filtering_enabled {
                     if let Some(info) =
                         filter_answers(&state.filter, &client, &resolved.message.answers)
