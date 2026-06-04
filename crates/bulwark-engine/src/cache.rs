@@ -25,6 +25,14 @@ const STALE_SERVE_TTL: u32 = 1;
 // or older format) fails the check and is ignored — a safe cold start.
 const SNAPSHOT_MAGIC: &[u8; 8] = b"BLWKCSN2";
 
+// Per-record sanity caps for snapshot import. A snapshot is locally written, but
+// a corrupt or truncated file must degrade to a (partial) cold start rather than
+// over-allocate or install bogus entries. A DNS message and its answer/offset
+// counts are all small, so anything beyond these bounds is rejected.
+const MAX_SNAPSHOT_WIRE_LEN: usize = 64 * 1024;
+const MAX_SNAPSHOT_ANSWERS: usize = 64;
+const MAX_SNAPSHOT_TTL_OFFSETS: usize = 256;
+
 /// How a cached response is held. The common case is `Wire`: the response we
 /// already encoded once, plus the byte offsets of every TTL field, so serving a
 /// hit is a flat byte clone + in-place id/TTL patch — no `Message` clone and no
@@ -524,14 +532,22 @@ fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
     let rtype = r.u16()?.into();
     let class = r.u16()?.into();
     let flags = r.u8()?;
-    let dnssec_ok = flags & 0b01 != 0;
-    let checking_disabled = flags & 0b10 != 0;
+    let key = QueryKey {
+        name,
+        rtype,
+        class,
+        dnssec_ok: flags & 0b01 != 0,
+        checking_disabled: flags & 0b10 != 0,
+    };
     let age = r.u32()?;
     let ttl = r.u32()?;
     // Use the `From<u16>` trait impl, not the inherent `from(high, low)`.
     let rcode: ResponseCode = r.u16()?.into();
 
     let ans_count = r.u16()? as usize;
+    if ans_count > MAX_SNAPSHOT_ANSWERS {
+        return None;
+    }
     let mut answers = Vec::with_capacity(ans_count);
     for _ in 0..ans_count {
         let len = r.u16()? as usize;
@@ -539,22 +555,39 @@ fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
     }
 
     let wire_len = r.u32()? as usize;
-    let bytes: Arc<[u8]> = Arc::from(r.take(wire_len)?);
+    if wire_len > MAX_SNAPSHOT_WIRE_LEN {
+        return None;
+    }
+    let wire = r.take(wire_len)?;
+    // Reject a record whose wire bytes don't parse to a message answering this
+    // exact key. A corrupt snapshot must not install arbitrary bytes under a key
+    // that a later lookup would patch and serve as a cache hit.
+    if !wire_matches_key(wire, &key) {
+        return None;
+    }
+    let bytes: Arc<[u8]> = Arc::from(wire);
 
     let off_count = r.u32()? as usize;
+    // Cap before allocating: `off_count` is an untrusted u32, so a corrupt value
+    // could otherwise drive a multi-gigabyte `Vec::with_capacity`.
+    if off_count > MAX_SNAPSHOT_TTL_OFFSETS {
+        return None;
+    }
     let mut offsets = Vec::with_capacity(off_count);
     for _ in 0..off_count {
         offsets.push(r.u32()?);
     }
+    // TTL offsets index into the wire bytes for patching on serve; reject any
+    // that would read/write past the end (a u32 TTL needs 4 bytes).
+    if offsets
+        .iter()
+        .any(|&o| o as usize + 4 > bytes.len())
+    {
+        return None;
+    }
 
     Some(ParsedEntry {
-        key: QueryKey {
-            name,
-            rtype,
-            class,
-            dnssec_ok,
-            checking_disabled,
-        },
+        key,
         age,
         ttl,
         stored: Stored::Wire {
@@ -564,6 +597,20 @@ fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
             answers: Arc::from(answers.into_boxed_slice()),
         },
     })
+}
+
+/// Whether `bytes` decodes to a DNS message whose first question matches `key`
+/// (name case-insensitively, plus type and class). Used to reject snapshot
+/// records whose wire payload doesn't belong under the key it's stored at.
+fn wire_matches_key(bytes: &[u8], key: &QueryKey) -> bool {
+    match Message::from_vec(bytes) {
+        Ok(msg) => msg.queries.first().is_some_and(|q| {
+            q.query_type() == key.rtype
+                && q.query_class() == key.class
+                && q.name().to_ascii().eq_ignore_ascii_case(&key.name)
+        }),
+        Err(_) => false,
+    }
 }
 
 /// Minimal forward-only byte reader: every accessor returns `None` rather than
@@ -863,6 +910,17 @@ mod tests {
             cache.get(&with_do, 0).is_none(),
             "a DO query must not be served the non-DO cache entry"
         );
+    }
+
+    #[test]
+    fn snapshot_record_rejects_mismatched_or_corrupt_wire() {
+        let wire = answer("good.test.", 60).to_vec().unwrap();
+        // Wire whose question matches the key is accepted...
+        assert!(wire_matches_key(&wire, &key("good.test.")));
+        // ...but not under a different key (would be cache poisoning on import)...
+        assert!(!wire_matches_key(&wire, &key("evil.test.")));
+        // ...and garbage bytes are rejected outright.
+        assert!(!wire_matches_key(b"not a dns message", &key("good.test.")));
     }
 
     #[test]
