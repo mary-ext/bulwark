@@ -19,12 +19,7 @@
 //!   BENCH_CONCURRENCY       concurrent in-flight queries     (default 64)
 //!   BENCH_DATA_DIR          where to cache the lists
 
-// Mirror the server's optional global allocator so `--features mimalloc`
-// benches the same allocator the shipped binary would use.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-#[cfg(feature = "jemalloc")]
+// Mirror the server's global allocator so the bench reflects production.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

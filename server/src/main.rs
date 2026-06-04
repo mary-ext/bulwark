@@ -1,13 +1,9 @@
 //! Bulwark server: runs the DNS engine and serves the web UI + REST API.
 
-// Opt-in fast global allocator. The per-query hot path is allocation-heavy
-// (Message parse, response build, wire encode, query-log entry) and frees the
-// log entry on a different thread than it was allocated — a pattern the system
-// allocator handles poorly. Enable with `--features mimalloc`.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-#[cfg(feature = "jemalloc")]
+// Fast global allocator. The per-query hot path is allocation-heavy (Message
+// parse, response build, wire encode, query-log entry) and frees the log entry
+// on a different thread than it was allocated — a pattern the system allocator
+// handles poorly. jemalloc roughly halves per-request CPU here (benched).
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
