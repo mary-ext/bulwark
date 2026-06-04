@@ -81,13 +81,13 @@ export type QueryLogConfig = {
     /** Whether to anonymize client IPs (drop last octet / suffix). */
     anonymize?: boolean;
     enabled?: boolean;
-    /** Persist the query log to disk so it survives restarts. */
+    /** Persist the query log to disk so it survives restarts. When off, the log
+    is kept in an in-memory database for the lifetime of the process. */
     persist?: boolean;
-    /** How many days of query log to retain on disk (independent of `stats`).
-    0 keeps only the in-memory `size` window. */
+    /** How many days of query log to retain (independent of `stats`). Entries
+    older than this are pruned periodically. 0 disables time-based pruning
+    (the log is kept indefinitely). */
     retention_days?: number;
-    /** Number of recent entries kept in memory for fast browsing. */
-    size?: number;
 };
 export type ServerConfig = {
     /** Addresses to serve plain DNS on (UDP + TCP). */
@@ -223,7 +223,7 @@ export type LogEntryView = {
 };
 export type QueryLogResponse = {
     entries: LogEntryView[];
-    /** Total entries currently held (before paging, after filtering). */
+    /** Total entries matching the filter (across all pages), for pagination. */
     total: number;
 };
 export type TopEntryDto = {

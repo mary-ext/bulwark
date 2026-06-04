@@ -168,14 +168,13 @@
           <SwitchRow bind:checked={querylog.enabled} label="Enable query log" />
           <SwitchRow bind:checked={querylog.persist} label="Persist to disk" />
           <SwitchRow bind:checked={querylog.anonymize} label="Anonymize client IPs" />
-          <div class="grid cols-2">
-            <Field label="In-memory entries" htmlFor="q-size">
-              <input id="q-size" type="number" min="1" bind:value={querylog.size} />
-            </Field>
-            <Field label="Retention (days)" htmlFor="q-retention">
-              <input id="q-retention" type="number" min="0" bind:value={querylog.retention_days} />
-            </Field>
-          </div>
+          <Field
+            label="Retention (days)"
+            htmlFor="q-retention"
+            hint="Entries older than this are pruned. 0 keeps them indefinitely."
+          >
+            <input id="q-retention" type="number" min="0" bind:value={querylog.retention_days} />
+          </Field>
           <div class="btn-row">
             <button
               class="btn btn-primary"

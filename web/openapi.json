@@ -1771,17 +1771,12 @@
           },
           "persist": {
             "type": "boolean",
-            "description": "Persist the query log to disk so it survives restarts."
+            "description": "Persist the query log to disk so it survives restarts. When off, the log\nis kept in an in-memory database for the lifetime of the process."
           },
           "retention_days": {
             "type": "integer",
             "format": "int32",
-            "description": "How many days of query log to retain on disk (independent of `stats`).\n0 keeps only the in-memory `size` window.",
-            "minimum": 0
-          },
-          "size": {
-            "type": "integer",
-            "description": "Number of recent entries kept in memory for fast browsing.",
+            "description": "How many days of query log to retain (independent of `stats`). Entries\nolder than this are pruned periodically. 0 disables time-based pruning\n(the log is kept indefinitely).",
             "minimum": 0
           }
         }
@@ -1802,7 +1797,7 @@
           },
           "total": {
             "type": "integer",
-            "description": "Total entries currently held (before paging, after filtering).",
+            "description": "Total entries matching the filter (across all pages), for pagination.",
             "minimum": 0
           }
         }
