@@ -250,7 +250,7 @@
         <h4 class="detail-heading">Request</h4>
         <dl>
           <dt>Domain</dt>
-          <dd class="mono">{bareDomain(detail.question)}</dd>
+          <dd class="mono wrap">{bareDomain(detail.question)}</dd>
           <dt>Type</dt>
           <dd class="mono">{detail.qtype}</dd>
           <dt>Client</dt>
