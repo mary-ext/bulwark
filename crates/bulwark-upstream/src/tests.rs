@@ -146,6 +146,41 @@ async fn sequential_failover_to_healthy_upstream() {
 }
 
 #[tokio::test]
+async fn dead_from_start_upstream_is_demoted() {
+    // An upstream that has *never* succeeded must still be marked down and sorted
+    // last once it crosses the failure threshold — the bug was that a
+    // never-successful upstream (samples == 0) stayed "up" forever and kept being
+    // tried first, waiting out its timeout on every query.
+    let dead = spawn_mock(Behaviour::Drop).await;
+    let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(4, 4, 4, 4), 0)).await;
+    let pool = UpstreamPool::build(&[entry(dead.addr), entry(good.addr)], settings())
+        .await
+        .unwrap();
+
+    // First query: dead times out, fails over to good.
+    let r1 = pool.resolve(&make_query("a.test.")).await.unwrap();
+    assert_eq!(r1.upstream, format!("udp://{}", good.addr));
+
+    // Dead is now reported down (previously it showed up because samples == 0).
+    let stats = pool.stats();
+    let dead_stat = stats
+        .iter()
+        .find(|s| s.spec.contains(&dead.addr.to_string()))
+        .unwrap();
+    assert!(!dead_stat.up, "a dead-from-start upstream must be marked down");
+
+    // Subsequent queries skip the demoted upstream entirely.
+    let before = dead.received.load(Ordering::SeqCst);
+    let r2 = pool.resolve(&make_query("b.test.")).await.unwrap();
+    assert_eq!(r2.upstream, format!("udp://{}", good.addr));
+    assert_eq!(
+        dead.received.load(Ordering::SeqCst),
+        before,
+        "the demoted upstream should receive no further queries"
+    );
+}
+
+#[tokio::test]
 async fn prefers_fastest_upstream_after_probing() {
     let slow = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 120)).await;
     let fast = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;

@@ -55,16 +55,35 @@ impl Default for PoolSettings {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct Health {
     ewma_ms: f64,
     samples: u64,
+    /// Presumed up until proven down. A fresh upstream starts up so it gets a
+    /// chance; it's marked down only after crossing the failure threshold. (If
+    /// this defaulted to false, a never-*successful* upstream couldn't be
+    /// distinguished from an untried one and would never sort as down.)
     up: bool,
     consecutive_failures: u32,
     total_queries: u64,
     total_failures: u64,
     last_rtt_ms: Option<f64>,
     last_error: Option<String>,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        Self {
+            ewma_ms: 0.0,
+            samples: 0,
+            up: true,
+            consecutive_failures: 0,
+            total_queries: 0,
+            total_failures: 0,
+            last_rtt_ms: None,
+            last_error: None,
+        }
+    }
 }
 
 /// A single upstream and its live health.
@@ -104,10 +123,12 @@ impl Upstream {
     }
 
     /// Sort key: healthy upstreams first, then by latency (unknown latency
-    /// sorts as "fast" so a fresh upstream gets a chance).
+    /// sorts as "fast" so a fresh upstream gets a chance). An upstream that has
+    /// crossed the failure threshold sorts last regardless of whether it ever
+    /// succeeded (`up` is presumed-true until then).
     fn sort_key(&self) -> (bool, u64) {
         let h = self.health.lock();
-        let down = !h.up && h.samples > 0;
+        let down = !h.up;
         let lat = if h.samples == 0 {
             0
         } else {
@@ -123,7 +144,7 @@ impl Upstream {
             spec: self.spec.display.clone(),
             name: self.name.clone(),
             kind: self.spec.kind,
-            up: h.up || h.samples == 0,
+            up: h.up,
             avg_rtt_ms: if h.samples == 0 {
                 None
             } else {
@@ -165,6 +186,20 @@ pub struct Resolved {
 }
 
 type ResolveFuture = Shared<BoxFuture<'static, SharedResult<Resolved>>>;
+
+/// Removes a single-flight entry when the leader's `resolve` finishes or is
+/// cancelled. Held only by the leader (the caller that created the entry), so a
+/// dropped leader can't leave a stale completed future in the map.
+struct InflightGuard<'a> {
+    map: &'a Mutex<HashMap<QueryKey, ResolveFuture>>,
+    key: QueryKey,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.map.lock().remove(&self.key);
+    }
+}
 
 /// A pool of upstream resolvers.
 pub struct UpstreamPool {
@@ -232,11 +267,16 @@ impl UpstreamPool {
             None => return Err(UpstreamError::Proto("query has no question".into())),
         };
 
-        // Single-flight: coalesce identical concurrent queries.
-        let (fut, leader) = {
+        // Single-flight: coalesce identical concurrent queries. The leader (the
+        // caller that created the in-flight entry) owns its cleanup via an RAII
+        // guard, so the entry is removed when the shared future completes *or* if
+        // this `resolve` is cancelled mid-await — a dropped leader can no longer
+        // leak a completed entry that later callers would inherit forever.
+        // Followers get no guard: they don't own the entry.
+        let (fut, _guard) = {
             let mut map = self.inflight.lock();
             if let Some(existing) = map.get(&key) {
-                (existing.clone(), false)
+                (existing.clone(), None)
             } else {
                 let ordered = self.ordered();
                 let timeout = self.settings.query_timeout;
@@ -248,14 +288,15 @@ impl UpstreamPool {
                         .boxed()
                         .shared();
                 map.insert(key.clone(), fut.clone());
-                (fut, true)
+                let guard = InflightGuard {
+                    map: &self.inflight,
+                    key: key.clone(),
+                };
+                (fut, Some(guard))
             }
         };
 
         let result = fut.await;
-        if leader {
-            self.inflight.lock().remove(&key);
-        }
 
         match result {
             Ok(mut resolved) => {
