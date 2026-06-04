@@ -29,11 +29,15 @@
     load();
   });
 
-  const cacheRate = $derived(
-    stats && stats.cache_hits + stats.cache_misses > 0
-      ? stats.cache_hits / (stats.cache_hits + stats.cache_misses)
-      : 0,
-  );
+  // Derived from the persisted stats counters, not the cache's in-memory
+  // hit/miss atomics (which reset on restart). Filtering runs before the cache
+  // lookup, so blocked/rewritten queries never reach it — the lookup count is
+  // total minus those, and `cached` is the hit count.
+  const cacheRate = $derived.by(() => {
+    if (!stats) return 0;
+    const lookups = stats.total - stats.blocked - stats.rewritten;
+    return lookups > 0 ? stats.cached / lookups : 0;
+  });
 </script>
 
 <div class="page-head">

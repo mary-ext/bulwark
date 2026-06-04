@@ -73,7 +73,7 @@ impl From<LatencyPercentiles> for LatencyPercentilesDto {
     }
 }
 
-/// A statistics snapshot plus live cache counters.
+/// A statistics snapshot plus the current cache entry count.
 #[derive(Serialize, ToSchema)]
 pub struct StatsResponse {
     pub total: u64,
@@ -93,8 +93,6 @@ pub struct StatsResponse {
     pub upstream_avg_rtt_ms: HashMap<String, f64>,
     pub upstream_latency_pct: HashMap<String, LatencyPercentilesDto>,
     pub series: Vec<SeriesPointDto>,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
     pub cache_size: usize,
 }
 
@@ -103,7 +101,7 @@ fn top(entries: Vec<TopEntry>) -> Vec<TopEntryDto> {
 }
 
 impl StatsResponse {
-    pub fn new(s: StatsSummary, cache_hits: u64, cache_misses: u64, cache_size: usize) -> Self {
+    pub fn new(s: StatsSummary, cache_size: usize) -> Self {
         Self {
             total: s.total,
             blocked: s.blocked,
@@ -126,8 +124,6 @@ impl StatsResponse {
                 .map(|(k, v)| (k, v.into()))
                 .collect(),
             series: s.series.into_iter().map(Into::into).collect(),
-            cache_hits,
-            cache_misses,
             cache_size,
         }
     }

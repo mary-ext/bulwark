@@ -1045,12 +1045,7 @@ pub async fn get_stats(
     let clients = state.engine.clients();
     let summary = state.engine.stats().snapshot(q.top, &clients);
     let cache = state.engine.cache();
-    Json(StatsResponse::new(
-        summary,
-        cache.hit_count(),
-        cache.miss_count(),
-        cache.len(),
-    ))
+    Json(StatsResponse::new(summary, cache.len()))
 }
 
 #[utoipa::path(

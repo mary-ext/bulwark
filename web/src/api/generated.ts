@@ -252,8 +252,6 @@ export type StatsResponse = {
     avg_processing_ms: number;
     block_rate: number;
     blocked: number;
-    cache_hits: number;
-    cache_misses: number;
     cache_size: number;
     cached: number;
     errors: number;

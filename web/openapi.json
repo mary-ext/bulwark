@@ -1940,7 +1940,7 @@
       },
       "StatsResponse": {
         "type": "object",
-        "description": "A statistics snapshot plus live cache counters.",
+        "description": "A statistics snapshot plus the current cache entry count.",
         "required": [
           "total",
           "blocked",
@@ -1959,8 +1959,6 @@
           "upstream_avg_rtt_ms",
           "upstream_latency_pct",
           "series",
-          "cache_hits",
-          "cache_misses",
           "cache_size"
         ],
         "properties": {
@@ -1973,16 +1971,6 @@
             "format": "double"
           },
           "blocked": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "cache_hits": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "cache_misses": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
