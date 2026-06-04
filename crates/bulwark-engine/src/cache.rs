@@ -6,6 +6,7 @@
 //!   served immediately while a background refresh runs.
 //! * LRU-bounded, keyed by `(name, type, class)`.
 
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -57,20 +58,54 @@ pub struct CacheConfig {
     pub stale_max_age: AtomicU32,
 }
 
-/// A TTL-aware DNS cache.
+/// Number of cache shards: a power of two (so shard selection is a cheap mask)
+/// near the CPU count, clamped to a sane range. Each shard has its own mutex, so
+/// concurrent lookups on different shards don't serialize — DNS traffic is
+/// highly concurrent (one tokio task per query), and cache hits are exactly
+/// where we want cores to scale. A single global mutex scales *negatively* under
+/// load (measured: 9.3M→2.9M hits/s, 1→16 threads).
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .next_power_of_two()
+        .clamp(8, 64)
+}
+
+/// A TTL-aware DNS cache, split into independently-locked shards keyed by a
+/// cheap hash of the query key.
 pub struct DnsCache {
-    map: Mutex<LruCache<QueryKey, Entry>>,
+    shards: Box<[Mutex<LruCache<QueryKey, Entry>>]>,
+    /// Bit mask for shard selection (`shards.len()` is a power of two).
+    mask: usize,
+    /// Hasher for shard selection only (the per-shard `LruCache` re-hashes
+    /// internally; this one just spreads keys across shards).
+    hash_builder: ahash::RandomState,
     cfg: CacheConfig,
+    /// Total capacity across all shards (the configured value).
     capacity: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
+/// Per-shard capacity for a given total, never zero.
+fn shard_cap(total: usize, shards: usize) -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new((total / shards).max(1)).unwrap()
+}
+
 impl DnsCache {
     pub fn new(capacity: usize, min_ttl: u32, max_ttl: u32, stale_max_age: u32) -> Self {
         let cap = capacity.max(1);
+        let n = shard_count();
+        let per_shard = shard_cap(cap, n);
+        let shards = (0..n)
+            .map(|_| Mutex::new(LruCache::new(per_shard)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            map: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(cap).unwrap())),
+            shards,
+            mask: n - 1,
+            hash_builder: ahash::RandomState::new(),
             cfg: CacheConfig {
                 enabled: AtomicBool::new(true),
                 min_ttl: AtomicU32::new(min_ttl),
@@ -81,6 +116,12 @@ impl DnsCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
+    }
+
+    /// The shard a key maps to.
+    fn shard(&self, key: &QueryKey) -> &Mutex<LruCache<QueryKey, Entry>> {
+        let h = self.hash_builder.hash_one(key) as usize;
+        &self.shards[h & self.mask]
     }
 
     /// Apply new tuning at runtime (config hot-reload). Resizes if needed.
@@ -100,8 +141,9 @@ impl DnsCache {
             .store(stale_max_age, Ordering::Relaxed);
         let cap = capacity.max(1);
         if cap != self.capacity.swap(cap, Ordering::Relaxed) {
-            if let Some(nz) = std::num::NonZeroUsize::new(cap) {
-                self.map.lock().resize(nz);
+            let per_shard = shard_cap(cap, self.shards.len());
+            for shard in self.shards.iter() {
+                shard.lock().resize(per_shard);
             }
         }
         if !enabled {
@@ -114,11 +156,13 @@ impl DnsCache {
     }
 
     pub fn clear(&self) {
-        self.map.lock().clear();
+        for shard in self.shards.iter() {
+            shard.lock().clear();
+        }
     }
 
     pub fn len(&self) -> usize {
-        self.map.lock().len()
+        self.shards.iter().map(|s| s.lock().len()).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -144,7 +188,7 @@ impl DnsCache {
         // message clone) is deferred until after the guard is dropped so
         // concurrent hits don't serialize on it.
         let (message, ttl, stale) = {
-            let mut map = self.map.lock();
+            let mut map = self.shard(key).lock();
             let Some(entry) = map.get(key) else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
@@ -195,7 +239,7 @@ impl DnsCache {
             stored_at: Instant::now(),
             ttl,
         };
-        self.map.lock().put(key, entry);
+        self.shard(&key).lock().put(key, entry);
     }
 
     /// Decide whether a response is cacheable and compute its clamped TTL.
@@ -372,7 +416,7 @@ mod tests {
         // Insert with ttl 1, then force expiry by mutating stored_at.
         cache.insert(key("h.com."), &answer("h.com.", 1));
         {
-            let mut map = cache.map.lock();
+            let mut map = cache.shard(&key("h.com.")).lock();
             let e = map.get_mut(&key("h.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
@@ -382,7 +426,7 @@ mod tests {
         // Now push it beyond the stale window -> miss.
         cache.insert(key("h.com."), &answer("h.com.", 1));
         {
-            let mut map = cache.map.lock();
+            let mut map = cache.shard(&key("h.com.")).lock();
             let e = map.get_mut(&key("h.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(7200);
         }
@@ -394,7 +438,7 @@ mod tests {
         let cache = DnsCache::new(100, 0, 0, 0);
         cache.insert(key("i.com."), &answer("i.com.", 1));
         {
-            let mut map = cache.map.lock();
+            let mut map = cache.shard(&key("i.com.")).lock();
             let e = map.get_mut(&key("i.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
