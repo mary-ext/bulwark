@@ -106,3 +106,53 @@ pub fn snapshot_stats_now(engine: &Engine, path: &Path) {
         let _ = std::fs::rename(&tmp, path);
     }
 }
+
+/// How often the DNS cache is snapshotted to disk. The cache rewarms itself on
+/// demand (serve-stale + background refresh), so this only bounds how much of a
+/// warm cache a hard crash can cost us; a generous interval keeps the periodic
+/// full-shard walk cheap.
+const CACHE_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Restore a persisted DNS cache snapshot into the engine, if present. Must run
+/// after the cache's TTL/stale config is applied so expiry is judged correctly.
+pub fn load_cache(path: &Path, engine: &Engine) {
+    let Ok(blob) = std::fs::read(path) else {
+        return; // no snapshot yet (or unreadable) — start cold.
+    };
+    let n = engine.cache().import_snapshot(&blob);
+    if n > 0 {
+        tracing::info!(entries = n, "restored DNS cache from snapshot");
+    }
+}
+
+/// Write the cache snapshot to `path` atomically (temp file + rename), so a
+/// crash mid-write never leaves a torn snapshot — readers see the old file or
+/// the complete new one. Skips writing while the cache is disabled so a
+/// temporary disable doesn't clobber a good snapshot with an empty one.
+fn snapshot_cache_to(engine: &Engine, path: &Path) {
+    if !engine.cache().is_enabled() {
+        return;
+    }
+    let blob = engine.cache().export_snapshot();
+    let tmp = path.with_extension("snap.tmp");
+    if std::fs::write(&tmp, &blob).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Periodically snapshot the DNS cache to disk.
+pub fn spawn_cache_snapshotter(engine: Arc<Engine>, path: PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(CACHE_SNAPSHOT_INTERVAL);
+        tick.tick().await; // skip the immediate tick.
+        loop {
+            tick.tick().await;
+            snapshot_cache_to(&engine, &path);
+        }
+    })
+}
+
+/// Write the current cache snapshot synchronously (used on shutdown).
+pub fn snapshot_cache_now(engine: &Engine, path: &Path) {
+    snapshot_cache_to(engine, path);
+}

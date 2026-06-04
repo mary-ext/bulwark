@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bulwark_upstream::QueryKey;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
@@ -19,6 +19,9 @@ use parking_lot::Mutex;
 const DEFAULT_NEGATIVE_TTL: u32 = 30;
 /// TTL (seconds) applied to records when serving a stale answer.
 const STALE_SERVE_TTL: u32 = 1;
+/// Magic + version header for the persisted snapshot blob. Bump the trailing
+/// digit on any format change so stale snapshots are ignored, not misread.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"BLWKCSN1";
 
 /// How a cached response is held. The common case is `Wire`: the response we
 /// already encoded once, plus the byte offsets of every TTL field, so serving a
@@ -362,6 +365,225 @@ impl DnsCache {
         }
         Some(ttl)
     }
+
+    /// Serialize the cache to a self-describing byte blob for persistence across
+    /// restarts. Only the `Wire` form is persisted (the rare `Message` fallback
+    /// is skipped — it can't be safely byte-patched anyway); entries already past
+    /// their stale lifetime are dropped. Each record stores the entry's *age* so
+    /// remaining lifetime can be recomputed on load against wall-clock time —
+    /// `stored_at` is an `Instant`, meaningless across processes.
+    ///
+    /// This walks every shard under its lock, so it is an off-hot-path operation
+    /// (periodic snapshot + shutdown), never called while serving a query.
+    pub fn export_snapshot(&self) -> Vec<u8> {
+        let now = unix_secs();
+        let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        out.extend_from_slice(SNAPSHOT_MAGIC);
+        out.extend_from_slice(&now.to_le_bytes());
+        // Backfilled with the real count once we know how many we wrote.
+        let count_at = out.len();
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut count: u32 = 0;
+        for shard in self.shards.iter() {
+            let map = shard.lock();
+            for (key, entry) in map.iter() {
+                let Stored::Wire {
+                    bytes,
+                    ttl_offsets,
+                    rcode,
+                    answers,
+                } = &entry.stored
+                else {
+                    continue;
+                };
+                let age = entry.age_secs();
+                // Skip entries that are neither fresh nor stale-servable.
+                if age >= entry.ttl.saturating_add(stale_max_age) {
+                    continue;
+                }
+                write_record(&mut out, key, age, entry.ttl, *rcode, answers, bytes, ttl_offsets);
+                count += 1;
+            }
+        }
+        out[count_at..count_at + 4].copy_from_slice(&count.to_le_bytes());
+        out
+    }
+
+    /// Restore entries from a blob produced by [`Self::export_snapshot`].
+    /// Returns the number of entries inserted. Best-effort: a bad magic, an
+    /// unreadable/truncated blob, or individual dead/expired entries are silently
+    /// skipped (a cold start is always safe). Remaining lifetime is recomputed
+    /// from the snapshot's wall-clock age plus elapsed time, so entries that have
+    /// expired beyond the *current* stale window while we were down are dropped.
+    /// Call after the cache's TTL/stale config is in place.
+    pub fn import_snapshot(&self, data: &[u8]) -> usize {
+        let mut r = Reader::new(data);
+        if r.take(SNAPSHOT_MAGIC.len()) != Some(SNAPSHOT_MAGIC.as_slice()) {
+            return 0;
+        }
+        let (Some(snap_unix), Some(count)) = (r.u64(), r.u32()) else {
+            return 0;
+        };
+        let now = unix_secs();
+        let elapsed = now.saturating_sub(snap_unix);
+        let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed) as u64;
+
+        let mut restored = 0;
+        for _ in 0..count {
+            let Some(parsed) = read_record(&mut r) else {
+                break; // truncated/corrupt tail — keep what we got.
+            };
+            let total_age = parsed.age as u64 + elapsed;
+            // Dead while we were down: past ttl + stale window.
+            if total_age >= parsed.ttl as u64 + stale_max_age {
+                continue;
+            }
+            // Rebuild an `Instant` that elapses to `total_age`. Can fail only if
+            // the machine's monotonic clock is younger than the entry's age.
+            let Some(stored_at) =
+                Instant::now().checked_sub(Duration::from_secs(total_age))
+            else {
+                continue;
+            };
+            let entry = Entry {
+                stored: parsed.stored,
+                stored_at,
+                ttl: parsed.ttl,
+            };
+            self.shard(&parsed.key).lock().put(parsed.key, entry);
+            restored += 1;
+        }
+        restored
+    }
+}
+
+/// Current wall-clock time as seconds since the Unix epoch (0 if the clock is
+/// before the epoch, which it never is in practice).
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append one `Wire` entry to the snapshot buffer. See [`DnsCache::export_snapshot`]
+/// for the format; every length prefix is little-endian.
+#[allow(clippy::too_many_arguments)]
+fn write_record(
+    out: &mut Vec<u8>,
+    key: &QueryKey,
+    age: u32,
+    ttl: u32,
+    rcode: ResponseCode,
+    answers: &[String],
+    bytes: &[u8],
+    offsets: &[u32],
+) {
+    let name = key.name.as_bytes();
+    out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&u16::from(key.rtype).to_le_bytes());
+    out.extend_from_slice(&u16::from(key.class).to_le_bytes());
+    out.extend_from_slice(&age.to_le_bytes());
+    out.extend_from_slice(&ttl.to_le_bytes());
+    out.extend_from_slice(&u16::from(rcode).to_le_bytes());
+    out.extend_from_slice(&(answers.len() as u16).to_le_bytes());
+    for a in answers {
+        let ab = a.as_bytes();
+        out.extend_from_slice(&(ab.len() as u16).to_le_bytes());
+        out.extend_from_slice(ab);
+    }
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
+    for o in offsets {
+        out.extend_from_slice(&o.to_le_bytes());
+    }
+}
+
+/// A record parsed from a snapshot blob, pre-`Instant` (age is resolved to a
+/// `stored_at` by the caller, which knows the elapsed-since-snapshot offset).
+struct ParsedEntry {
+    key: QueryKey,
+    age: u32,
+    ttl: u32,
+    stored: Stored,
+}
+
+/// Parse one record. Returns `None` on a short/corrupt read so the caller can
+/// stop at the first bad record and keep everything before it.
+fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
+    let name_len = r.u16()? as usize;
+    let name = String::from_utf8_lossy(r.take(name_len)?).into_owned();
+    let rtype = r.u16()?.into();
+    let class = r.u16()?.into();
+    let age = r.u32()?;
+    let ttl = r.u32()?;
+    // Use the `From<u16>` trait impl, not the inherent `from(high, low)`.
+    let rcode: ResponseCode = r.u16()?.into();
+
+    let ans_count = r.u16()? as usize;
+    let mut answers = Vec::with_capacity(ans_count);
+    for _ in 0..ans_count {
+        let len = r.u16()? as usize;
+        answers.push(String::from_utf8_lossy(r.take(len)?).into_owned());
+    }
+
+    let wire_len = r.u32()? as usize;
+    let bytes: Arc<[u8]> = Arc::from(r.take(wire_len)?);
+
+    let off_count = r.u32()? as usize;
+    let mut offsets = Vec::with_capacity(off_count);
+    for _ in 0..off_count {
+        offsets.push(r.u32()?);
+    }
+
+    Some(ParsedEntry {
+        key: QueryKey { name, rtype, class },
+        age,
+        ttl,
+        stored: Stored::Wire {
+            bytes,
+            ttl_offsets: Arc::from(offsets.into_boxed_slice()),
+            rcode,
+            answers: Arc::from(answers.into_boxed_slice()),
+        },
+    })
+}
+
+/// Minimal forward-only byte reader: every accessor returns `None` rather than
+/// panicking when the buffer is too short, so a truncated snapshot degrades to a
+/// partial (or empty) restore instead of a crash.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let s = self.data.get(self.pos..end)?;
+        self.pos = end;
+        Some(s)
+    }
+
+    fn u16(&mut self) -> Option<u16> {
+        Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    }
 }
 
 /// Derive a negative-cache TTL from the SOA record, if any.
@@ -516,6 +738,84 @@ mod tests {
             e.stored_at = Instant::now() - std::time::Duration::from_secs(7200);
         }
         assert!(cache.get(&key("h.com."), 0).is_none());
+    }
+
+    #[test]
+    fn snapshot_roundtrips_fresh_entry() {
+        let cache = DnsCache::new(100, 0, 0, 0);
+        cache.insert(key("a.com."), &answer("a.com.", 100));
+        let blob = cache.export_snapshot();
+
+        let restored = DnsCache::new(100, 0, 0, 0);
+        assert_eq!(restored.import_snapshot(&blob), 1);
+        let hit = restored.get(&key("a.com."), 0).expect("restored hit");
+        assert!(!hit.stale);
+        // TTL is the remaining lifetime, decremented from the original 100.
+        let m = hit.response.into_message();
+        assert!(m.answers[0].ttl <= 100 && m.answers[0].ttl >= 95);
+    }
+
+    #[test]
+    fn snapshot_preserves_answers_and_rcode_for_logging() {
+        let cache = DnsCache::new(100, 0, 0, 0);
+        cache.insert(key("a.com."), &answer("a.com.", 100));
+        let blob = cache.export_snapshot();
+
+        let restored = DnsCache::new(100, 0, 0, 0);
+        restored.import_snapshot(&blob);
+        match restored.get(&key("a.com."), 0).unwrap().response {
+            CachedResponse::Wire { rcode, answers, .. } => {
+                assert_eq!(rcode, ResponseCode::NoError);
+                assert_eq!(&*answers, &["A 1.2.3.4".to_string()]);
+            }
+            CachedResponse::Message(_) => panic!("expected wire form"),
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_stale_servable_entry() {
+        // Expired but within the stale window: should survive a snapshot and come
+        // back as a stale hit (triggering a background refresh on the live path).
+        let cache = DnsCache::new(100, 0, 0, 3600);
+        cache.insert(key("h.com."), &answer("h.com.", 1));
+        {
+            let mut map = cache.shard(&key("h.com.")).lock();
+            let e = map.get_mut(&key("h.com.")).unwrap();
+            e.stored_at = Instant::now() - Duration::from_secs(10);
+        }
+        let blob = cache.export_snapshot();
+
+        let restored = DnsCache::new(100, 0, 0, 3600);
+        assert_eq!(restored.import_snapshot(&blob), 1);
+        assert!(restored.get(&key("h.com."), 0).expect("stale hit").stale);
+    }
+
+    #[test]
+    fn snapshot_drops_dead_entry() {
+        // Past ttl + stale window at export time -> not written to the blob.
+        let cache = DnsCache::new(100, 0, 0, 5);
+        cache.insert(key("d.com."), &answer("d.com.", 1));
+        {
+            let mut map = cache.shard(&key("d.com.")).lock();
+            let e = map.get_mut(&key("d.com.")).unwrap();
+            e.stored_at = Instant::now() - Duration::from_secs(60);
+        }
+        let blob = cache.export_snapshot();
+
+        let restored = DnsCache::new(100, 0, 0, 5);
+        assert_eq!(restored.import_snapshot(&blob), 0);
+    }
+
+    #[test]
+    fn import_ignores_garbage() {
+        let cache = DnsCache::new(100, 0, 0, 0);
+        assert_eq!(cache.import_snapshot(b""), 0);
+        assert_eq!(cache.import_snapshot(b"not a snapshot at all"), 0);
+        // Valid header, truncated body -> 0 restored, no panic.
+        let mut blob = SNAPSHOT_MAGIC.to_vec();
+        blob.extend_from_slice(&unix_secs().to_le_bytes());
+        blob.extend_from_slice(&5u32.to_le_bytes()); // claims 5, has none
+        assert_eq!(cache.import_snapshot(&blob), 0);
     }
 
     #[test]

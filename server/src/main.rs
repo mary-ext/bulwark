@@ -40,6 +40,10 @@ async fn main() -> anyhow::Result<()> {
         persist::load_stats(&paths.stats, &engine);
     }
 
+    // Warm the DNS cache from the last snapshot (after build_engine has applied
+    // the cache's TTL/stale config, so expiry is judged correctly).
+    persist::load_cache(&paths.cache_snapshot, &engine);
+
     // Open the disk-backed query-log store. When persistence is off we use an
     // in-memory database so the log still works for the lifetime of the process.
     let store_path = if config.query_log.persist {
@@ -69,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
     // Background tasks.
     spawn_probe_loop(engine.clone(), config.clone());
     persist::spawn_stats_snapshotter(engine.clone(), paths.stats.clone(), config.clone());
+    persist::spawn_cache_snapshotter(engine.clone(), paths.cache_snapshot.clone());
     persist::spawn_querylog_pruner(store.clone(), config.clone());
 
     // Start DNS listeners.
@@ -100,10 +105,11 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, appy.into_make_service())
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            tracing::info!("shutting down; persisting stats");
+            tracing::info!("shutting down; persisting stats + cache");
             if shutdown_cfg.read().await.stats.persist {
                 persist::snapshot_stats_now(&shutdown_engine, &shutdown_paths.stats);
             }
+            persist::snapshot_cache_now(&shutdown_engine, &shutdown_paths.cache_snapshot);
         })
         .await
         .context("http server error")?;

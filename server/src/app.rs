@@ -26,6 +26,9 @@ pub struct Paths {
     /// Disk-backed query-log database (SQLite via Turso).
     pub querylog_db: PathBuf,
     pub stats: PathBuf,
+    /// DNS cache snapshot, restored on startup to warm the cache (see
+    /// [`crate::persist::load_cache`]).
+    pub cache_snapshot: PathBuf,
 }
 
 impl Paths {
@@ -35,6 +38,7 @@ impl Paths {
             lists_dir: data_dir.join("lists"),
             querylog_db: data_dir.join("querylog.db"),
             stats: data_dir.join("stats.json"),
+            cache_snapshot: data_dir.join("cache.snap"),
             data_dir,
         }
     }
