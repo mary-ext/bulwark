@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bulwark_config::BlockingMode;
 use bulwark_engine::cache::DnsCache;
@@ -287,6 +287,46 @@ async fn build_engine(
         Arc::new(DnsCache::new(100_000, 0, max_ttl, stale_max_age)),
         Arc::new(QueryLog::new(10_000, true)),
         Arc::new(Stats::new(true, 24)),
+    )
+}
+
+/// Like `build_engine`, but with independent control over whether the query log
+/// and stats recorders are enabled — used to isolate `finalize()`'s cost.
+async fn build_engine_obs(
+    filter: Arc<FilterEngine>,
+    upstream: SocketAddr,
+    stats_on: bool,
+    log_on: bool,
+) -> Arc<Engine> {
+    let pool = Arc::new(
+        UpstreamPool::build(
+            &[PoolEntry {
+                spec: format!("udp://{upstream}"),
+                name: Some("mock".into()),
+            }],
+            PoolSettings {
+                query_timeout: Duration::from_millis(500),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    let state = EngineState {
+        filter,
+        pool,
+        clients: Arc::new(ClientMatcher::default()),
+        filtering_enabled: true,
+        blocking_mode: BlockingMode::NxDomain,
+        block_v4: Ipv4Addr::UNSPECIFIED,
+        block_v6: std::net::Ipv6Addr::UNSPECIFIED,
+        blocked_ttl: 10,
+    };
+    Engine::new(
+        state,
+        Arc::new(DnsCache::new(100_000, 0, 0, 3600)),
+        Arc::new(QueryLog::new(10_000, log_on)),
+        Arc::new(Stats::new(stats_on, 24)),
     )
 }
 
@@ -672,6 +712,94 @@ async fn phase2_scenarios(
         many(stale, RecordType::A),
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b: finalize() cost — cache-hit path with observability on vs off.
+//
+// `finalize()` runs on *every* query and, when stats/log are enabled, builds
+// answer summaries, stringifies the client IP, reads the wall clock, locks a
+// stats shard, and pushes a log entry. The "fully off" run early-returns before
+// any of that, so on - off ≈ the finalize cost paid per cached query in prod.
+// ---------------------------------------------------------------------------
+
+async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) {
+    println!("\n== Phase 2b: finalize() cost on the cache-hit path (obs on vs off) ==");
+
+    // stats + log ON (production default).
+    let on = build_engine_obs(filter.clone(), upstream, true, true).await;
+    let _ = on
+        .handle(query("fin-hot.example.", RecordType::A), local())
+        .await;
+    let hot = (0..n).map(|_| "fin-hot.example".to_string());
+    scenario(&on, "cache hit (stats+log on)", many(hot, RecordType::A)).await;
+
+    // stats + log OFF (finalize early-returns the response untouched).
+    let off = build_engine_obs(filter.clone(), upstream, false, false).await;
+    let _ = off
+        .handle(query("fin-hot.example.", RecordType::A), local())
+        .await;
+    let hot = (0..n).map(|_| "fin-hot.example".to_string());
+    scenario(&off, "cache hit (obs off)", many(hot, RecordType::A)).await;
+
+    // stats only / log only, to attribute the cost between the two recorders.
+    let stats_only = build_engine_obs(filter.clone(), upstream, true, false).await;
+    let _ = stats_only
+        .handle(query("fin-hot.example.", RecordType::A), local())
+        .await;
+    let hot = (0..n).map(|_| "fin-hot.example".to_string());
+    scenario(&stats_only, "cache hit (stats only)", many(hot, RecordType::A)).await;
+
+    let log_only = build_engine_obs(filter.clone(), upstream, false, true).await;
+    let _ = log_only
+        .handle(query("fin-hot.example.", RecordType::A), local())
+        .await;
+    let hot = (0..n).map(|_| "fin-hot.example".to_string());
+    scenario(&log_only, "cache hit (log only)", many(hot, RecordType::A)).await;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2c: finalize() component micro-costs (deterministic, best-of-5).
+//
+// Isolates the individual allocators/syscalls inside finalize()+build() so we
+// know which ones are worth eliminating.
+// ---------------------------------------------------------------------------
+
+fn phase2c_finalize_components() {
+    println!("\n== Phase 2c: finalize() component micro-costs (best-of-5) ==");
+    let n = 1_000_000usize;
+
+    // A representative A response: two answer records, like a real reply.
+    let name = Name::from_str("cache-hot.example.").unwrap();
+    let recs = vec![
+        Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4)))),
+        Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(5, 6, 7, 8)))),
+    ];
+
+    // (a) Answer summaries: `resp.answers.iter().map(summarize).collect()`,
+    //     where summarize = format!("{} {}", record_type, data).
+    let summaries = best_ns_per_op(5, n, |_| {
+        let v: Vec<String> = recs
+            .iter()
+            .map(|r| format!("{} {}", r.record_type(), r.data))
+            .collect();
+        v.iter().map(|s| s.len()).sum::<usize>()
+    });
+    println!("  answer summaries (2 recs)   {summaries:>4} ns/op");
+
+    // (b) client_ip.to_string() in LogBuilder::build.
+    let ip: IpAddr = "192.168.1.50".parse().unwrap();
+    let ip_cost = best_ns_per_op(5, n, |_| ip.to_string().len());
+    println!("  client_ip.to_string()       {ip_cost:>4} ns/op");
+
+    // (c) now_ms(): a SystemTime::now() syscall per query.
+    let now_cost = best_ns_per_op(5, n, |_| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as usize)
+            .unwrap_or(0)
+    });
+    println!("  now_ms() (SystemTime::now)  {now_cost:>4} ns/op");
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1191,8 @@ async fn main() {
     phase0_ab(&blocked);
     phase1_stage_profile(&filter, &blocked);
     phase2_scenarios(filter.clone(), &blocked, upstream, n).await;
+    phase2b_finalize(filter.clone(), upstream, n).await;
+    phase2c_finalize_components();
     phase3_concurrency(
         filter.clone(),
         &blocked,
