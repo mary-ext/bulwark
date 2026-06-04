@@ -77,9 +77,12 @@ fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
 
 /// Response-side filtering: re-check the records an upstream actually returned
 /// against the blocklist. The query name can pass the request-side check while
-/// the answer points at a blocked target — *CNAME cloaking*, where a tracker
-/// hides behind a first-party `CNAME` (`data.brand.com -> tracker.evil.net`), is
-/// the canonical case the query-name check alone never catches.
+/// the answer points at a blocked target. Two cases:
+///
+/// - *CNAME cloaking*: a tracker hides behind a first-party `CNAME`
+///   (`data.brand.com -> tracker.evil.net`); the query-name check never sees it.
+/// - *IP blocking*: the resolved `A`/`AAAA` address itself matches a rule (e.g.
+///   a known ad-serving IP), regardless of the name that resolved to it.
 ///
 /// Returns the matching rule for the first blocked record, or `None` if the
 /// whole answer chain is clean. The records are already parsed (the upstream
@@ -98,12 +101,15 @@ fn filter_answers(
     };
     for rec in answers {
         // `Name::to_ascii` carries a trailing dot; `filter.check` normalises it,
-        // but trim here so the comparison is unambiguous.
-        let target = match &rec.data {
-            RData::CNAME(cname) => cname.0.to_ascii(),
+        // but trim here so the comparison is unambiguous. IP literals stringify
+        // without a trailing dot, so the trim is a no-op for them.
+        let (target, rtype) = match &rec.data {
+            RData::CNAME(cname) => (cname.0.to_ascii(), "CNAME"),
+            RData::A(ip) => (ip.0.to_string(), "A"),
+            RData::AAAA(ip) => (ip.0.to_string(), "AAAA"),
             _ => continue,
         };
-        if let Verdict::Block(info) = filter.check(target.trim_end_matches('.'), "CNAME", &ci) {
+        if let Verdict::Block(info) = filter.check(target.trim_end_matches('.'), rtype, &ci) {
             return Some(info);
         }
     }

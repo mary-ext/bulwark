@@ -259,6 +259,24 @@ async fn uncloak_block_is_cached() {
 }
 
 #[tokio::test]
+async fn blocks_response_by_resolved_ip() {
+    // The name is clean, but it resolves to a blocked IP. Response-side
+    // filtering must catch the A record's address and block.
+    let (up, _count) = mock_upstream(Ipv4Addr::new(9, 9, 9, 9)).await;
+    let engine = make_engine("||9.9.9.9^", up).await;
+
+    let r = engine
+        .handle(ingest(query("sneaky.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r.metadata.response_code,
+        ResponseCode::NXDomain,
+        "an answer resolving to a blocked IP should be blocked"
+    );
+}
+
+#[tokio::test]
 async fn clean_cname_chain_is_forwarded() {
     // A CNAME chain whose target is *not* blocked must pass through untouched.
     let up = mock_upstream_cname("cdn.good.net.", Ipv4Addr::new(5, 6, 7, 8)).await;
