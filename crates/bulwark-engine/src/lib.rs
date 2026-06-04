@@ -15,6 +15,7 @@ pub mod clients;
 pub mod querylog;
 pub mod server;
 pub mod stats;
+pub mod wire;
 
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -30,7 +31,7 @@ use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 
 use crate::block::{block_response, error_response, rewrite_response, Rewritten};
-use crate::cache::DnsCache;
+use crate::cache::{CachedResponse, DnsCache};
 use crate::clients::{ClientMatcher, ResolvedClient};
 use crate::querylog::{QueryAction, QueryLog, QueryLogEntry};
 use crate::stats::Stats;
@@ -75,6 +76,20 @@ fn fill_answer_summaries(dst: &mut Vec<String>, src: &[hickory_proto::rr::Record
             let _ = write!(s, "{} {}", rec.record_type(), rec.data);
         } else {
             dst.push(format!("{} {}", rec.record_type(), rec.data));
+        }
+    }
+    dst.truncate(src.len());
+}
+
+/// Copy precomputed answer summaries into `dst`, reusing its existing `String`
+/// buffers. Used by the wire cache path, whose summaries are stored on the entry.
+fn fill_from_summaries(dst: &mut Vec<String>, src: &[String]) {
+    for (i, s) in src.iter().enumerate() {
+        if let Some(d) = dst.get_mut(i) {
+            d.clear();
+            d.push_str(s);
+        } else {
+            dst.push(s.clone());
         }
     }
     dst.truncate(src.len());
@@ -168,15 +183,14 @@ impl Engine {
     }
 
     /// Process a query and return the response, recording log + stats.
-    pub async fn handle(&self, query: Message, client_ip: IpAddr) -> Message {
+    pub async fn handle(&self, query: Message, client_ip: IpAddr) -> EngineResponse {
         let start = Instant::now();
         let state = self.state.load();
         let client = state.clients.identify(client_ip);
 
         // A query must have a question.
         let Some(question) = query.queries.first().cloned() else {
-            let resp = error_response(&query, ResponseCode::FormErr);
-            return resp;
+            return EngineResponse::Message(error_response(&query, ResponseCode::FormErr));
         };
         let rtype = question.query_type();
         let rtype_str = rtype_label(rtype);
@@ -245,15 +259,23 @@ impl Engine {
             rtype,
             class: question.query_class(),
         };
-        if let Some(hit) = self.cache.get(&key) {
-            let mut resp = hit.message;
-            resp.metadata.id = query.metadata.id;
+        if let Some(hit) = self.cache.get(&key, query.metadata.id) {
             if hit.stale {
                 // Optimistic: refresh in the background (single-flight in the
                 // pool ensures only one upstream request).
                 self.spawn_refresh(state.pool.clone(), query.clone(), key.clone());
             }
-            return self.finalize(resp, QueryAction::Cached, log, start);
+            return match hit.response {
+                // Fast path: pre-encoded bytes with id + TTLs already patched.
+                CachedResponse::Wire {
+                    bytes,
+                    rcode,
+                    answers,
+                } => self.finalize_wire(bytes, rcode, answers, log, start),
+                CachedResponse::Message(resp) => {
+                    self.finalize(resp, QueryAction::Cached, log, start)
+                }
+            };
         }
 
         // ---- Upstream ----
@@ -308,20 +330,25 @@ impl Engine {
         });
     }
 
-    fn finalize(
+    /// Build + record the query-log entry and stats for a completed query,
+    /// reusing a pooled entry's buffers. `rcode` and `fill_answers` supply the
+    /// response-derived fields without requiring a `Message`, so the wire
+    /// fast path needs no decode.
+    fn record(
         &self,
-        resp: Message,
-        action: QueryAction,
         log: LogBuilder,
+        action: QueryAction,
+        rcode: Cow<'static, str>,
+        fill_answers: impl FnOnce(&mut Vec<String>),
         start: Instant,
-    ) -> Message {
+    ) {
         // If nothing will consume the entry, don't pay to build it: the answer
-        // summaries, rcode label, client-IP string, and the entry itself are all
-        // pure logging/stats overhead.
+        // summaries, client-IP string, and the entry itself are all pure
+        // logging/stats overhead.
         let stats_on = self.stats.is_enabled();
         let log_on = self.log.is_enabled();
         if !stats_on && !log_on {
-            return resp;
+            return;
         }
 
         // Only forwarded queries set the per-upstream RTT.
@@ -344,8 +371,8 @@ impl Engine {
         entry.qtype = log.qtype;
         entry.action = action;
         entry.allowlisted = log.allowlisted;
-        entry.rcode = rcode_label(resp.metadata.response_code);
-        fill_answer_summaries(&mut entry.answers, &resp.answers);
+        entry.rcode = rcode;
+        fill_answers(&mut entry.answers);
         entry.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         if stats_on {
@@ -358,13 +385,82 @@ impl Engine {
             // returning to the pool instead of freeing them.
             self.log.recycle(entry);
         }
-        resp
+    }
+
+    /// Record a freshly-built `Message` response (forwarded / blocked / rewritten
+    /// / error / non-wire cache hit) and return it for the server to encode.
+    fn finalize(
+        &self,
+        resp: Message,
+        action: QueryAction,
+        log: LogBuilder,
+        start: Instant,
+    ) -> EngineResponse {
+        let rcode = rcode_label(resp.metadata.response_code);
+        self.record(
+            log,
+            action,
+            rcode,
+            |dst| fill_answer_summaries(dst, &resp.answers),
+            start,
+        );
+        EngineResponse::Message(resp)
+    }
+
+    /// Record a wire-byte cache hit (bytes already id/TTL-patched) using the
+    /// precomputed rcode + answer summaries, and return the bytes ready to send —
+    /// no `Message` clone, no re-encode.
+    fn finalize_wire(
+        &self,
+        bytes: Vec<u8>,
+        rcode: ResponseCode,
+        answers: Arc<[String]>,
+        log: LogBuilder,
+        start: Instant,
+    ) -> EngineResponse {
+        self.record(
+            log,
+            QueryAction::Cached,
+            rcode_label(rcode),
+            |dst| fill_from_summaries(dst, &answers),
+            start,
+        );
+        EngineResponse::Wire(bytes)
+    }
+}
+
+/// A processed response, ready for the server to put on the wire. The hot cache
+/// path yields pre-encoded `Wire` bytes (no re-encode); every other path yields
+/// a `Message` the server encodes itself.
+pub enum EngineResponse {
+    Message(Message),
+    Wire(Vec<u8>),
+}
+
+impl EngineResponse {
+    /// Decode to a structured `Message` (re-parsing `Wire` bytes). Off the hot
+    /// path — used by the UDP truncation fallback and by tests.
+    pub fn into_message(self) -> Message {
+        match self {
+            EngineResponse::Message(m) => m,
+            EngineResponse::Wire(b) => Message::from_vec(&b)
+                .unwrap_or_else(|_| Message::new(0, MessageType::Response, OpCode::Query)),
+        }
+    }
+
+    /// Encode to wire bytes with no length limit (TCP). `Wire` bytes pass through
+    /// unchanged; a `Message` is encoded here.
+    pub fn into_wire(self) -> Option<Vec<u8>> {
+        match self {
+            EngineResponse::Message(m) => m.to_vec().ok(),
+            EngineResponse::Wire(b) => Some(b),
+        }
     }
 }
 
 /// Accumulates the outcome-independent fields for a [`QueryLogEntry`] during
-/// processing. The outcome-specific data lives in the [`QueryAction`] passed to
-/// [`build`](LogBuilder::build).
+/// processing. The outcome-specific data (action, rcode, answers) is supplied to
+/// [`Engine::record`] at finalize time.
 struct LogBuilder {
     /// Kept as an `IpAddr` (Copy); only stringified in `finalize`, which the
     /// caller skips entirely when neither logging nor stats is enabled.

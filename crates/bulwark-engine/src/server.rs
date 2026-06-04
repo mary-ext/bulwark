@@ -82,7 +82,14 @@ fn spawn_udp(engine: Arc<Engine>, socket: UdpSocket) -> JoinHandle<()> {
             tokio::spawn(async move {
                 let max = udp_max_payload(&query);
                 let resp = engine.handle(query, peer.ip()).await;
-                let bytes = encode_udp(&resp, max);
+                // Fast path: a wire-byte cache hit is already encoded and almost
+                // always fits the UDP limit — send it as-is. Otherwise (a
+                // `Message`, or oversized wire needing truncation) fall back to
+                // `encode_udp`, which decodes the wire only in that rare case.
+                let bytes = match resp {
+                    crate::EngineResponse::Wire(b) if b.len() <= max => b,
+                    other => encode_udp(&other.into_message(), max),
+                };
                 if !bytes.is_empty() {
                     let _ = socket.send_to(&bytes, peer).await;
                 }
@@ -132,9 +139,9 @@ async fn serve_tcp_conn(
             return Ok(());
         };
         let resp = engine.handle(query, peer.ip()).await;
-        let bytes = match resp.to_vec() {
-            Ok(b) => b,
-            Err(_) => return Ok(()),
+        let bytes = match resp.into_wire() {
+            Some(b) => b,
+            None => return Ok(()),
         };
         if bytes.len() > u16::MAX as usize {
             return Ok(());

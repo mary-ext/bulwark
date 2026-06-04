@@ -27,11 +27,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bulwark_config::BlockingMode;
-use bulwark_engine::cache::DnsCache;
+use bulwark_engine::cache::{CachedResponse, DnsCache};
 use bulwark_engine::clients::ClientMatcher;
 use bulwark_engine::querylog::QueryLog;
 use bulwark_engine::stats::Stats;
-use bulwark_engine::{Engine, EngineState};
+use bulwark_engine::{Engine, EngineResponse, EngineState};
 use bulwark_filter::{ClientInfo, Compiler, FilterEngine};
 use bulwark_upstream::{PoolEntry, PoolSettings, QueryKey, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -932,6 +932,60 @@ fn phase2d_log_microbench() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2e: end-to-end cache hit *including* the wire encode the server does.
+//
+// Phase 2 times handle() only; the wire-byte cache's biggest win — skipping the
+// per-response Message::to_vec re-encode — happens in the server, after handle().
+// This phase measures the full client-facing CPU two ways, same run (so it is
+// thermal-drift-immune): the real wire-byte path (send bytes as-is) vs. routing
+// the response back through a Message + to_vec. NOTE the round-trip arm also
+// *decodes* the wire (from_vec) to get a Message, which the pre-wire-byte code
+// never did (it held a Message already) — so it OVERSTATES the delta. The clean
+// per-hit saving vs. the old code is the Phase 2c figure (~231 ns: the
+// adjust_ttls clone + the to_vec re-encode, both now ~0).
+// ---------------------------------------------------------------------------
+
+async fn phase2e_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) {
+    println!("\n== Phase 2e: end-to-end cache hit incl. wire encode (handle + send-ready) ==");
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let _ = engine
+        .handle(query("e2e-hot.example.", RecordType::A), local())
+        .await;
+
+    // Real path: a wire-byte hit is already encoded; send it directly.
+    let msgs = many((0..n).map(|_| "e2e-hot.example".to_string()), RecordType::A);
+    let warm = (msgs.len() / 10).max(1);
+    for m in msgs.iter().take(warm) {
+        let _ = engine.handle(m.clone(), local()).await;
+    }
+    let mut ns = Vec::with_capacity(n);
+    for m in msgs {
+        let t = Instant::now();
+        let resp = engine.handle(m, local()).await;
+        let bytes = match resp {
+            EngineResponse::Wire(b) => b,
+            other => other.into_message().to_vec().unwrap_or_default(),
+        };
+        std::hint::black_box(bytes.len());
+        ns.push(t.elapsed().as_nanos() as u64);
+    }
+    report("wire-byte (send as-is)", ns);
+
+    // Round-trip through a Message (decode + re-encode). Upper bound; overstates
+    // vs. the old code by the decode it adds — see the phase note.
+    let msgs = many((0..n).map(|_| "e2e-hot.example".to_string()), RecordType::A);
+    let mut ns = Vec::with_capacity(n);
+    for m in msgs {
+        let t = Instant::now();
+        let resp = engine.handle(m, local()).await;
+        let bytes = resp.into_message().to_vec().unwrap_or_default();
+        std::hint::black_box(bytes.len());
+        ns.push(t.elapsed().as_nanos() as u64);
+    }
+    report("Message round-trip (dec+enc)", ns);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3: concurrent throughput + single-flight.
 // ---------------------------------------------------------------------------
 
@@ -1279,8 +1333,11 @@ fn phase5_cache_contention() {
                 let mut i = t;
                 let mut sink = 0usize;
                 for _ in 0..per_thread {
-                    if let Some(hit) = cache.get(&keys[i & mask]) {
-                        sink += hit.message.answers.len();
+                    if let Some(hit) = cache.get(&keys[i & mask], 0) {
+                        sink += match hit.response {
+                            CachedResponse::Wire { bytes, .. } => bytes.len(),
+                            CachedResponse::Message(m) => m.answers.len(),
+                        };
                     }
                     i = i.wrapping_add(1);
                 }
@@ -1323,6 +1380,7 @@ async fn main() {
     phase2b_finalize(filter.clone(), upstream, n).await;
     phase2c_finalize_components();
     phase2d_log_microbench();
+    phase2e_e2e(filter.clone(), upstream, n).await;
     phase3_concurrency(
         filter.clone(),
         &blocked,

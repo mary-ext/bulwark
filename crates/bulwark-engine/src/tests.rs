@@ -106,7 +106,8 @@ async fn forwards_and_caches() {
 
     let r1 = engine
         .handle(query("good.com.", RecordType::A), local())
-        .await;
+        .await
+        .into_message();
     assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
     assert_eq!(r1.answers.len(), 1);
     assert_eq!(r1.metadata.id, 0xABCD);
@@ -114,10 +115,39 @@ async fn forwards_and_caches() {
     // Second identical query should be served from cache (no new upstream hit).
     let r2 = engine
         .handle(query("good.com.", RecordType::A), local())
-        .await;
+        .await
+        .into_message();
     assert_eq!(r2.answers.len(), 1);
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(engine.cache().hit_count(), 1);
+}
+
+#[tokio::test]
+async fn cache_hit_serves_patched_wire() {
+    let (up, count) = mock_upstream(Ipv4Addr::new(9, 8, 7, 6)).await;
+    let engine = make_engine("", up).await;
+
+    // Prime the cache (forwarded, stored as wire bytes with TTL 300).
+    let _ = engine
+        .handle(query("hit.com.", RecordType::A), local())
+        .await;
+
+    // Second query with a *different* transaction id -> wire-byte cache hit.
+    let mut q = query("hit.com.", RecordType::A);
+    q.metadata.id = 0x4242;
+    let r = engine.handle(q, local()).await.into_message();
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "cache hit must not touch upstream"
+    );
+    assert_eq!(r.metadata.id, 0x4242, "id must be patched to the new query");
+    assert_eq!(r.metadata.message_type, MessageType::Response);
+    assert_eq!(r.answers.len(), 1);
+    assert!(matches!(&r.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(9, 8, 7, 6)));
+    // TTL was rewritten to the remaining lifetime (<= the stored 300, >= 1).
+    assert!(r.answers[0].ttl >= 1 && r.answers[0].ttl <= 300);
 }
 
 #[tokio::test]
@@ -127,7 +157,8 @@ async fn blocks_filtered_domain() {
 
     let r = engine
         .handle(query("ads.example.com.", RecordType::A), local())
-        .await;
+        .await
+        .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
     // Blocked queries never touch the upstream.
     assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -149,7 +180,8 @@ async fn rewrites_to_custom_ip() {
 
     let r = engine
         .handle(query("router.lan.", RecordType::A), local())
-        .await;
+        .await
+        .into_message();
     assert_eq!(r.answers.len(), 1);
     assert!(matches!(&r.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(10, 0, 0, 1)));
 }
@@ -180,6 +212,7 @@ async fn servfail_when_no_upstream_answers() {
     let engine = make_engine("", dead).await;
     let r = engine
         .handle(query("anything.com.", RecordType::A), local())
-        .await;
+        .await
+        .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
 }

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bulwark_upstream::QueryKey;
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use lru::LruCache;
 use parking_lot::Mutex;
 
@@ -20,11 +20,32 @@ const DEFAULT_NEGATIVE_TTL: u32 = 30;
 /// TTL (seconds) applied to records when serving a stale answer.
 const STALE_SERVE_TTL: u32 = 1;
 
+/// How a cached response is held. The common case is `Wire`: the response we
+/// already encoded once, plus the byte offsets of every TTL field, so serving a
+/// hit is a flat byte clone + in-place id/TTL patch — no `Message` clone and no
+/// `to_vec` re-encode. `Message` is the fallback for the rare response we
+/// couldn't safely wire-scan.
+///
+/// All fields are behind `Arc`/`Box`, so cloning a `Stored` under the cache lock
+/// is just pointer bumps; the actual byte clone + patch happens after the lock
+/// is released so concurrent hits don't serialize on it.
+#[derive(Clone)]
+enum Stored {
+    Wire {
+        /// Encoded response bytes, TTLs as originally stored.
+        bytes: Arc<[u8]>,
+        /// Byte offsets of each RR TTL field (excludes OPT); patched per hit.
+        ttl_offsets: Arc<[u32]>,
+        /// Response code, kept so the query log/stats don't re-parse the wire.
+        rcode: ResponseCode,
+        /// Precomputed answer summaries for the query log (e.g. `"A 1.2.3.4"`).
+        answers: Arc<[String]>,
+    },
+    Message(Arc<Message>),
+}
+
 struct Entry {
-    /// Stored behind an `Arc` so a cache hit only clones a pointer while the
-    /// cache mutex is held; the (comparatively expensive) per-record TTL
-    /// rewrite happens on a clone made *after* the lock is released.
-    message: Arc<Message>,
+    stored: Stored,
     stored_at: Instant,
     /// Effective (clamped) TTL in seconds.
     ttl: u32,
@@ -36,13 +57,42 @@ impl Entry {
     }
 }
 
+/// The response form returned from a cache hit: either ready-to-send wire bytes
+/// (id + TTLs already patched) plus the bits the log/stats need, or a `Message`
+/// fallback the caller encodes itself.
+pub enum CachedResponse {
+    Wire {
+        bytes: Vec<u8>,
+        rcode: ResponseCode,
+        answers: Arc<[String]>,
+    },
+    Message(Message),
+}
+
+impl CachedResponse {
+    /// Decode to a structured `Message`. The `Wire` variant re-parses its bytes
+    /// (only used off the hot path — e.g. by the UDP truncation fallback or
+    /// tests; the fast path sends the bytes as-is).
+    pub fn into_message(self) -> Message {
+        match self {
+            CachedResponse::Message(m) => m,
+            CachedResponse::Wire { bytes, .. } => Message::from_vec(&bytes)
+                .unwrap_or_else(|_| Message::new(0, MessageType::Response, OpCode::Query)),
+        }
+    }
+}
+
 /// Result of a cache lookup.
 pub struct CacheHit {
-    /// The cached response with TTLs adjusted to remaining lifetime.
-    pub message: Message,
+    pub response: CachedResponse,
     /// True when this is a stale (expired) answer served optimistically; the
     /// caller should trigger a background refresh.
     pub stale: bool,
+}
+
+/// Summarise an answer record as e.g. `"A 1.2.3.4"` for the query log.
+fn summarize(rec: &hickory_proto::rr::Record) -> String {
+    format!("{} {}", rec.record_type(), rec.data)
 }
 
 /// Live, atomically-updatable cache tuning.
@@ -176,17 +226,19 @@ impl DnsCache {
         self.misses.load(Ordering::Relaxed)
     }
 
-    /// Look up a response. Returns `None` on a true miss; counts hits/misses.
-    pub fn get(&self, key: &QueryKey) -> Option<CacheHit> {
+    /// Look up a response, returning it ready to serve with TTLs decremented to
+    /// remaining lifetime and the transaction id set to `id`. Returns `None` on a
+    /// true miss; counts hits/misses.
+    pub fn get(&self, key: &QueryKey, id: u16) -> Option<CacheHit> {
         if !self.is_enabled() {
             return None;
         }
 
-        // Hold the lock only long enough to bump the LRU and grab a cheap `Arc`
-        // handle to the stored message; the per-record TTL rewrite (a full
-        // message clone) is deferred until after the guard is dropped so
-        // concurrent hits don't serialize on it.
-        let (message, ttl, stale) = {
+        // Hold the lock only long enough to bump the LRU and clone a cheap
+        // (pointer-only) handle to the stored form; the actual byte clone + TTL
+        // patch (or message clone) is deferred until after the guard is dropped
+        // so concurrent hits don't serialize on it.
+        let (stored, ttl, stale) = {
             let mut map = self.shard(key).lock();
             let Some(entry) = map.get(key) else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -195,12 +247,12 @@ impl DnsCache {
 
             let age = entry.age_secs();
             let entry_ttl = entry.ttl;
-            // `Arc::clone` (refcount bump) ends the borrow of `entry`, freeing
+            // Cloning `stored` (Arc bumps) ends the borrow of `entry`, freeing
             // `map` for the `pop` below.
-            let message = entry.message.clone();
+            let stored = entry.stored.clone();
 
             if age < entry_ttl {
-                (message, (entry_ttl - age).max(1), false)
+                (stored, (entry_ttl - age).max(1), false)
             } else {
                 // Expired. Optionally serve stale within the configured window
                 // (serve-stale is on iff `stale_max_age > 0`). The window is
@@ -208,7 +260,7 @@ impl DnsCache {
                 // lifetime of a stale-servable entry.
                 let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
                 if age.saturating_sub(entry_ttl) < stale_max_age {
-                    (message, STALE_SERVE_TTL, true)
+                    (stored, STALE_SERVE_TTL, true)
                 } else {
                     // Too old / not optimistic: drop it and report a miss.
                     map.pop(key);
@@ -219,10 +271,28 @@ impl DnsCache {
         };
 
         self.hits.fetch_add(1, Ordering::Relaxed);
-        Some(CacheHit {
-            message: adjust_ttls(&message, ttl),
-            stale,
-        })
+        let response = match stored {
+            Stored::Wire {
+                bytes,
+                ttl_offsets,
+                rcode,
+                answers,
+            } => {
+                let mut out = bytes.to_vec();
+                crate::wire::patch(&mut out, id, ttl, &ttl_offsets);
+                CachedResponse::Wire {
+                    bytes: out,
+                    rcode,
+                    answers,
+                }
+            }
+            Stored::Message(message) => {
+                let mut m = adjust_ttls(&message, ttl);
+                m.metadata.id = id;
+                CachedResponse::Message(m)
+            }
+        };
+        Some(CacheHit { response, stale })
     }
 
     /// Insert a response. No-op if the response isn't cacheable.
@@ -233,8 +303,23 @@ impl DnsCache {
         let Some(ttl) = self.cacheable_ttl(message) else {
             return;
         };
+        // Encode once and record TTL offsets so hits are a byte clone + patch.
+        // Fall back to storing the `Message` if encoding or the wire scan fails
+        // (rare; keeps correctness for anything we can't safely patch).
+        let stored = match message.to_vec() {
+            Ok(bytes) => match crate::wire::scan_ttl_offsets(&bytes) {
+                Some(offsets) => Stored::Wire {
+                    bytes: Arc::from(bytes.into_boxed_slice()),
+                    ttl_offsets: Arc::from(offsets.into_boxed_slice()),
+                    rcode: message.metadata.response_code,
+                    answers: message.answers.iter().map(summarize).collect(),
+                },
+                None => Stored::Message(Arc::new(message.clone())),
+            },
+            Err(_) => Stored::Message(Arc::new(message.clone())),
+        };
         let entry = Entry {
-            message: Arc::new(message.clone()),
+            stored,
             stored_at: Instant::now(),
             ttl,
         };
@@ -342,26 +427,27 @@ mod tests {
     fn caches_and_returns_with_decreasing_ttl() {
         let cache = DnsCache::new(100, 0, 0, 0);
         cache.insert(key("a.com."), &answer("a.com.", 100));
-        let hit = cache.get(&key("a.com.")).unwrap();
+        let hit = cache.get(&key("a.com."), 0).unwrap();
         assert!(!hit.stale);
-        assert!(hit.message.answers[0].ttl <= 100);
-        assert!(hit.message.answers[0].ttl >= 99);
+        let m = hit.response.into_message();
+        assert!(m.answers[0].ttl <= 100);
+        assert!(m.answers[0].ttl >= 99);
     }
 
     #[test]
     fn min_ttl_clamp_raises_short_ttls() {
         let cache = DnsCache::new(100, 60, 0, 0);
         cache.insert(key("b.com."), &answer("b.com.", 5));
-        let hit = cache.get(&key("b.com.")).unwrap();
-        assert!(hit.message.answers[0].ttl >= 59);
+        let hit = cache.get(&key("b.com."), 0).unwrap();
+        assert!(hit.response.into_message().answers[0].ttl >= 59);
     }
 
     #[test]
     fn max_ttl_clamp_caps_long_ttls() {
         let cache = DnsCache::new(100, 0, 100, 0);
         cache.insert(key("c.com."), &answer("c.com.", 100_000));
-        let hit = cache.get(&key("c.com.")).unwrap();
-        assert!(hit.message.answers[0].ttl <= 100);
+        let hit = cache.get(&key("c.com."), 0).unwrap();
+        assert!(hit.response.into_message().answers[0].ttl <= 100);
     }
 
     #[test]
@@ -372,7 +458,7 @@ mod tests {
         cache.insert(key("d.com."), &answer("d.com.", 1));
         // Manually expire by mutating stored_at is not accessible; instead test
         // that a fresh non-optimistic cache without the entry misses.
-        assert!(cache.get(&key("missing.com.")).is_none());
+        assert!(cache.get(&key("missing.com."), 0).is_none());
     }
 
     #[test]
@@ -382,7 +468,7 @@ mod tests {
         m.answers.clear();
         m.metadata.response_code = ResponseCode::ServFail;
         cache.insert(key("e.com."), &m);
-        assert!(cache.get(&key("e.com.")).is_none());
+        assert!(cache.get(&key("e.com."), 0).is_none());
     }
 
     #[test]
@@ -393,7 +479,7 @@ mod tests {
         m.metadata.response_code = ResponseCode::NXDomain;
         cache.insert(key("f.com."), &m);
         // NXDOMAIN with no answers is cached (negative cache).
-        assert!(cache.get(&key("f.com.")).is_some());
+        assert!(cache.get(&key("f.com."), 0).is_some());
     }
 
     #[test]
@@ -402,7 +488,7 @@ mod tests {
         cache.insert(key("g.com."), &answer("g.com.", 100));
         assert_eq!(cache.len(), 1);
         cache.reconfigure(false, 100, 0, 0, 0);
-        assert!(cache.get(&key("g.com.")).is_none());
+        assert!(cache.get(&key("g.com."), 0).is_none());
         assert_eq!(cache.len(), 0);
     }
 
@@ -419,7 +505,7 @@ mod tests {
             let e = map.get_mut(&key("h.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
-        let hit = cache.get(&key("h.com.")).expect("stale hit");
+        let hit = cache.get(&key("h.com."), 0).expect("stale hit");
         assert!(hit.stale);
 
         // Now push it beyond the stale window -> miss.
@@ -429,7 +515,7 @@ mod tests {
             let e = map.get_mut(&key("h.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(7200);
         }
-        assert!(cache.get(&key("h.com.")).is_none());
+        assert!(cache.get(&key("h.com."), 0).is_none());
     }
 
     #[test]
@@ -441,6 +527,6 @@ mod tests {
             let e = map.get_mut(&key("i.com.")).unwrap();
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
-        assert!(cache.get(&key("i.com.")).is_none());
+        assert!(cache.get(&key("i.com."), 0).is_none());
     }
 }
