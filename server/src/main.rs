@@ -1,5 +1,13 @@
 //! Bulwark server: runs the DNS engine and serves the web UI + REST API.
 
+// Opt-in fast global allocator. The per-query hot path is allocation-heavy
+// (Message parse, response build, wire encode, query-log entry) and frees the
+// log entry on a different thread than it was allocated — a pattern the system
+// allocator handles poorly. Enable with `--features mimalloc`.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

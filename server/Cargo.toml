@@ -41,6 +41,16 @@ rand.workspace = true
 humantime.workspace = true
 turso.workspace = true
 mime_guess = "2"
+# Optional fast global allocator (see the `mimalloc` feature). The hot path
+# allocates several times per query (parse, response build, encode, log entry)
+# and frees the log entry cross-thread on the writer — an alloc pattern that a
+# sharded allocator handles far better than the system default.
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+# Install mimalloc as the global allocator. Off by default so a plain build
+# uses the system allocator; flip on once benched to be a clear win.
+mimalloc = ["dep:mimalloc"]
 
 [dev-dependencies]
 # Enables the additive trust-root hook only for examples/tests/benches — NOT the
