@@ -800,6 +800,29 @@ fn phase2c_finalize_components() {
             .unwrap_or(0)
     });
     println!("  now_ms() (SystemTime::now)  {now_cost:>4} ns/op");
+
+    // (d) What a wire-byte cache would replace, per cache hit:
+    //   - the Message clone done in adjust_ttls()  (cache hit, in handle)
+    //   - the Message::to_vec() re-encode          (server, AFTER handle — not
+    //     captured by Phase 2, which times handle() only)
+    // vs. what it would cost instead: a flat Vec<u8> clone + in-place TTL patch.
+    let mut resp = Message::new(0x1234, MessageType::Response, OpCode::Query);
+    let mut q = Query::query(name.clone(), RecordType::A);
+    q.set_query_class(DNSClass::IN);
+    resp.queries.push(q);
+    for r in &recs {
+        resp.answers.push(r.clone());
+    }
+    let clone_cost = best_ns_per_op(5, n, |_| resp.clone().answers.len());
+    let encode_cost = best_ns_per_op(5, n, |_| resp.to_vec().map(|v| v.len()).unwrap_or(0));
+    let wire = resp.to_vec().unwrap();
+    let wireclone_cost = best_ns_per_op(5, n, |_| wire.clone().len());
+    println!("  Message::clone (adjust_ttls){clone_cost:>4} ns/op");
+    println!("  Message::to_vec (server enc){encode_cost:>4} ns/op");
+    println!(
+        "  Vec<u8>::clone (wire-byte)   {wireclone_cost:>4} ns/op   (replaces the two above: ~{} ns saved/hit)",
+        (clone_cost + encode_cost).saturating_sub(wireclone_cost)
+    );
 }
 
 // ---------------------------------------------------------------------------

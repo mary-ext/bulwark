@@ -6,7 +6,6 @@
 //!   served immediately while a background refresh runs.
 //! * LRU-bounded, keyed by `(name, type, class)`.
 
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
