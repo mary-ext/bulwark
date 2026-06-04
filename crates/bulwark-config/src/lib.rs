@@ -283,6 +283,9 @@ impl Default for FilteringConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ClientConfig {
+    /// Stable, server-assigned identifier. Used as the resource key in the API.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     /// Identifiers: IP addresses or CIDR ranges.
     #[serde(default)]
@@ -375,8 +378,17 @@ impl Config {
             return Ok(Self::default());
         }
         let text = std::fs::read_to_string(path)?;
-        let cfg: Config = serde_yaml::from_str(&text)?;
+        let mut cfg: Config = serde_yaml::from_str(&text)?;
         cfg.validate()?;
+        // Clients are keyed by a stable `id`. Legacy entries predating the
+        // granular client API have none and can't be addressed, so drop them
+        // rather than migrate.
+        let before = cfg.clients.len();
+        cfg.clients.retain(|c| !c.id.is_empty());
+        let dropped = before - cfg.clients.len();
+        if dropped > 0 {
+            tracing::warn!("dropped {dropped} client(s) without an id from config");
+        }
         Ok(cfg)
     }
 

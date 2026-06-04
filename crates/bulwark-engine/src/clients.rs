@@ -111,6 +111,7 @@ mod tests {
 
     fn cfg(name: &str, ids: &[&str], tags: &[&str]) -> ClientConfig {
         ClientConfig {
+            id: name.into(),
             name: name.into(),
             ids: ids.iter().map(|s| s.to_string()).collect(),
             tags: tags.iter().map(|s| s.to_string()).collect(),

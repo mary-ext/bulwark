@@ -655,6 +655,7 @@ mod tests {
         // retroactively, without re-recording anything. Removing the name later
         // (an empty matcher) reverts them to bare IPs — as the `bare` case shows.
         let m = ClientMatcher::build(&[ClientConfig {
+            id: "lan".into(),
             name: "lan".into(),
             ids: vec!["10.0.0.0/24".into()],
             tags: vec![],

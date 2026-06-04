@@ -338,6 +338,7 @@ mod tests {
         // Name 10.0.0.5 "phone": a name filter now matches an entry logged
         // before the name existed.
         let m = ClientMatcher::build(&[ClientConfig {
+            id: "phone".into(),
             name: "phone".into(),
             ids: vec!["10.0.0.5".into()],
             tags: vec![],
