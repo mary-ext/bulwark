@@ -66,36 +66,39 @@
 </div>
 
 {#if stats}
+  <!-- Only attach a card sparkline once there are at least two hourly buckets
+       to connect; below that we pass no snippet so the card shows no empty
+       trend strip. -->
+  {#snippet totalSpark()}
+    <Sparkline
+      values={totalTrend}
+      labels={sparkLabels}
+      color="var(--accent)"
+      ariaLabel="Hourly query volume"
+    />
+  {/snippet}
+  {#snippet blockedSpark()}
+    <Sparkline
+      values={blockedTrend}
+      labels={sparkLabels}
+      color="var(--bad)"
+      ariaLabel="Hourly blocked volume"
+    />
+  {/snippet}
   <div class="grid cols-4">
-    <StatCard label="Total queries" value={num(stats.total)} sub="{num(stats.errors)} errors">
-      {#snippet spark()}
-        {#if totalTrend.length > 1}
-          <Sparkline
-            values={totalTrend}
-            labels={sparkLabels}
-            color="var(--accent)"
-            ariaLabel="Hourly query volume"
-          />
-        {/if}
-      {/snippet}
-    </StatCard>
+    <StatCard
+      label="Total queries"
+      value={num(stats.total)}
+      sub="{num(stats.errors)} errors"
+      spark={totalTrend.length > 1 ? totalSpark : undefined}
+    />
     <StatCard
       label="Blocked"
       value={num(stats.blocked)}
       sub="{pct(stats.block_rate)} of queries"
       tone="bad"
-    >
-      {#snippet spark()}
-        {#if blockedTrend.length > 1}
-          <Sparkline
-            values={blockedTrend}
-            labels={sparkLabels}
-            color="var(--bad)"
-            ariaLabel="Hourly blocked volume"
-          />
-        {/if}
-      {/snippet}
-    </StatCard>
+      spark={blockedTrend.length > 1 ? blockedSpark : undefined}
+    />
     <StatCard
       label="Cache hit rate"
       value={pct(cacheRate)}
