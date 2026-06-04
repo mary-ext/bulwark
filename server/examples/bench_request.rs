@@ -1579,29 +1579,50 @@ async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: S
     let _ = engine
         .handle(query("req-hot.example.", RecordType::A), peer)
         .await;
+    // Pre-build the raw query byte-blobs OUTSIDE the timed loop — a real server
+    // receives bytes off the socket, it does not synthesize them. Building them
+    // in-loop (as an earlier version did) inflated ns/req and polluted samply.
+    // Use a bounded pool indexed by `i % len` so cycling stays realistic.
+    let pool_len = iters.min(100_000);
+    let pool: Vec<Vec<u8>> = match scenario {
+        "cachehit" => vec![raw("req-hot.example.")],
+        "blocked" => (0..pool_len).map(|i| raw(&blocked[i % blocked.len()])).collect(),
+        "forwarded" => (0..pool_len).map(|i| raw(&format!("p{i}.bench-prof.example"))).collect(),
+        other => {
+            eprintln!("unknown BENCH_PROFILE='{other}' (use cachehit|blocked|forwarded)");
+            return;
+        }
+    };
     eprintln!("profiling '{scenario}' x{iters} (no socket I/O) ...");
     let t = Instant::now();
+    let (mut parse_ns, mut handle_ns, mut enc_ns) = (0u128, 0u128, 0u128);
     let mut sink = 0usize;
     for i in 0..iters {
-        let bytes = match scenario {
-            "cachehit" => raw("req-hot.example."),
-            "blocked" => raw(&blocked[i % blocked.len()]),
-            "forwarded" => raw(&format!("p{i}.bench-prof.example")),
-            other => {
-                eprintln!("unknown BENCH_PROFILE='{other}' (use cachehit|blocked|forwarded)");
-                return;
-            }
-        };
-        let q = Message::from_vec(&bytes).unwrap();
+        let bytes = &pool[i % pool.len()];
+        let a = Instant::now();
+        let q = Message::from_vec(bytes).unwrap();
         let max = udp_max_payload(&q);
+        let b = Instant::now();
         let resp = engine.handle(q, peer).await;
+        let c = Instant::now();
         let out = encode_udp_response(resp, max);
+        let d = Instant::now();
+        parse_ns += b.duration_since(a).as_nanos();
+        handle_ns += c.duration_since(b).as_nanos();
+        enc_ns += d.duration_since(c).as_nanos();
         sink = sink.wrapping_add(out.len());
     }
+    let per = |x: u128| x / iters as u128;
     eprintln!(
         "done '{scenario}': {:?} total, {:.0} ns/req, sink={sink}",
         t.elapsed(),
         t.elapsed().as_nanos() as f64 / iters as f64
+    );
+    eprintln!(
+        "  split: parse={} ns  handle={} ns  encode={} ns",
+        per(parse_ns),
+        per(handle_ns),
+        per(enc_ns)
     );
 }
 
