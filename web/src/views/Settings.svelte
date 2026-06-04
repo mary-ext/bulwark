@@ -65,10 +65,10 @@
     load();
   });
 
-  async function run(fn: () => Promise<unknown>, okMsg: string) {
+  async function run<T>(fn: () => Promise<T>, okMsg: string | ((res: T) => string)) {
     try {
-      await fn();
-      toaster.show(okMsg);
+      const res = await fn();
+      toaster.show(typeof okMsg === "function" ? okMsg(res) : okMsg);
     } catch (e) {
       toaster.show(errMsg(e, "Save failed"), true);
     }
@@ -285,7 +285,13 @@
             class="btn btn-primary"
             onclick={() =>
               server &&
-              run(() => ok(api.putServer(server!)), "Server settings saved (restart to apply binds)")}
+              run(
+                () => ok(api.putServer(server!)),
+                (res) =>
+                  res.restart_required
+                    ? "Server settings saved — restart required to apply bind changes"
+                    : "Server settings saved",
+              )}
           >
             Save
           </button>

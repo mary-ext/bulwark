@@ -35,7 +35,9 @@ export type OkResponse = {
     ok: boolean;
 };
 export type AuthConfig = {
-    /** Argon2 password hash; `None` until the admin sets a password (setup flow). */
+    /** Argon2 password hash; `None` until the admin sets a password (setup flow).
+    Skipped when absent so the redacted (`None`) value the API returns never
+    rides the wire, and the YAML stays clean before setup. */
     password_hash?: string | null;
     /** Admin username. */
     username?: string;
@@ -286,7 +288,6 @@ export type UpstreamStatDto = {
     avg_rtt_ms?: number | null;
     kind: TransportKindDto;
     last_error?: string | null;
-    last_rtt_ms?: number | null;
     name: string;
     spec: string;
     total_failures: number;

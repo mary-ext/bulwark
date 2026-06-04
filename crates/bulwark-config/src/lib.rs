@@ -366,7 +366,9 @@ pub struct AuthConfig {
     #[serde(default)]
     pub username: String,
     /// Argon2 password hash; `None` until the admin sets a password (setup flow).
-    #[serde(default)]
+    /// Skipped when absent so the redacted (`None`) value the API returns never
+    /// rides the wire, and the YAML stays clean before setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
 }
 

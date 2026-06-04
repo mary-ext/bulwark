@@ -451,14 +451,17 @@ pub async fn put_server(
     Json(body): Json<ServerConfig>,
 ) -> ApiResult<Json<ServerUpdateResponse>> {
     let (mut cfg, _update) = state.begin_update().await;
+    // Only the listen binds need a restart to take effect; everything else
+    // (e.g. rate limit) applies live, so only flag a restart when a bind moved.
+    let restart_required =
+        cfg.server.dns_bind != body.dns_bind || cfg.server.http_bind != body.http_bind;
     cfg.server = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    // Note: dns_bind / http_bind changes take effect on restart.
     Ok(Json(ServerUpdateResponse {
         ok: true,
-        restart_required: true,
+        restart_required,
     }))
 }
 

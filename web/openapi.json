@@ -1261,7 +1261,7 @@
               "string",
               "null"
             ],
-            "description": "Argon2 password hash; `None` until the admin sets a password (setup flow)."
+            "description": "Argon2 password hash; `None` until the admin sets a password (setup flow).\nSkipped when absent so the redacted (`None`) value the API returns never\nrides the wire, and the YAML stays clean before setup."
           },
           "username": {
             "type": "string",
@@ -2192,13 +2192,6 @@
               "string",
               "null"
             ]
-          },
-          "last_rtt_ms": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double"
           },
           "name": {
             "type": "string"
