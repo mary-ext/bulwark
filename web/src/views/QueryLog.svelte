@@ -92,15 +92,6 @@
     return e.allowlisted ? "allowed" : e.action;
   }
 
-  // The merged "Response" summary: matched rule, else first answer, else rcode.
-  function resultText(e: LogEntryView): string {
-    return e.rule ?? e.answers[0] ?? e.rcode;
-  }
-
-  function upstreamText(e: LogEntryView): string {
-    return e.upstream ?? (e.action === "cached" ? "cache" : "");
-  }
-
   // Match AdGuard Home: allow => @@||host^$important, block => ||host^$important.
   async function addRule(e: LogEntryView, allow: boolean) {
     const domain = bareDomain(e.question);
@@ -164,9 +155,9 @@
     {#snippet head()}
       <tr>
         <th>Time</th>
-        <th>Domain</th>
+        <th class="domain-col">Domain</th>
         <th>Client</th>
-        <th>Response</th>
+        <th class="resp-col">Response</th>
         <th></th>
       </tr>
     {/snippet}
@@ -174,20 +165,20 @@
     {#snippet row(e)}
       <tr class="hoverable clickable" onclick={() => openDetail(e)}>
         <td class="muted nowrap" title={dateTime(e.time_ms)}>{relTime(e.time_ms)}</td>
-        <td>
+        <td class="domain-col">
           <div class="domain-cell">
             <span class="mono domain" title={e.question}>{e.question}</span>
             <span class="qtype">{e.qtype}</span>
           </div>
         </td>
         <td class="nowrap">{e.client_name ?? e.client_ip}</td>
-        <td>
+        <td class="resp-col">
           <div class="response-cell">
-            <Badge tone={tone(e)}>{statusLabel(e)}</Badge>
-            <span class="resp-detail mono muted" title={resultText(e)}>
-              {resultText(e)}{#if upstreamText(e)} · <span class="faint">{upstreamText(e)}</span
-                >{/if}
-            </span>
+            <span class="status status-{tone(e)}">{statusLabel(e)}</span>
+            {#if e.rule}
+              <span class="resp-detail mono muted" title={e.rule}>{e.rule}</span>
+            {/if}
+            <span class="resp-latency muted" title="Response time">{ms(e.elapsed_ms)}</span>
           </div>
         </td>
         <td class="actions-cell" onclick={(ev) => ev.stopPropagation()}>
@@ -218,7 +209,7 @@
           <Badge tone={tone(e)}>{statusLabel(e)}</Badge>
         </div>
         <div class="log-card-meta muted">
-          {relTime(e.time_ms)} · {e.qtype} · {e.client_name ?? e.client_ip}
+          {relTime(e.time_ms)} · {e.qtype} · {e.client_name ?? e.client_ip} · {ms(e.elapsed_ms)}
         </div>
       </button>
     {/snippet}
@@ -330,17 +321,24 @@
     white-space: nowrap;
   }
 
-  /* Desktop table cells (now ~5 columns — no horizontal scroll) */
+  /* Desktop table cells (~5 columns — no horizontal scroll) */
   .clickable {
     cursor: pointer;
+  }
+  /* Let Domain absorb all leftover width; the other columns size to content.
+     width:100% + max-width:0 makes the cell take the slack while the inner
+     text truncates instead of stretching the row. */
+  .domain-col {
+    width: 100%;
+    max-width: 0;
   }
   .domain-cell {
     display: flex;
     align-items: baseline;
     gap: var(--sp-2);
-    max-width: 340px;
   }
   .domain {
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -351,18 +349,53 @@
     font-family: var(--font-mono);
     color: var(--text-faint);
   }
+  /* Size the Response column to its content (don't let the greedy Domain
+     column squeeze it narrower than its widest row, which clipped latency). */
+  .resp-col {
+    width: 1%;
+    white-space: nowrap;
+  }
   .response-cell {
     display: flex;
     align-items: center;
     gap: var(--sp-2);
-    max-width: 420px;
+  }
+  /* Plain-text status (no badge pill); a subtle color keeps the verdict scannable. */
+  .status {
+    flex-shrink: 0;
+    font-size: 0.82rem;
+  }
+  .status-good {
+    color: var(--good-fg);
+  }
+  .status-bad {
+    color: var(--bad-fg);
+  }
+  .status-warn {
+    color: var(--warn-fg);
+  }
+  .status-info {
+    color: var(--info-fg);
+  }
+  .status-neutral {
+    color: var(--text-dim);
   }
   .resp-detail {
     min-width: 0;
+    max-width: 240px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-size: 0.8rem;
+  }
+  /* Response time, right-aligned within the cell so the values form a tidy
+     column; td padding keeps it clear of the actions column. */
+  .resp-latency {
+    flex-shrink: 0;
+    margin-left: auto;
+    padding-left: var(--sp-3);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
   }
   .actions-cell {
     text-align: right;
