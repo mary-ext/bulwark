@@ -1492,6 +1492,117 @@ async fn phase6_full_request(
         .map(|i| raw(&format!("r{i}-{}.bench-req.example", rand::random::<u32>())))
         .collect();
     full_request_scenario(&engine, "forwarded (parse+handle+enc)", fwd_pool).await;
+
+    // Same-run handle-only (no parse, no encode) for blocked vs cache hit, so
+    // the block-synthesis cost is isolated in one thermal context (cross-phase
+    // subtraction is unreliable — see the "same-run A/B only" rule).
+    let blk_msgs = blocked.iter().cycle().take(n).map(|d| query(d, RecordType::A)).collect();
+    handle_only(&engine, "blocked (handle only)", blk_msgs).await;
+    let hit_msgs = std::iter::repeat_with(|| query("req-hot.example.", RecordType::A)).take(n).collect();
+    handle_only(&engine, "cache hit (handle only)", hit_msgs).await;
+
+    // Decomposition (same-run, best-of-5): attribute the blocked path's per-
+    // request cost. A blocked reply is a synthesized Message, so unlike a cache
+    // hit (wire-byte passthrough, ~0 encode) it pays a full to_vec every query.
+    println!("\n  -- blocked-path decomposition (best-of-5 ns/op) --");
+    let blk_bytes = raw(&blocked[0]);
+    // (a) Request parse: Message::from_vec of the inbound blocked query.
+    let parse_ns = best_of_5(|| {
+        let m = Message::from_vec(&blk_bytes).unwrap();
+        std::hint::black_box(m.queries.len())
+    });
+    println!("  {:<32} {parse_ns:>6} ns/op", "Message::from_vec (request)");
+    // (b) Blocked-response encode: to_vec of the synthesized NXDOMAIN+SOA.
+    let blk_resp = engine
+        .handle(Message::from_vec(&blk_bytes).unwrap(), local())
+        .await
+        .into_message();
+    let blk_enc_ns = best_of_5(|| blk_resp.to_vec().unwrap().len());
+    println!("  {:<32} {blk_enc_ns:>6} ns/op", "blocked resp to_vec (SOA)");
+    // (c) For contrast: to_vec of a typical A response (the positive case the
+    // wire-byte cache lets us skip entirely on a hit).
+    let a_resp = engine
+        .handle(query("req-hot.example.", RecordType::A), local())
+        .await
+        .into_message();
+    let a_enc_ns = best_of_5(|| a_resp.to_vec().unwrap().len());
+    println!("  {:<32} {a_enc_ns:>6} ns/op", "A resp to_vec (contrast)");
+    // (d) The constant SOA names block_response re-parses on EVERY blocked
+    // NXDOMAIN/NODATA query (block.rs negative_soa). Two of these per block.
+    let soa_name_ns = best_of_5(|| {
+        let n = Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap();
+        n.num_labels() as usize
+    });
+    println!("  {:<32} {soa_name_ns:>6} ns/op  (x2 per block, constant)", "Name::from_str (SOA mname)");
+}
+
+/// Time engine.handle() only (no parse, no encode) over a batch of messages.
+async fn handle_only(engine: &Arc<Engine>, label: &str, msgs: Vec<Message>) {
+    let peer = local();
+    let mut ns = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        let t = Instant::now();
+        let resp = engine.handle(m, peer).await;
+        ns.push(t.elapsed().as_nanos() as u64);
+        std::hint::black_box(matches!(resp, EngineResponse::Wire(_)));
+    }
+    report(label, ns);
+}
+
+/// Best-of-5 timing of a tight 100k-iteration loop, in ns/op. Returns the
+/// minimum across 5 trials to suppress scheduler/thermal noise (same yardstick
+/// as Phase 2c).
+fn best_of_5(mut f: impl FnMut() -> usize) -> u128 {
+    let iters = 100_000u128;
+    let mut best = u128::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        let mut sink = 0usize;
+        for _ in 0..iters {
+            sink = sink.wrapping_add(f());
+        }
+        std::hint::black_box(sink);
+        best = best.min(t.elapsed().as_nanos() / iters);
+    }
+    best
+}
+
+/// Run a single full-request workload (parse + handle + encode) at high volume
+/// for external profilers. `scenario` ∈ {cachehit, blocked, forwarded}. Iteration
+/// count comes from BENCH_N (default 1.5M — a few seconds of samples).
+async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: SocketAddr, scenario: &str) {
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let raw = |name: &str| query(name, RecordType::A).to_vec().unwrap();
+    let iters = env_usize("BENCH_N", 1_500_000);
+    let peer = local();
+    // Prime the cache-hit domain.
+    let _ = engine
+        .handle(query("req-hot.example.", RecordType::A), peer)
+        .await;
+    eprintln!("profiling '{scenario}' x{iters} (no socket I/O) ...");
+    let t = Instant::now();
+    let mut sink = 0usize;
+    for i in 0..iters {
+        let bytes = match scenario {
+            "cachehit" => raw("req-hot.example."),
+            "blocked" => raw(&blocked[i % blocked.len()]),
+            "forwarded" => raw(&format!("p{i}.bench-prof.example")),
+            other => {
+                eprintln!("unknown BENCH_PROFILE='{other}' (use cachehit|blocked|forwarded)");
+                return;
+            }
+        };
+        let q = Message::from_vec(&bytes).unwrap();
+        let max = udp_max_payload(&q);
+        let resp = engine.handle(q, peer).await;
+        let out = encode_udp_response(resp, max);
+        sink = sink.wrapping_add(out.len());
+    }
+    eprintln!(
+        "done '{scenario}': {:?} total, {:.0} ns/req, sink={sink}",
+        t.elapsed(),
+        t.elapsed().as_nanos() as f64 / iters as f64
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1511,6 +1622,14 @@ async fn main() {
     println!("  sampled {} real blockable domains", blocked.len());
 
     let (upstream, _count) = mock_upstream(delay).await;
+
+    // Profiling mode: when BENCH_PROFILE=<scenario> is set, run ONLY that
+    // full-request workload at high volume and exit — a clean target for
+    // samply/perf with no other phases to dilute the flamegraph.
+    if let Ok(scenario) = std::env::var("BENCH_PROFILE") {
+        profile_only(filter, &blocked, upstream, &scenario).await;
+        return;
+    }
 
     phase0_ab(&blocked);
     phase1_stage_profile(&filter, &blocked);
