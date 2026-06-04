@@ -599,7 +599,7 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
     let engine = Engine::new(
         state,
         Arc::new(DnsCache::new(100_000, 0, 3600, 0)),
-        Arc::new(QueryLog::new(10_000, true)),
+        Arc::new(QueryLog::new(true)),
         Arc::new(Stats::new(true, 24)),
     );
 

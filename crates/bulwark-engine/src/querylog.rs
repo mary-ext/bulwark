@@ -1,13 +1,15 @@
-//! In-memory query log: a bounded ring buffer of recent queries with filtering
-//! and pagination for the UI.
+//! Query log: the shared entry types plus a thin send-side gate.
+//!
+//! The log is disk-backed (see the server's query store). The DNS hot path
+//! builds a [`QueryLogEntry`] and, when logging is enabled, hands it to
+//! [`QueryLog::push`], which forwards it to the background writer over an
+//! unbounded channel. The [`LogFilter`]/[`LogPage`] shapes are defined here but
+//! the filtering and pagination they describe run against the database.
 
 use std::borrow::Cow;
-use std::collections::VecDeque;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-
-use crate::clients::ClientMatcher;
 
 /// What happened to a query, together with the data specific to that outcome.
 ///
@@ -57,10 +59,8 @@ pub struct QueryLogEntry {
 }
 
 impl QueryLogEntry {
-    /// An empty entry whose heap buffers can be filled in place. Used as the
-    /// starting point when no recycled entry is available; every field is
-    /// overwritten before the entry is stored, so the placeholder `Cached`
-    /// action is never observed.
+    /// An empty entry whose fields are filled in before use. The placeholder
+    /// `Cached` action is always overwritten, so it is never observed.
     pub fn empty() -> Self {
         Self {
             id: 0,
@@ -127,183 +127,53 @@ pub struct LogFilter {
 #[derive(Debug, Serialize)]
 pub struct LogPage {
     pub entries: Vec<QueryLogEntry>,
-    /// Total entries currently held (before paging, after filtering).
+    /// Total entries matching the filter (across all pages), for pagination.
     pub total: usize,
 }
 
-/// Maximum number of evicted entries kept around for buffer reuse. Bounds the
-/// memory the recycle pool can hold while still covering the steady-state churn
-/// (one entry evicted per push once the ring is full).
-const RECYCLE_POOL_CAP: usize = 256;
-
-/// Bounded, newest-first query log.
+/// A thin send-side gate in front of the disk-backed store. Holds the
+/// enabled/disabled toggle and the channel to the background writer; it does not
+/// retain entries. The DNS path checks [`is_enabled`](Self::is_enabled) before
+/// paying to build an entry, then calls [`push`](Self::push) to hand it off.
 pub struct QueryLog {
-    inner: Mutex<VecDeque<QueryLogEntry>>,
-    capacity: parking_lot::RwLock<usize>,
     enabled: std::sync::atomic::AtomicBool,
-    /// Optional sink for persistence: each pushed entry is also forwarded here so
-    /// a background writer can append it to disk.
+    /// Channel to the background writer. Set once at startup; `None` until then
+    /// (or when persistence is unwired), in which case pushes are dropped.
     sink: Mutex<Option<tokio::sync::mpsc::UnboundedSender<QueryLogEntry>>>,
-    /// Evicted entries kept for their heap buffers so the next entry can be
-    /// filled in place (clear + rewrite) instead of allocating fresh strings.
-    /// This is what keeps the hot path from thrashing the allocator: at steady
-    /// state every push evicts one entry, which lands here and is handed back to
-    /// the next [`recycled_entry`](QueryLog::recycled_entry) caller.
-    recycled: Mutex<Vec<QueryLogEntry>>,
 }
 
 impl QueryLog {
-    pub fn new(capacity: usize, enabled: bool) -> Self {
+    pub fn new(enabled: bool) -> Self {
         Self {
-            inner: Mutex::new(VecDeque::with_capacity(capacity.min(1024))),
-            capacity: parking_lot::RwLock::new(capacity.max(1)),
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             sink: Mutex::new(None),
-            recycled: Mutex::new(Vec::new()),
         }
     }
 
-    /// Take an entry whose heap buffers can be reused, if one is pooled. The
-    /// caller must overwrite every field before storing it. Returns `None` when
-    /// the pool is empty (caller should start from [`QueryLogEntry::empty`]).
-    pub fn recycled_entry(&self) -> Option<QueryLogEntry> {
-        self.recycled.lock().pop()
-    }
-
-    /// Return an entry's buffers to the recycle pool instead of freeing them.
-    /// Used for the stats-only path (entry built but not stored in the ring) and
-    /// internally for evicted entries.
-    pub fn recycle(&self, entry: QueryLogEntry) {
-        let mut pool = self.recycled.lock();
-        if pool.len() < RECYCLE_POOL_CAP {
-            pool.push(entry);
-        }
-        // Otherwise let it drop (free) — the pool is full enough.
-    }
-
-    /// Attach a persistence sink. Entries pushed afterwards are also sent here.
+    /// Attach the writer sink. Entries pushed afterwards are sent here.
     pub fn set_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<QueryLogEntry>) {
         *self.sink.lock() = Some(tx);
     }
 
-    /// Pre-populate the in-memory ring from persisted entries (oldest-first
-    /// input). Does not re-send to the sink.
-    pub fn preload(&self, entries: Vec<QueryLogEntry>) {
-        let cap = *self.capacity.read();
-        let mut q = self.inner.lock();
-        for e in entries {
-            q.push_front(e);
-            while q.len() > cap {
-                q.pop_back();
-            }
-        }
-    }
-
-    pub fn reconfigure(&self, capacity: usize, enabled: bool) {
-        *self.capacity.write() = capacity.max(1);
+    pub fn reconfigure(&self, enabled: bool) {
         self.enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
-        let cap = capacity.max(1);
-        let mut q = self.inner.lock();
-        while q.len() > cap {
-            q.pop_back();
-        }
     }
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Append a new entry (newest at the front), evicting the oldest if full.
-    /// The single entry evicted at steady state is routed to the recycle pool so
-    /// its heap buffers can be reused rather than freed.
+    /// Forward a completed entry to the background writer. A no-op if logging is
+    /// disabled or no sink is attached. Cheap on the hot path: one atomic load
+    /// plus a lock-free channel send (the entry is moved, not cloned).
     pub fn push(&self, entry: QueryLogEntry) {
         if !self.is_enabled() {
-            // Not stored, but its buffers are still worth recycling.
-            self.recycle(entry);
             return;
         }
         if let Some(tx) = self.sink.lock().as_ref() {
-            let _ = tx.send(entry.clone());
+            let _ = tx.send(entry);
         }
-        let cap = *self.capacity.read();
-        let evicted = {
-            let mut q = self.inner.lock();
-            q.push_front(entry);
-            // The common steady-state case: exactly one over capacity. Hold onto
-            // it to recycle after dropping the lock; any extra (e.g. just after a
-            // capacity shrink) is simply freed.
-            let evicted = if q.len() > cap { q.pop_back() } else { None };
-            while q.len() > cap {
-                q.pop_back();
-            }
-            evicted
-        };
-        if let Some(old) = evicted {
-            self.recycle(old);
-        }
-    }
-
-    pub fn clear(&self) {
-        self.inner.lock().clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Query the log with filtering + pagination (newest first). Stored entries
-    /// hold only the client IP; `clients` is the current client matcher, used to
-    /// resolve the friendly name for the client filter so a filter by name
-    /// matches entries logged before that name existed. The returned entries are
-    /// nameless — the caller resolves the display name the same way (see
-    /// `LogEntryView` in the server) so renames/removals apply retroactively.
-    pub fn query(
-        &self,
-        filter: &LogFilter,
-        offset: usize,
-        limit: usize,
-        clients: &ClientMatcher,
-    ) -> LogPage {
-        let q = self.inner.lock();
-        let search = filter.search.as_ref().map(|s| s.to_ascii_lowercase());
-        let client = filter.client.as_ref().map(|s| s.to_ascii_lowercase());
-
-        let matched: Vec<&QueryLogEntry> = q
-            .iter()
-            .filter(|e| {
-                if filter.blocked_only && !e.is_blocked() {
-                    return false;
-                }
-                if let Some(s) = &search {
-                    if !e.question.to_ascii_lowercase().contains(s) {
-                        return false;
-                    }
-                }
-                if let Some(c) = &client {
-                    let name_match = clients
-                        .name_for_str(&e.client_ip)
-                        .is_some_and(|n| n.to_ascii_lowercase().contains(c));
-                    if !e.client_ip.to_ascii_lowercase().contains(c) && !name_match {
-                        return false;
-                    }
-                }
-                true
-            })
-            .collect();
-
-        let total = matched.len();
-        let entries = matched
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect();
-        LogPage { entries, total }
     }
 }
 
@@ -311,119 +181,33 @@ impl QueryLog {
 mod tests {
     use super::*;
 
-    fn entry(id: u64, q: &str, blocked: bool) -> QueryLogEntry {
-        QueryLogEntry {
-            id,
-            time_ms: id as i64,
-            client_ip: "10.0.0.1".into(),
-            question: q.into(),
-            qtype: "A".into(),
-            action: if blocked {
-                QueryAction::Blocked {
-                    rule: "||ads^".into(),
-                    list_id: 0,
-                }
-            } else {
-                QueryAction::Forwarded {
-                    upstream: "1.1.1.1".into(),
-                }
-            },
-            allowlisted: false,
-            rcode: "NOERROR".into(),
-            answers: vec![],
-            elapsed_ms: 1.0,
-        }
+    /// The disabled gate drops entries without touching the (absent) sink, and a
+    /// push with no sink attached is a harmless no-op.
+    #[test]
+    fn gate_respects_enabled_and_missing_sink() {
+        let log = QueryLog::new(false);
+        log.push(QueryLogEntry::empty()); // disabled: dropped, no panic
+        log.reconfigure(true);
+        log.push(QueryLogEntry::empty()); // enabled but no sink: dropped, no panic
+        assert!(log.is_enabled());
     }
 
+    /// When a sink is attached, an enabled push forwards the entry to the writer.
     #[test]
-    fn ring_buffer_evicts_oldest() {
-        let log = QueryLog::new(3, true);
-        for i in 0..5 {
-            log.push(entry(i, "x.com", false));
-        }
-        assert_eq!(log.len(), 3);
-        let page = log.query(&LogFilter::default(), 0, 10, &ClientMatcher::default());
-        // Newest first.
-        assert_eq!(page.entries[0].id, 4);
-        assert_eq!(page.total, 3);
-    }
-
-    #[test]
-    fn filters_blocked_and_search() {
-        let log = QueryLog::new(10, true);
-        log.push(entry(1, "ads.example.com", true));
-        log.push(entry(2, "good.example.com", false));
-        let blocked = log.query(
-            &LogFilter {
-                blocked_only: true,
-                ..Default::default()
-            },
-            0,
-            10,
-            &ClientMatcher::default(),
-        );
-        assert_eq!(blocked.total, 1);
-        let search = log.query(
-            &LogFilter {
-                search: Some("good".into()),
-                ..Default::default()
-            },
-            0,
-            10,
-            &ClientMatcher::default(),
-        );
-        assert_eq!(search.total, 1);
-        assert_eq!(search.entries[0].id, 2);
-    }
-
-    #[test]
-    fn client_filter_resolves_names_retroactively() {
-        use bulwark_config::ClientConfig;
-
-        let log = QueryLog::new(10, true);
-        // Stored with only an IP; no name baked in.
-        let mut e = entry(1, "x.com", false);
-        e.client_ip = "10.0.0.5".into();
+    fn push_forwards_to_sink_when_enabled() {
+        let log = QueryLog::new(true);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        log.set_sink(tx);
+        let mut e = QueryLogEntry::empty();
+        e.id = 42;
         log.push(e);
+        let got = rx.try_recv().expect("entry forwarded");
+        assert_eq!(got.id, 42);
 
-        // Without config, filtering by the (future) name finds nothing.
-        let none = log.query(
-            &LogFilter {
-                client: Some("phone".into()),
-                ..Default::default()
-            },
-            0,
-            10,
-            &ClientMatcher::default(),
-        );
-        assert_eq!(none.total, 0);
-
-        // Name 10.0.0.5 "phone": a name filter now matches an entry logged
-        // before the name existed.
-        let m = ClientMatcher::build(&[ClientConfig {
-            id: "phone".into(),
-            name: "phone".into(),
-            ids: vec!["10.0.0.5".into()],
-            tags: vec![],
-            filtering_enabled: true,
-        }]);
-        let hit = log.query(
-            &LogFilter {
-                client: Some("phone".into()),
-                ..Default::default()
-            },
-            0,
-            10,
-            &m,
-        );
-        assert_eq!(hit.total, 1);
-    }
-
-    #[test]
-    fn disabled_log_drops_entries() {
-        let log = QueryLog::new(10, false);
-        log.push(entry(1, "x.com", false));
-        assert_eq!(log.len(), 0);
+        // Disabled: nothing forwarded.
+        log.reconfigure(false);
+        log.push(QueryLogEntry::empty());
+        assert!(rx.try_recv().is_err());
     }
 }
 

@@ -44,10 +44,6 @@ pub(crate) fn default_max_ttl() -> u32 {
     86_400
 }
 
-pub(crate) fn default_log_size() -> usize {
-    10_000
-}
-
 pub(crate) fn default_stats_days() -> u32 {
     30
 }

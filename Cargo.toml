@@ -70,6 +70,10 @@ humantime = "2"
 ipnet = { version = "2", features = ["serde"] }
 argon2 = "0.5"
 base64 = "0.22"
+# Embedded SQLite-compatible store for the query log. Pure-Rust, tokio-native.
+# default-features disabled to avoid the bundled mimalloc global allocator (we
+# keep control of the server allocator) and FTS (not needed yet — LIKE search).
+turso = { version = "0.7.0-pre.5", default-features = false }
 
 [profile.release]
 opt-level = 3

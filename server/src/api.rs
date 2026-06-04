@@ -1005,7 +1005,7 @@ fn default_limit() -> usize {
 pub async fn get_querylog(
     State(state): State<AppState>,
     Query(q): Query<LogQuery>,
-) -> Json<QueryLogResponse> {
+) -> ApiResult<Json<QueryLogResponse>> {
     let filter = bulwark_engine::querylog::LogFilter {
         search: q.search,
         client: q.client,
@@ -1013,9 +1013,10 @@ pub async fn get_querylog(
     };
     let clients = state.engine.clients();
     let page = state
-        .engine
-        .log()
-        .query(&filter, q.offset, q.limit.min(1000), &clients);
+        .store
+        .query(&filter, q.offset, q.limit.min(1000), &clients)
+        .await
+        .map_err(internal)?;
 
     // Resolve list ids to friendly names so the UI can show which list (and
     // which rule) was responsible.
@@ -1031,10 +1032,10 @@ pub async fn get_querylog(
             LogEntryView::new(entry, list_name, client_name)
         })
         .collect();
-    Json(QueryLogResponse {
+    Ok(Json(QueryLogResponse {
         entries,
         total: page.total,
-    })
+    }))
 }
 
 #[utoipa::path(
@@ -1043,9 +1044,9 @@ pub async fn get_querylog(
     tag = "querylog",
     responses((status = 200, body = OkResponse), (status = 401, body = ErrorResponse))
 )]
-pub async fn clear_querylog(State(state): State<AppState>) -> Json<OkResponse> {
-    state.engine.log().clear();
-    OkResponse::ok()
+pub async fn clear_querylog(State(state): State<AppState>) -> ApiResult<Json<OkResponse>> {
+    state.store.clear().await.map_err(internal)?;
+    Ok(OkResponse::ok())
 }
 
 #[utoipa::path(

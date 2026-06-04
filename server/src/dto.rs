@@ -212,7 +212,7 @@ impl LogEntryView {
 #[derive(Serialize, ToSchema)]
 pub struct QueryLogResponse {
     pub entries: Vec<LogEntryView>,
-    /// Total entries currently held (before paging, after filtering).
+    /// Total entries matching the filter (across all pages), for pagination.
     pub total: usize,
 }
 

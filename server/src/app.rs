@@ -23,7 +23,8 @@ pub struct Paths {
     pub data_dir: PathBuf,
     pub config: PathBuf,
     pub lists_dir: PathBuf,
-    pub querylog: PathBuf,
+    /// Disk-backed query-log database (SQLite via Turso).
+    pub querylog_db: PathBuf,
     pub stats: PathBuf,
 }
 
@@ -32,7 +33,7 @@ impl Paths {
         Self {
             config: data_dir.join("config.yaml"),
             lists_dir: data_dir.join("lists"),
-            querylog: data_dir.join("querylog.jsonl"),
+            querylog_db: data_dir.join("querylog.db"),
             stats: data_dir.join("stats.json"),
             data_dir,
         }
@@ -50,6 +51,9 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub paths: Arc<Paths>,
     pub sessions: Arc<Sessions>,
+    /// Disk-backed query-log store, read by the API and written by the
+    /// background writer task.
+    pub store: Arc<crate::store::QueryStore>,
 }
 
 /// Read a filter list's stored text (empty if it doesn't exist yet).
@@ -130,7 +134,7 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
         cfg.cache.max_ttl_secs,
         cfg.cache.optimistic_max_age_secs,
     );
-    let log = Arc::new(QueryLog::new(cfg.query_log.size, cfg.query_log.enabled));
+    let log = Arc::new(QueryLog::new(cfg.query_log.enabled));
     let stats = Arc::new(Stats::new(cfg.stats.enabled, cfg.stats.retention_days));
     Ok(Engine::new(state, cache, log, stats))
 }
@@ -163,7 +167,7 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
     state
         .engine
         .log()
-        .reconfigure(new_cfg.query_log.size, new_cfg.query_log.enabled);
+        .reconfigure(new_cfg.query_log.enabled);
     state
         .engine
         .stats()

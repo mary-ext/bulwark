@@ -301,14 +301,13 @@ pub struct ClientConfig {
 pub struct QueryLogConfig {
     #[serde(default = "btrue")]
     pub enabled: bool,
-    /// Number of recent entries kept in memory for fast browsing.
-    #[serde(default = "default_log_size")]
-    pub size: usize,
-    /// Persist the query log to disk so it survives restarts.
+    /// Persist the query log to disk so it survives restarts. When off, the log
+    /// is kept in an in-memory database for the lifetime of the process.
     #[serde(default = "btrue")]
     pub persist: bool,
-    /// How many days of query log to retain on disk (independent of `stats`).
-    /// 0 keeps only the in-memory `size` window.
+    /// How many days of query log to retain (independent of `stats`). Entries
+    /// older than this are pruned periodically. 0 disables time-based pruning
+    /// (the log is kept indefinitely).
     #[serde(default = "default_log_retention_days")]
     pub retention_days: u32,
     /// Whether to anonymize client IPs (drop last octet / suffix).
@@ -320,7 +319,6 @@ impl Default for QueryLogConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            size: default_log_size(),
             persist: true,
             retention_days: default_log_retention_days(),
             anonymize: false,

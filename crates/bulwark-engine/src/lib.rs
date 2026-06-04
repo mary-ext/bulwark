@@ -330,10 +330,10 @@ impl Engine {
         });
     }
 
-    /// Build + record the query-log entry and stats for a completed query,
-    /// reusing a pooled entry's buffers. `rcode` and `fill_answers` supply the
-    /// response-derived fields without requiring a `Message`, so the wire
-    /// fast path needs no decode.
+    /// Build + record the query-log entry and stats for a completed query.
+    /// `rcode` and `fill_answers` supply the response-derived fields without
+    /// requiring a `Message`, so the wire fast path needs no decode. The entry is
+    /// handed to the background writer (or dropped if logging is off).
     fn record(
         &self,
         log: LogBuilder,
@@ -355,14 +355,11 @@ impl Engine {
         let upstream_rtt_ms = log.upstream_rtt_ms;
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
 
-        // Fill a recycled entry in place when one is available, reusing its
-        // `client_ip` and `answers` heap buffers rather than allocating fresh
-        // strings on every query. The `question` buffer is moved in from the name
-        // we already normalised, so it costs no extra allocation either.
-        let mut entry = self.log.recycled_entry().unwrap_or_else(QueryLogEntry::empty);
+        // Build the entry. The `question` buffer is moved in from the name we
+        // already normalised, so it costs no extra allocation.
+        let mut entry = QueryLogEntry::empty();
         entry.id = id;
         entry.time_ms = now_ms();
-        entry.client_ip.clear();
         {
             use std::fmt::Write as _;
             let _ = write!(entry.client_ip, "{}", log.client_ip);
@@ -379,11 +376,8 @@ impl Engine {
             self.stats.record(&entry, upstream_rtt_ms);
         }
         if log_on {
+            // Hand off to the background writer (the entry is moved, not cloned).
             self.log.push(entry);
-        } else {
-            // Stats-only: the entry isn't stored, but its buffers are still worth
-            // returning to the pool instead of freeing them.
-            self.log.recycle(entry);
         }
     }
 

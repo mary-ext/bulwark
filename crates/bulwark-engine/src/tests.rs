@@ -81,7 +81,7 @@ async fn make_engine(rules: &str, upstream: SocketAddr) -> Arc<Engine> {
     Engine::new(
         state,
         Arc::new(DnsCache::new(100, 0, 0, 0)),
-        Arc::new(QueryLog::new(100, true)),
+        Arc::new(QueryLog::new(true)),
         Arc::new(Stats::new(true, 1)),
     )
 }
@@ -155,6 +155,10 @@ async fn blocks_filtered_domain() {
     let (up, count) = mock_upstream(Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||ads.example.com^", up).await;
 
+    // Capture what gets handed to the writer for this query.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.log().set_sink(tx);
+
     let r = engine
         .handle(query("ads.example.com.", RecordType::A), local())
         .await
@@ -163,14 +167,9 @@ async fn blocks_filtered_domain() {
     // Blocked queries never touch the upstream.
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
-    let page = engine
-        .log()
-        .query(&Default::default(), 0, 10, &engine.clients());
-    assert!(matches!(
-        page.entries[0].action,
-        QueryAction::Blocked { .. }
-    ));
-    assert!(page.entries[0].is_blocked());
+    let entry = rx.try_recv().expect("blocked query logged");
+    assert!(matches!(entry.action, QueryAction::Blocked { .. }));
+    assert!(entry.is_blocked());
 }
 
 #[tokio::test]

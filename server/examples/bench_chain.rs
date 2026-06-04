@@ -282,12 +282,23 @@ async fn build_engine(
         block_v6: std::net::Ipv6Addr::UNSPECIFIED,
         blocked_ttl: 10,
     };
-    Engine::new(
+    let engine = Engine::new(
         state,
         Arc::new(DnsCache::new(100_000, 0, max_ttl, stale_max_age)),
-        Arc::new(QueryLog::new(10_000, true)),
+        Arc::new(QueryLog::new(true)),
         Arc::new(Stats::new(true, 24)),
-    )
+    );
+    attach_drained_sink(&engine);
+    engine
+}
+
+/// Attach a query-log sink with a background drainer, mirroring production where
+/// each logged entry is sent to the writer task. Without this the log's `push`
+/// would be a no-op (no sink), under-counting the per-query send cost.
+fn attach_drained_sink(engine: &Arc<Engine>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.log().set_sink(tx);
+    tokio::spawn(async move { while rx.recv().await.is_some() {} });
 }
 
 /// Like `build_engine`, but with independent control over whether the query log
@@ -322,12 +333,16 @@ async fn build_engine_obs(
         block_v6: std::net::Ipv6Addr::UNSPECIFIED,
         blocked_ttl: 10,
     };
-    Engine::new(
+    let engine = Engine::new(
         state,
         Arc::new(DnsCache::new(100_000, 0, 0, 3600)),
-        Arc::new(QueryLog::new(10_000, log_on)),
+        Arc::new(QueryLog::new(log_on)),
         Arc::new(Stats::new(stats_on, 24)),
-    )
+    );
+    if log_on {
+        attach_drained_sink(&engine);
+    }
+    engine
 }
 
 fn query(name: &str, rtype: RecordType) -> Message {
@@ -826,18 +841,21 @@ fn phase2c_finalize_components() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2d: query-log build + push cost at steady state (deterministic).
+// Phase 2d: query-log build + push cost (deterministic).
 //
 // Isolates exactly the per-query log work — constructing a QueryLogEntry (its
-// string allocations) and pushing it into a *pre-filled* ring (so every push
-// evicts + frees one entry, the real production steady state). Measuring against
-// a pre-filled log avoids the VecDeque growth reallocs that inflate the
-// whole-chain Phase 2b number on a fresh engine. Same-run A/B, so it is immune
-// to the cross-run thermal drift that makes Phase 2 means hard to compare.
+// string allocations) and handing it to the writer over the unbounded channel
+// (a node alloc + atomic enqueue; the entry is moved, not cloned). A background
+// task drains the channel so it doesn't grow unbounded, matching production.
+// Same-run A/B (build-only vs build+send), so it is immune to the cross-run
+// thermal drift that makes Phase 2 means hard to compare.
+//
+// The writer's own work (the SQLite insert transaction) runs on a background
+// task, off the query's hot path entirely, so it is not measured here.
 // ---------------------------------------------------------------------------
 
 fn phase2d_log_microbench() {
-    println!("\n== Phase 2d: query-log build + push, steady state (best-of-5) ==");
+    println!("\n== Phase 2d: query-log build + channel send (best-of-5) ==");
     let n = 200_000usize;
 
     // A representative cached A response: one answer record.
@@ -874,60 +892,27 @@ fn phase2d_log_microbench() {
         e.client_ip.len() + e.question.len() + e.answers.iter().map(|s| s.len()).sum::<usize>()
     });
 
-    // (b) Build + push into a ring pre-filled to capacity (steady-state evict).
-    let log = QueryLog::new(10_000, true);
-    for _ in 0..12_000 {
-        log.push(make_entry());
+    // (b) Build + send to the writer channel (the real hot-path handoff). A
+    // receiver is attached and drained *between* timed trials — outside the
+    // timer — so the unbounded channel stays bounded without charging the recv
+    // cost to the measurement.
+    let log = QueryLog::new(true);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    log.set_sink(tx);
+    let mut buildpush = u128::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        for _ in 0..n {
+            log.push(make_entry());
+        }
+        buildpush = buildpush.min(t.elapsed().as_nanos() / n as u128);
+        while rx.try_recv().is_ok() {} // drain (untimed)
     }
-    let buildpush = best_ns_per_op(5, n, |_| {
-        log.push(make_entry());
-        0
-    });
 
     println!("  build entry only            {build:>4} ns/op");
     println!(
-        "  build + push (steady state) {buildpush:>4} ns/op   (push+evict alone ~{} ns)",
+        "  build + send (hot path)     {buildpush:>4} ns/op   (channel send alone ~{} ns)",
         buildpush.saturating_sub(build)
-    );
-
-    // (c) Pooled reuse: fill a recycled entry in place, exactly as the engine's
-    // finalize() does. Pre-fill so both the ring and the recycle pool are at
-    // steady state. Same-run A/B against (b), so it is thermal-drift-immune.
-    let log2 = QueryLog::new(10_000, true);
-    for _ in 0..12_000 {
-        log2.push(make_entry());
-    }
-    let pooled = best_ns_per_op(5, n, |_| {
-        use std::fmt::Write as _;
-        let mut e = log2
-            .recycled_entry()
-            .unwrap_or_else(bulwark_engine::querylog::QueryLogEntry::empty);
-        e.id = 0;
-        e.time_ms = 1_700_000_000_000;
-        e.client_ip.clear();
-        let _ = write!(e.client_ip, "{ip}");
-        e.question.clear();
-        e.question.push_str("cache-hot.example.");
-        e.qtype = std::borrow::Cow::Borrowed("A");
-        e.action = QueryAction::Cached;
-        e.allowlisted = false;
-        e.rcode = std::borrow::Cow::Borrowed("NOERROR");
-        for (i, rec) in recs.iter().enumerate() {
-            if let Some(s) = e.answers.get_mut(i) {
-                s.clear();
-                let _ = write!(s, "{} {}", rec.record_type(), rec.data);
-            } else {
-                e.answers.push(format!("{} {}", rec.record_type(), rec.data));
-            }
-        }
-        e.answers.truncate(recs.len());
-        e.elapsed_ms = 0.5;
-        log2.push(e);
-        0
-    });
-    println!(
-        "  build + push (pooled reuse) {pooled:>4} ns/op   ({:+.0}% vs non-pooled)",
-        (pooled as f64 - buildpush as f64) / buildpush as f64 * 100.0
     );
 }
 

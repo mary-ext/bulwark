@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bulwark::app::{self, AppState, Paths};
-use bulwark::{api, assets, auth, persist};
+use bulwark::{api, assets, auth, persist, store};
 use bulwark_config::Config;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -35,18 +35,27 @@ async fn main() -> anyhow::Result<()> {
     // Build the engine.
     let engine = app::build_engine(&config, &paths).await?;
 
-    // Restore persisted statistics + query log.
+    // Restore persisted statistics.
     if config.stats.persist {
         persist::load_stats(&paths.stats, &engine);
     }
-    if config.query_log.persist {
-        let entries =
-            persist::load_and_prune_querylog(&paths.querylog, config.query_log.retention_days);
-        engine.log().preload(entries);
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        engine.log().set_sink(tx);
-        persist::spawn_querylog_writer(paths.querylog.clone(), rx);
-    }
+
+    // Open the disk-backed query-log store. When persistence is off we use an
+    // in-memory database so the log still works for the lifetime of the process.
+    let store_path = if config.query_log.persist {
+        paths.querylog_db.to_string_lossy().into_owned()
+    } else {
+        ":memory:".to_string()
+    };
+    let store = Arc::new(
+        store::QueryStore::open(&store_path)
+            .await
+            .context("opening query-log store")?,
+    );
+    // Wire the engine's hot-path sink to the background writer.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    engine.log().set_sink(tx);
+    persist::spawn_querylog_writer(store.clone(), rx);
 
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let state = AppState {
@@ -54,12 +63,13 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         paths: paths.clone(),
         sessions: Arc::new(auth::Sessions::new(Duration::from_secs(7 * 24 * 3600))),
+        store: store.clone(),
     };
 
     // Background tasks.
     spawn_probe_loop(engine.clone(), config.clone());
     persist::spawn_stats_snapshotter(engine.clone(), paths.stats.clone(), config.clone());
-    persist::spawn_querylog_pruner(paths.querylog.clone(), config.clone());
+    persist::spawn_querylog_pruner(store.clone(), config.clone());
 
     // Start DNS listeners.
     let dns_binds = config.read().await.server.dns_bind.clone();

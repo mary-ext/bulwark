@@ -1,7 +1,8 @@
-//! On-disk persistence for the query log (append-only JSONL) and statistics
-//! (periodic JSON snapshot), each with its own retention.
+//! On-disk persistence for statistics (periodic JSON snapshot) and the
+//! background plumbing for the disk-backed query-log store (see
+//! [`crate::store`]): the writer that batches entries into the database and the
+//! periodic retention pruner.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -10,6 +11,8 @@ use bulwark_engine::querylog::QueryLogEntry;
 use bulwark_engine::Engine;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::store::QueryStore;
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -17,63 +20,17 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Load persisted query-log entries newer than `retention_days`, pruning the
-/// file to those entries. Returns them oldest-first.
-pub fn load_and_prune_querylog(path: &Path, retention_days: u32) -> Vec<QueryLogEntry> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let cutoff = if retention_days == 0 {
-        0
-    } else {
-        now_ms() - (retention_days as i64) * 86_400_000
-    };
-    let mut kept: Vec<QueryLogEntry> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<QueryLogEntry>(&line).ok())
-        .filter(|e| e.time_ms >= cutoff)
-        .collect();
-
-    // Bound memory: keep only the most recent ~200k lines on load.
-    const MAX_LOAD: usize = 200_000;
-    if kept.len() > MAX_LOAD {
-        kept.drain(0..kept.len() - MAX_LOAD);
-    }
-
-    // Rewrite the (pruned) file atomically.
-    if let Err(e) = rewrite_jsonl(path, &kept) {
-        tracing::warn!(error = %e, "failed to prune query log file");
-    }
-    kept
-}
-
-fn rewrite_jsonl(path: &Path, entries: &[QueryLogEntry]) -> std::io::Result<()> {
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
-        for e in entries {
-            if let Ok(line) = serde_json::to_string(e) {
-                writeln!(w, "{line}")?;
-            }
-        }
-        w.flush()?;
-    }
-    std::fs::rename(&tmp, path)
-}
-
-/// Spawn the background writer that appends new log entries to disk.
+/// Spawn the background writer that batches new log entries into the store.
 pub fn spawn_querylog_writer(
-    path: PathBuf,
+    store: Arc<QueryStore>,
     mut rx: UnboundedReceiver<QueryLogEntry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Open in append mode; recreate if missing.
         loop {
             let Some(first) = rx.recv().await else {
                 break;
             };
-            // Drain whatever is queued and write as a batch.
+            // Drain whatever is queued and write as one transaction.
             let mut batch = vec![first];
             while let Ok(e) = rx.try_recv() {
                 batch.push(e);
@@ -81,31 +38,16 @@ pub fn spawn_querylog_writer(
                     break;
                 }
             }
-            if let Err(e) = append_batch(&path, &batch) {
-                tracing::warn!(error = %e, "query log append failed");
+            if let Err(e) = store.insert_batch(&batch).await {
+                tracing::warn!(error = %e, "query log batch insert failed");
             }
         }
     })
 }
 
-fn append_batch(path: &Path, batch: &[QueryLogEntry]) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let mut buf = String::new();
-    for e in batch {
-        if let Ok(line) = serde_json::to_string(e) {
-            buf.push_str(&line);
-            buf.push('\n');
-        }
-    }
-    f.write_all(buf.as_bytes())
-}
-
-/// Periodically prune the query-log file to the retention window.
+/// Periodically delete query-log entries older than the retention window.
 pub fn spawn_querylog_pruner(
-    path: PathBuf,
+    store: Arc<QueryStore>,
     config: Arc<tokio::sync::RwLock<bulwark_config::Config>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -113,16 +55,16 @@ pub fn spawn_querylog_pruner(
         tick.tick().await; // skip immediate
         loop {
             tick.tick().await;
-            let (persist, retention) = {
-                let c = config.read().await;
-                (c.query_log.persist, c.query_log.retention_days)
-            };
-            if persist {
-                let p = path.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    load_and_prune_querylog(&p, retention);
-                })
-                .await;
+            let retention = config.read().await.query_log.retention_days;
+            // 0 disables time-based pruning.
+            if retention == 0 {
+                continue;
+            }
+            let cutoff = now_ms() - (retention as i64) * 86_400_000;
+            match store.delete_older_than(cutoff).await {
+                Ok(n) if n > 0 => tracing::debug!(removed = n, "pruned old query-log entries"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "query log prune failed"),
             }
         }
     })
