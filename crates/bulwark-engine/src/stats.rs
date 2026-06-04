@@ -60,7 +60,8 @@ struct StatsInner {
     #[serde(default)]
     latency_hist: Vec<u64>,
 
-    domains: HashMap<String, u64>,
+    #[serde(default)]
+    resolved_domains: HashMap<String, u64>,
     blocked_domains: HashMap<String, u64>,
     clients: HashMap<String, u64>,
     upstreams: HashMap<String, u64>,
@@ -100,7 +101,7 @@ impl StatsInner {
             }
         }
 
-        merge_counts(&mut self.domains, &other.domains);
+        merge_counts(&mut self.resolved_domains, &other.resolved_domains);
         merge_counts(&mut self.blocked_domains, &other.blocked_domains);
         merge_counts(&mut self.clients, &other.clients);
         merge_counts(&mut self.upstreams, &other.upstreams);
@@ -269,10 +270,12 @@ impl Stats {
         s.proc_time_count += 1;
         s.latency_hist[idx] += 1;
 
-        // Top-N counters.
-        bump(&mut s.domains, domain, 1, cap);
+        // Top-N counters. A query name lands in exactly one of the two domain
+        // lists — resolved or blocked.
         if blocked {
             bump(&mut s.blocked_domains, domain, 1, cap);
+        } else {
+            bump(&mut s.resolved_domains, domain, 1, cap);
         }
         bump(&mut s.clients, client, 1, cap);
         bump(&mut s.qtypes, entry.qtype.as_ref(), 1, cap);
@@ -390,7 +393,7 @@ impl Stats {
             avg_processing_ms: avg_proc,
             latency_buckets: latency_labels(),
             latency_hist: s.latency_hist.clone(),
-            top_domains: top_n_of(&s.domains, top_n),
+            top_resolved_domains: top_n_of(&s.resolved_domains, top_n),
             top_blocked_domains: top_n_of(&s.blocked_domains, top_n),
             top_clients: top_clients_resolved(&s.clients, clients, top_n),
             top_upstreams: top_n_of(&s.upstreams, top_n),
@@ -559,7 +562,8 @@ pub struct StatsSummary {
     pub avg_processing_ms: f64,
     pub latency_buckets: Vec<String>,
     pub latency_hist: Vec<u64>,
-    pub top_domains: Vec<TopEntry>,
+    /// Most-resolved (non-blocked) query names.
+    pub top_resolved_domains: Vec<TopEntry>,
     pub top_blocked_domains: Vec<TopEntry>,
     pub top_clients: Vec<TopEntry>,
     pub top_upstreams: Vec<TopEntry>,
@@ -622,7 +626,10 @@ mod tests {
         assert_eq!(snap.total, 4);
         assert_eq!(snap.blocked, 2);
         assert_eq!(snap.cached, 1);
-        assert_eq!(snap.top_domains[0].name, "ads.com");
+        // top_resolved_domains excludes blocked names — only the resolved good.com remains.
+        assert_eq!(snap.top_resolved_domains[0].name, "good.com");
+        assert_eq!(snap.top_resolved_domains[0].count, 2);
+        assert!(snap.top_resolved_domains.iter().all(|t| t.name != "ads.com"));
         assert_eq!(snap.top_blocked_domains[0].count, 2);
         assert!(snap.upstream_avg_rtt_ms.contains_key("1.1.1.1"));
         // latency histogram recorded

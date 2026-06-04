@@ -1907,7 +1907,7 @@
           "avg_processing_ms",
           "latency_buckets",
           "latency_hist",
-          "top_domains",
+          "top_resolved_domains",
           "top_blocked_domains",
           "top_clients",
           "top_upstreams",
@@ -2000,7 +2000,7 @@
               "$ref": "#/components/schemas/TopEntryDto"
             }
           },
-          "top_domains": {
+          "top_resolved_domains": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/TopEntryDto"

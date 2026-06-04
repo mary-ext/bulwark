@@ -257,7 +257,7 @@ export type StatsResponse = {
     series: SeriesPointDto[];
     top_blocked_domains: TopEntryDto[];
     top_clients: TopEntryDto[];
-    top_domains: TopEntryDto[];
+    top_resolved_domains: TopEntryDto[];
     top_upstreams: TopEntryDto[];
     total: number;
     upstream_avg_rtt_ms: {
