@@ -69,7 +69,7 @@
 
   <div class="grid cols-2" style="margin-top:var(--sp-4)">
     <div class="card">
-      <div class="card-title">Most resolved domains</div>
+      <div class="card-title">Top resolved domains</div>
       <RankedList items={stats.top_resolved_domains} total={stats.total} color="var(--chart-2)" />
     </div>
     <div class="card">
