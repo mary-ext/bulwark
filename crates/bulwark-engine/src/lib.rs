@@ -312,7 +312,7 @@ impl Engine {
         &self,
         resp: Message,
         action: QueryAction,
-        mut log: LogBuilder,
+        log: LogBuilder,
         start: Instant,
     ) -> Message {
         // If nothing will consume the entry, don't pay to build it: the answer

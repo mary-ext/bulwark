@@ -771,7 +771,7 @@ fn phase2c_finalize_components() {
 
     // A representative A response: two answer records, like a real reply.
     let name = Name::from_str("cache-hot.example.").unwrap();
-    let recs = vec![
+    let recs = [
         Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4)))),
         Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(5, 6, 7, 8)))),
     ];
@@ -819,7 +819,7 @@ fn phase2d_log_microbench() {
 
     // A representative cached A response: one answer record.
     let name = Name::from_str("cache-hot.example.").unwrap();
-    let recs = vec![Record::from_rdata(
+    let recs = [Record::from_rdata(
         name.clone(),
         300,
         RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
