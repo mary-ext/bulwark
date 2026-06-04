@@ -6,7 +6,8 @@
 FROM debian:trixie-slim AS build
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# build-essential: C toolchain for `ring` (rustls/quinn). git+curl+ca-certs for mise.
+# build-essential: C toolchain + make for `ring` (rustls/quinn) and the
+# jemalloc global allocator (tikv-jemalloc-sys). git+curl+ca-certs for mise.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl git ca-certificates build-essential \
