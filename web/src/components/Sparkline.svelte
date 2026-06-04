@@ -33,11 +33,21 @@
   const xAt = (i: number) => (n <= 1 ? w / 2 : (i / (n - 1)) * w);
   const yAt = (v: number) => height - pad - (v / max) * (height - 2 * pad);
 
-  const linePts = $derived(values.map((v, i) => `${xAt(i)},${yAt(v)}`).join(" "));
+  // A single bucket (e.g. a fresh instance with only the current hour) has no
+  // span to plot across, so draw it as a flat line spanning the full width
+  // instead of one degenerate vertex that renders as nothing.
+  const pts = $derived(
+    n === 1
+      ? [
+          [0, yAt(values[0])],
+          [w, yAt(values[0])],
+        ]
+      : values.map((v, i) => [xAt(i), yAt(v)]),
+  );
+
+  const linePts = $derived(pts.map(([x, y]) => `${x},${y}`).join(" "));
   const areaPath = $derived(
-    `M0,${height} ` +
-      values.map((v, i) => `L${xAt(i)},${yAt(v)}`).join(" ") +
-      ` L${w},${height} Z`,
+    `M0,${height} ` + pts.map(([x, y]) => `L${x},${y}`).join(" ") + ` L${w},${height} Z`,
   );
 
   function onmove(e: PointerEvent) {

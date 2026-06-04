@@ -66,9 +66,6 @@
 </div>
 
 {#if stats}
-  <!-- Only attach a card sparkline once there are at least two hourly buckets
-       to connect; below that we pass no snippet so the card shows no empty
-       trend strip. -->
   {#snippet totalSpark()}
     <Sparkline
       values={totalTrend}
@@ -90,14 +87,14 @@
       label="Total queries"
       value={num(stats.total)}
       sub="{num(stats.errors)} errors"
-      spark={totalTrend.length > 1 ? totalSpark : undefined}
+      spark={totalSpark}
     />
     <StatCard
       label="Blocked"
       value={num(stats.blocked)}
       sub="{pct(stats.block_rate)} of queries"
       tone="bad"
-      spark={blockedTrend.length > 1 ? blockedSpark : undefined}
+      spark={blockedSpark}
     />
     <StatCard
       label="Cache hit rate"
