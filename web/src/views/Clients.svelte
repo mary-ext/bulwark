@@ -1,7 +1,7 @@
 <script lang="ts">
   import * as api from "../api/generated";
   import { ok } from "@oazapfts/runtime";
-  import type { ClientConfig } from "../api/generated";
+  import type { ClientConfig, ClientInput } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { parseList } from "../lib/format";
   import { toaster } from "../lib/toast.svelte";
@@ -20,7 +20,7 @@
 
   // Edit dialog state.
   let dialogOpen = $state(false);
-  let editIndex = $state(-1); // -1 = adding a new client
+  let editId = $state<string | null>(null); // null = adding a new client
   let draftName = $state("");
   let draftIds = $state("");
   let draftTags = $state("");
@@ -43,7 +43,7 @@
   });
 
   function openAdd() {
-    editIndex = -1;
+    editId = null;
     draftName = "";
     draftIds = "";
     draftTags = "";
@@ -52,23 +52,12 @@
   }
 
   function openEdit(c: Client) {
-    editIndex = clients.indexOf(c);
+    editId = c.id;
     draftName = c.name;
     draftIds = c.ids.join(", ");
     draftTags = c.tags.join(", ");
     draftFiltering = c.filtering_enabled;
     dialogOpen = true;
-  }
-
-  async function persist(next: Client[]): Promise<boolean> {
-    try {
-      await ok(api.putClients(next));
-      clients = next;
-      return true;
-    } catch (e) {
-      toaster.show(errMsg(e, "Save failed"), true);
-      return false;
-    }
   }
 
   async function saveDraft() {
@@ -81,21 +70,31 @@
       toaster.show("Add at least one IP or CIDR", true);
       return;
     }
-    saving = true;
-    const entry: Client = {
+    const input: ClientInput = {
       name: draftName.trim(),
       ids,
       tags: parseList(draftTags),
       filtering_enabled: draftFiltering,
     };
-    const next = [...clients];
-    if (editIndex >= 0) next[editIndex] = entry;
-    else next.push(entry);
-    if (await persist(next)) {
-      toaster.show(editIndex >= 0 ? "Client updated" : "Client added");
+    saving = true;
+    try {
+      if (editId !== null) {
+        await ok(api.putClient(editId, input));
+        clients = clients.map((c) =>
+          c.id === editId ? ({ ...c, ...input } as Client) : c,
+        );
+        toaster.show("Client updated");
+      } else {
+        const created = (await ok(api.postClient(input))) as Client;
+        clients = [...clients, created];
+        toaster.show("Client added");
+      }
       dialogOpen = false;
+    } catch (e) {
+      toaster.show(errMsg(e, "Save failed"), true);
+    } finally {
+      saving = false;
     }
-    saving = false;
   }
 
   function askDelete(c: Client) {
@@ -104,8 +103,13 @@
   }
 
   async function doDelete(c: Client) {
-    const next = clients.filter((x) => x !== c);
-    if (await persist(next)) toaster.show("Client removed");
+    try {
+      await ok(api.deleteClient(c.id));
+      clients = clients.filter((x) => x.id !== c.id);
+      toaster.show("Client removed");
+    } catch (e) {
+      toaster.show(errMsg(e, "Delete failed"), true);
+    }
   }
 </script>
 
@@ -123,7 +127,7 @@
 </p>
 
 <section class="card" style="padding:0;overflow:hidden">
-  <ResponsiveTable items={clients} key={(c) => c}>
+  <ResponsiveTable items={clients} key={(c) => c.id}>
     {#snippet head()}
       <tr><th>Name</th><th>IPs / CIDRs</th><th>Tags</th><th>Filtering</th><th></th></tr>
     {/snippet}
@@ -181,7 +185,7 @@
 <!-- Add / edit dialog -->
 <Sheet
   bind:open={dialogOpen}
-  title={editIndex >= 0 ? "Edit client" : "Add client"}
+  title={editId !== null ? "Edit client" : "Add client"}
   variant={isMobile.matches ? "sheet" : "dialog"}
 >
   <div class="stack" style="gap:var(--sp-4)">
@@ -202,7 +206,7 @@
     <div class="dialog-actions">
       <button class="btn" onclick={() => (dialogOpen = false)}>Cancel</button>
       <button class="btn btn-primary" onclick={saveDraft} disabled={saving}>
-        {saving ? "Saving…" : editIndex >= 0 ? "Save changes" : "Add client"}
+        {saving ? "Saving…" : editId !== null ? "Save changes" : "Add client"}
       </button>
     </div>
   </div>

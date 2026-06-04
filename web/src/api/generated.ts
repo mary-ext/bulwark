@@ -15,6 +15,8 @@ export const servers = {};
 export type ClientConfig = {
     /** Whether filtering applies to this client. */
     filtering_enabled?: boolean;
+    /** Stable, server-assigned identifier. Used as the resource key in the API. */
+    id?: string;
     /** Identifiers: IP addresses or CIDR ranges. */
     ids?: string[];
     name: string;
@@ -22,6 +24,12 @@ export type ClientConfig = {
 };
 export type ErrorResponse = {
     error: string;
+};
+export type ClientInput = {
+    filtering_enabled?: boolean;
+    ids?: string[];
+    name: string;
+    tags?: string[];
 };
 export type OkResponse = {
     ok: boolean;
@@ -299,18 +307,46 @@ export function getClients(opts?: Oazapfts.RequestOpts) {
         ...opts
     });
 }
-export function putClients(body: ClientConfig[], opts?: Oazapfts.RequestOpts) {
+export function postClient(clientInput: ClientInput, opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: ClientConfig;
+    } | {
+        status: 400;
+        data: ErrorResponse;
+    }>("/api/clients", oazapfts.json({
+        ...opts,
+        method: "POST",
+        body: clientInput
+    }));
+}
+export function putClient(id: string, clientInput: ClientInput, opts?: Oazapfts.RequestOpts) {
     return oazapfts.fetchJson<{
         status: 200;
         data: OkResponse;
     } | {
         status: 400;
         data: ErrorResponse;
-    }>("/api/clients", oazapfts.json({
+    } | {
+        status: 404;
+        data: ErrorResponse;
+    }>(`/api/clients/${encodeURIComponent(id)}`, oazapfts.json({
         ...opts,
         method: "PUT",
-        body
+        body: clientInput
     }));
+}
+export function deleteClient(id: string, opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: OkResponse;
+    } | {
+        status: 404;
+        data: ErrorResponse;
+    }>(`/api/clients/${encodeURIComponent(id)}`, {
+        ...opts,
+        method: "DELETE"
+    });
 }
 export function getConfig(opts?: Oazapfts.RequestOpts) {
     return oazapfts.fetchJson<{
