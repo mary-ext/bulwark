@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{middleware, Json, Router};
@@ -108,7 +108,51 @@ pub fn router(state: AppState) -> Router {
         .route("/api/upstreams/test", post(test_upstream))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    public.merge(protected).with_state(state)
+    public
+        .merge(protected)
+        // Cross-origin protection on every /api route. Safe methods pass through;
+        // unsafe ones must look same-origin (or be a non-browser client).
+        .layer(middleware::from_fn(cross_origin_protection))
+        .with_state(state)
+}
+
+/// Reject state-changing cross-origin browser requests, mirroring Go's
+/// `http.CrossOriginProtection`. Safe methods (GET/HEAD/OPTIONS) are exempt. For
+/// the rest we trust `Sec-Fetch-Site: same-origin` (and `none`, a direct
+/// navigation); `same-site`/`cross-site` are rejected. Older browsers and
+/// non-browser clients omit `Sec-Fetch-Site`, so we fall back to requiring any
+/// `Origin` header to match `Host` (a missing `Origin` — e.g. curl — is allowed,
+/// since it isn't a browser cross-site request). This is the CSRF defense:
+/// `SameSite=Lax` alone doesn't cover same-site-but-cross-origin.
+async fn cross_origin_protection(request: axum::extract::Request, next: middleware::Next) -> Response {
+    if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        return next.run(request).await;
+    }
+    let headers = request.headers();
+    let allowed = match headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("same-origin") | Some("none") => true,
+        Some(_) => false,
+        None => origin_matches_host(headers),
+    };
+    if allowed {
+        next.run(request).await
+    } else {
+        (StatusCode::FORBIDDEN, "cross-origin request blocked").into_response()
+    }
+}
+
+/// Whether any `Origin` header matches the `Host` header (host[:port]). A missing
+/// `Origin` returns true — it's a non-browser request, not a cross-site one.
+fn origin_matches_host(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return true;
+    };
+    let origin_host = origin.split_once("://").map(|(_, rest)| rest);
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    matches!((origin_host, host), (Some(o), Some(h)) if o.eq_ignore_ascii_case(h))
 }
 
 // ---------------------------------------------------------------------------
@@ -178,8 +222,23 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<S
     })
 }
 
-fn session_cookie(token: &str) -> String {
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800")
+fn session_cookie(token: &str, secure: bool) -> String {
+    let mut c = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800");
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// Whether the request reached us over HTTPS, per a reverse proxy's
+/// `X-Forwarded-Proto`. The `Secure` cookie flag is added only then: Bulwark
+/// also serves plain HTTP (e.g. inside a tailnet), where `Secure` would stop the
+/// browser from ever sending the session cookie back.
+fn is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
 }
 
 #[utoipa::path(
@@ -194,6 +253,7 @@ fn session_cookie(token: &str) -> String {
 )]
 pub async fn setup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(creds): Json<Credentials>,
 ) -> ApiResult<Response> {
     {
@@ -213,10 +273,14 @@ pub async fn setup(
     cfg.auth.password_hash = Some(hash);
     apply_config(&state, cfg).await.map_err(internal)?;
 
+    let secure = is_https(&headers);
     let token = state.sessions.create();
-    let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
-    Ok((headers, OkResponse::ok()).into_response())
+    let mut out = HeaderMap::new();
+    out.insert(
+        header::SET_COOKIE,
+        session_cookie(&token, secure).parse().unwrap(),
+    );
+    Ok((out, OkResponse::ok()).into_response())
 }
 
 #[utoipa::path(
@@ -231,6 +295,7 @@ pub async fn setup(
 )]
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(creds): Json<Credentials>,
 ) -> ApiResult<Response> {
     let cfg = state.config.read().await;
@@ -244,10 +309,14 @@ pub async fn login(
     if !ok {
         return Err(ApiError::Unauthorized);
     }
+    let secure = is_https(&headers);
     let token = state.sessions.create();
-    let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, session_cookie(&token).parse().unwrap());
-    Ok((headers, OkResponse::ok()).into_response())
+    let mut out = HeaderMap::new();
+    out.insert(
+        header::SET_COOKIE,
+        session_cookie(&token, secure).parse().unwrap(),
+    );
+    Ok((out, OkResponse::ok()).into_response())
 }
 
 #[utoipa::path(
@@ -1135,4 +1204,45 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn origin_host_fallback() {
+        // No Origin -> a non-browser client (e.g. curl), allowed.
+        assert!(origin_matches_host(&hm(&[("host", "bulwark.local")])));
+        // Origin matching Host -> same-origin, allowed.
+        assert!(origin_matches_host(&hm(&[
+            ("host", "bulwark.local"),
+            ("origin", "http://bulwark.local"),
+        ])));
+        // Origin from a different site -> blocked.
+        assert!(!origin_matches_host(&hm(&[
+            ("host", "bulwark.local"),
+            ("origin", "http://evil.example"),
+        ])));
+    }
+
+    #[test]
+    fn secure_flag_only_when_https() {
+        assert!(session_cookie("t", true).contains("; Secure"));
+        assert!(!session_cookie("t", false).contains("Secure"));
+        assert!(is_https(&hm(&[("x-forwarded-proto", "https")])));
+        assert!(!is_https(&hm(&[("x-forwarded-proto", "http")])));
+        assert!(!is_https(&hm(&[])));
+    }
 }
