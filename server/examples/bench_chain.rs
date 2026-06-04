@@ -957,6 +957,92 @@ fn run_record_bench(
 }
 
 // ---------------------------------------------------------------------------
+// Phase 5: concurrent cache-hit throughput — isolates the cache mutex.
+//
+// Phase 3's tail is dominated by forwarded queries doing real upstream I/O, so
+// it can't show how the cache lock itself scales. Here every operation is a
+// warm cache hit (no filter, no upstream, no async), so the only shared state
+// is the cache's mutex + the per-hit TTL-rewrite clone. This is where moving
+// the clone out of the critical section should show up.
+// ---------------------------------------------------------------------------
+
+fn warm_cache(n_keys: usize) -> (Arc<DnsCache>, Arc<Vec<QueryKey>>) {
+    let cache = Arc::new(DnsCache::new(100_000, 0, 0, 0));
+    let mut keys = Vec::with_capacity(n_keys);
+    for i in 0..n_keys {
+        let name = format!("hot{i}.bench.example.");
+        let mut resp = query(&name, RecordType::A);
+        resp.metadata.message_type = MessageType::Response;
+        resp.metadata.response_code = ResponseCode::NoError;
+        // A couple of answers, like a real A response, so the clone is not free.
+        resp.answers.push(Record::from_rdata(
+            Name::from_str(&name).unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        resp.answers.push(Record::from_rdata(
+            Name::from_str(&name).unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(5, 6, 7, 8))),
+        ));
+        let key = QueryKey::from_message(&resp).unwrap();
+        cache.insert(key.clone(), &resp);
+        keys.push(key);
+    }
+    (cache, Arc::new(keys))
+}
+
+fn phase5_cache_contention() {
+    println!("\n== Phase 5: concurrent cache-hit throughput (warm keys) ==");
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let per_thread = 2_000_000usize;
+    let (cache, keys) = warm_cache(256);
+    let mask = keys.len() - 1;
+
+    let thread_counts: Vec<usize> = [1usize, 2, 4, cores]
+        .into_iter()
+        .filter(|&c| c <= cores)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    println!("  {:<8} {:>16} {:>10}", "threads", "hits/s", "scaling");
+    let mut base = 0.0f64;
+    for &c in &thread_counts {
+        let barrier = Arc::new(std::sync::Barrier::new(c));
+        let mut handles = Vec::new();
+        for t in 0..c {
+            let cache = cache.clone();
+            let keys = keys.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut i = t;
+                let mut sink = 0usize;
+                for _ in 0..per_thread {
+                    if let Some(hit) = cache.get(&keys[i & mask]) {
+                        sink += hit.message.answers.len();
+                    }
+                    i = i.wrapping_add(1);
+                }
+                std::hint::black_box(sink);
+            }));
+        }
+        let start = Instant::now();
+        for h in handles {
+            let _ = h.join();
+        }
+        let rate = (c * per_thread) as f64 / start.elapsed().as_secs_f64();
+        if c == 1 {
+            base = rate;
+        }
+        println!("  {c:<8} {rate:>16.0} {:>9.1}x", rate / base.max(1.0));
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -986,6 +1072,7 @@ async fn main() {
     )
     .await;
     phase4_stats_contention(&blocked);
+    phase5_cache_contention();
 
     println!("\n== done ==");
 }

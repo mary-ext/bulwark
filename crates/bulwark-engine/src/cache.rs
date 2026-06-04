@@ -7,6 +7,7 @@
 //! * LRU-bounded, keyed by `(name, type, class)`.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bulwark_upstream::QueryKey;
@@ -20,7 +21,10 @@ const DEFAULT_NEGATIVE_TTL: u32 = 30;
 const STALE_SERVE_TTL: u32 = 1;
 
 struct Entry {
-    message: Message,
+    /// Stored behind an `Arc` so a cache hit only clones a pointer while the
+    /// cache mutex is held; the (comparatively expensive) per-record TTL
+    /// rewrite happens on a clone made *after* the lock is released.
+    message: Arc<Message>,
     stored_at: Instant,
     /// Effective (clamped) TTL in seconds.
     ttl: u32,
@@ -29,9 +33,6 @@ struct Entry {
 impl Entry {
     fn age_secs(&self) -> u32 {
         self.stored_at.elapsed().as_secs().min(u32::MAX as u64) as u32
-    }
-    fn expired(&self) -> bool {
-        self.age_secs() >= self.ttl
     }
 }
 
@@ -137,41 +138,48 @@ impl DnsCache {
         if !self.is_enabled() {
             return None;
         }
-        let mut map = self.map.lock();
-        let Some(entry) = map.get(key) else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
+
+        // Hold the lock only long enough to bump the LRU and grab a cheap `Arc`
+        // handle to the stored message; the per-record TTL rewrite (a full
+        // message clone) is deferred until after the guard is dropped so
+        // concurrent hits don't serialize on it.
+        let (message, ttl, stale) = {
+            let mut map = self.map.lock();
+            let Some(entry) = map.get(key) else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            };
+
+            let age = entry.age_secs();
+            let entry_ttl = entry.ttl;
+            // `Arc::clone` (refcount bump) ends the borrow of `entry`, freeing
+            // `map` for the `pop` below.
+            let message = entry.message.clone();
+
+            if age < entry_ttl {
+                (message, (entry_ttl - age).max(1), false)
+            } else {
+                // Expired. Optionally serve stale within the configured window
+                // (serve-stale is on iff `stale_max_age > 0`). The window is
+                // measured from expiry, so `ttl + stale_max_age` is the total
+                // lifetime of a stale-servable entry.
+                let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
+                if age.saturating_sub(entry_ttl) < stale_max_age {
+                    (message, STALE_SERVE_TTL, true)
+                } else {
+                    // Too old / not optimistic: drop it and report a miss.
+                    map.pop(key);
+                    self.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
         };
 
-        if !entry.expired() {
-            let remaining = entry.ttl - entry.age_secs();
-            let message = adjust_ttls(&entry.message, remaining.max(1));
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(CacheHit {
-                message,
-                stale: false,
-            });
-        }
-
-        // Expired. Optionally serve stale within the configured window (serve-
-        // stale is on iff `stale_max_age > 0`). The window is measured from
-        // expiry, so `ttl + stale_max_age` is the total lifetime of a
-        // stale-servable entry.
-        let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
-        let within_window = entry.age_secs().saturating_sub(entry.ttl) < stale_max_age;
-        if within_window {
-            let message = adjust_ttls(&entry.message, STALE_SERVE_TTL);
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            return Some(CacheHit {
-                message,
-                stale: true,
-            });
-        }
-
-        // Too old / not optimistic: drop it and report a miss.
-        map.pop(key);
-        self.misses.fetch_add(1, Ordering::Relaxed);
-        None
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        Some(CacheHit {
+            message: adjust_ttls(&message, ttl),
+            stale,
+        })
     }
 
     /// Insert a response. No-op if the response isn't cacheable.
@@ -183,7 +191,7 @@ impl DnsCache {
             return;
         };
         let entry = Entry {
-            message: message.clone(),
+            message: Arc::new(message.clone()),
             stored_at: Instant::now(),
             ttl,
         };
