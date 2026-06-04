@@ -265,7 +265,7 @@
 <ConfirmDialog
   bind:open={confirmClearLog}
   title="Clear query log?"
-  message="This empties the in-memory query log. Persisted history on disk is not affected."
+  message="This permanently deletes all query log entries, including history persisted on disk. This cannot be undone."
   confirmLabel="Clear log"
   danger
   onConfirm={clearLog}
