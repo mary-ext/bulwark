@@ -24,10 +24,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use bulwark_config::BlockingMode;
-use bulwark_filter::{ClientInfo, FilterEngine, Verdict};
+use bulwark_filter::{ClientInfo, FilterEngine, MatchInfo, Verdict};
 use bulwark_upstream::{QueryKey, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{DNSClass, Name, RecordType};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use crate::block::{block_response, error_response, rewrite_response, Rewritten};
 use crate::cache::{CachedResponse, DnsCache};
@@ -73,6 +73,41 @@ fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
     src.iter()
         .map(|rec| format!("{} {}", rec.record_type(), rec.data))
         .collect()
+}
+
+/// Response-side filtering: re-check the records an upstream actually returned
+/// against the blocklist. The query name can pass the request-side check while
+/// the answer points at a blocked target — *CNAME cloaking*, where a tracker
+/// hides behind a first-party `CNAME` (`data.brand.com -> tracker.evil.net`), is
+/// the canonical case the query-name check alone never catches.
+///
+/// Returns the matching rule for the first blocked record, or `None` if the
+/// whole answer chain is clean. The records are already parsed (the upstream
+/// pool decoded them), and the per-record `filter.check` only fires for the
+/// record types we inspect, so this rides along the cache-miss path that is
+/// already network-bound.
+fn filter_answers(
+    filter: &FilterEngine,
+    client: &ResolvedClient,
+    answers: &[Record],
+) -> Option<MatchInfo> {
+    let ci = ClientInfo {
+        ip: Some(client.ip),
+        name: client.name.as_deref(),
+        tags: &client.tags,
+    };
+    for rec in answers {
+        // `Name::to_ascii` carries a trailing dot; `filter.check` normalises it,
+        // but trim here so the comparison is unambiguous.
+        let target = match &rec.data {
+            RData::CNAME(cname) => cname.0.to_ascii(),
+            _ => continue,
+        };
+        if let Verdict::Block(info) = filter.check(target.trim_end_matches('.'), "CNAME", &ci) {
+            return Some(info);
+        }
+    }
+    None
 }
 
 /// The display label for a response code. Returns a borrowed `&'static str` for
@@ -293,12 +328,37 @@ impl Engine {
         };
         match state.pool.resolve(&query).await {
             Ok(resolved) => {
-                self.cache.insert(key, &resolved.message);
                 // Attribute the answering upstream's own round-trip to per-upstream
                 // stats, not the whole-query wall-clock: with sequential failover a
                 // query that waited out an earlier upstream's timeout would otherwise
                 // charge that ~1s to the upstream that actually answered quickly.
                 log.upstream_rtt_ms = Some(resolved.rtt_ms);
+
+                // Response-side filtering (CNAME uncloaking): the query name passed
+                // the request-side check, but the answer may point at a blocked
+                // target. Decide *before* caching so the cached entry is the block,
+                // not the cloaked answer — otherwise every later cache hit leaks it.
+                if state.filtering_enabled && client.filtering_enabled {
+                    if let Some(info) =
+                        filter_answers(&state.filter, &client, &resolved.message.answers)
+                    {
+                        let resp = block_response(
+                            &query,
+                            state.blocking_mode,
+                            state.block_v4,
+                            state.block_v6,
+                            state.blocked_ttl,
+                        );
+                        self.cache.insert(key, &resp);
+                        let action = QueryAction::Blocked {
+                            rule: info.rule,
+                            list_id: info.list_id,
+                        };
+                        return self.finalize(resp, action, log, start);
+                    }
+                }
+
+                self.cache.insert(key, &resolved.message);
                 let action = QueryAction::Forwarded {
                     upstream: resolved.upstream,
                 };

@@ -51,6 +51,42 @@ async fn mock_upstream(answer_ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicU64>) {
     (addr, count)
 }
 
+/// A mock upstream that answers every A query with a CNAME chain
+/// `<qname> -> <cname_target>` followed by an `A <answer_ip>` for the target,
+/// mimicking the CNAME-cloaked responses real trackers return.
+async fn mock_upstream_cname(cname_target: &str, answer_ip: Ipv4Addr) -> SocketAddr {
+    let target = Name::from_str(cname_target).unwrap();
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut resp = query.clone();
+            resp.metadata.message_type = MessageType::Response;
+            resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(q) = query.queries.first() {
+                resp.answers.push(Record::from_rdata(
+                    q.name().clone(),
+                    300,
+                    RData::CNAME(hickory_proto::rr::rdata::CNAME(target.clone())),
+                ));
+                resp.answers.push(Record::from_rdata(
+                    target.clone(),
+                    300,
+                    RData::A(A(answer_ip)),
+                ));
+            }
+            let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+        }
+    });
+    addr
+}
+
 async fn make_engine(rules: &str, upstream: SocketAddr) -> Arc<Engine> {
     let filter = Arc::new(compile_one(rules));
     let pool = Arc::new(
@@ -176,6 +212,69 @@ async fn blocks_filtered_domain() {
     let entry = rx.try_recv().expect("blocked query logged");
     assert!(matches!(entry.action, QueryAction::Blocked { .. }));
     assert!(entry.is_blocked());
+}
+
+#[tokio::test]
+async fn uncloaks_blocked_cname_target() {
+    // The query name is clean, but the upstream answer CNAMEs to a blocked
+    // tracker. Response-side filtering must catch the target and block.
+    let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    engine.log().set_sink(tx);
+
+    let r = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r.metadata.response_code,
+        ResponseCode::NXDomain,
+        "a blocked CNAME target should turn the whole response into a block"
+    );
+
+    let entry = rx.try_recv().expect("uncloaked query logged");
+    assert!(matches!(entry.action, QueryAction::Blocked { .. }));
+}
+
+#[tokio::test]
+async fn uncloak_block_is_cached() {
+    // After uncloaking once, the synthesized block must be cached so the next
+    // identical query is served without a second upstream round-trip.
+    let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    let q = || ingest(query("data.brand.com.", RecordType::A));
+    let r1 = engine.handle(q(), local()).await.into_message();
+    assert_eq!(r1.metadata.response_code, ResponseCode::NXDomain);
+
+    let r2 = engine.handle(q(), local()).await.into_message();
+    assert_eq!(r2.metadata.response_code, ResponseCode::NXDomain);
+    assert_eq!(
+        engine.cache().hit_count(),
+        1,
+        "the second query must hit the cached block, not re-resolve"
+    );
+}
+
+#[tokio::test]
+async fn clean_cname_chain_is_forwarded() {
+    // A CNAME chain whose target is *not* blocked must pass through untouched.
+    let up = mock_upstream_cname("cdn.good.net.", Ipv4Addr::new(5, 6, 7, 8)).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    let r = engine
+        .handle(ingest(query("www.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    // CNAME + A both present, unmodified.
+    assert_eq!(r.answers.len(), 2);
+    assert!(r
+        .answers
+        .iter()
+        .any(|a| matches!(&a.data, RData::A(A(ip)) if *ip == Ipv4Addr::new(5, 6, 7, 8))));
 }
 
 #[tokio::test]
