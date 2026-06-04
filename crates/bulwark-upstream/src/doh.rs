@@ -29,7 +29,7 @@ use tokio::sync::OnceCell;
 use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
 use crate::spec::UpstreamSpec;
-use crate::transport::{decode, encode, Transport};
+use crate::transport::{decode, encode, matches_query, Transport};
 
 const DNS_MESSAGE: &str = "application/dns-message";
 
@@ -191,7 +191,7 @@ impl DohTransport {
         // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
             return self
-                .exchange(self.h3().await?, &body, original_id, false, true)
+                .exchange(self.h3().await?, &body, &q, original_id, false, true)
                 .await;
         }
 
@@ -199,7 +199,7 @@ impl DohTransport {
         // back to h1/h2 (and forget the advertisement) if the h3 attempt fails.
         if self.h3_fresh() {
             match self
-                .exchange(self.h3().await?, &body, original_id, false, true)
+                .exchange(self.h3().await?, &body, &q, original_id, false, true)
                 .await
             {
                 Ok(msg) => return Ok(msg),
@@ -211,7 +211,7 @@ impl DohTransport {
         }
 
         // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
-        self.exchange(self.h12().await?, &body, original_id, true, false)
+        self.exchange(self.h12().await?, &body, &q, original_id, true, false)
             .await
     }
 
@@ -226,6 +226,7 @@ impl DohTransport {
         &self,
         client: &reqwest::Client,
         body: &[u8],
+        expect: &Message,
         original_id: u16,
         learn_alt_svc: bool,
         http3: bool,
@@ -262,6 +263,14 @@ impl DohTransport {
             .await
             .map_err(|e| UpstreamError::Http(e.to_string()))?;
         let mut msg = decode(&bytes)?;
+        // `expect` and the response both carry id 0 (RFC 8484), so verify the
+        // response answers our question before trusting it — otherwise a buggy
+        // or hostile server could get its answer cached under our key.
+        if !matches_query(expect, &msg) {
+            return Err(UpstreamError::Http(
+                "DoH response does not match query".into(),
+            ));
+        }
         msg.metadata.id = original_id;
         Ok(msg)
     }

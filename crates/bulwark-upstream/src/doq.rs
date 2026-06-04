@@ -19,7 +19,7 @@ use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
 use crate::spec::UpstreamSpec;
 use crate::tlsconf::doq_config;
-use crate::transport::{decode, encode, Transport};
+use crate::transport::{decode, encode, matches_query, Transport};
 
 pub struct DoqTransport {
     spec: UpstreamSpec,
@@ -107,6 +107,15 @@ impl DoqTransport {
             return Err(UpstreamError::Proto("short DoQ response".into()));
         }
         let mut msg = decode(&data[2..])?;
+        // Both `q` and the response carry id 0 on the wire (RFC 9250), so verify
+        // the response actually answers our question (name/type/class) before
+        // trusting it — a hostile or buggy upstream must not get its answer
+        // cached under our key.
+        if !matches_query(&q, &msg) {
+            return Err(UpstreamError::Proto(
+                "DoQ response does not match query".into(),
+            ));
+        }
         msg.metadata.id = original_id;
         Ok(msg)
     }
