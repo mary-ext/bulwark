@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 
-use crate::Engine;
+use crate::{Engine, Ingress};
 
 /// Idle timeout for a TCP DNS connection (between queries, waiting for a length
 /// prefix).
@@ -27,16 +27,6 @@ const MAX_UDP_INFLIGHT: usize = 1024;
 
 /// Max concurrent TCP connections per listener.
 const MAX_TCP_CONNS: usize = 512;
-
-fn decode(bytes: &[u8]) -> Option<Message> {
-    Message::from_vec(bytes).ok()
-}
-
-/// The maximum UDP payload the client will accept (EDNS, clamped to 512..4096).
-fn udp_max_payload(query: &Message) -> usize {
-    let advertised = query.edns.as_ref().map(|e| e.max_payload()).unwrap_or(512);
-    (advertised as usize).clamp(512, 4096)
-}
 
 /// Encode a response for UDP, truncating (setting TC) if it exceeds `max`.
 fn encode_udp(resp: &Message, max: usize) -> Vec<u8> {
@@ -88,7 +78,7 @@ fn spawn_udp(engine: Arc<Engine>, socket: UdpSocket) -> JoinHandle<()> {
                     continue;
                 }
             };
-            let Some(query) = decode(&buf[..n]) else {
+            let Some(ingress) = Ingress::parse(&buf[..n]) else {
                 continue;
             };
             // Bound concurrent in-flight queries. When saturated this awaits a
@@ -101,8 +91,8 @@ fn spawn_udp(engine: Arc<Engine>, socket: UdpSocket) -> JoinHandle<()> {
             let socket = socket.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let max = udp_max_payload(&query);
-                let resp = engine.handle(query, peer.ip()).await;
+                let max = ingress.udp_max_payload();
+                let resp = engine.handle(ingress, peer.ip()).await;
                 // Fast path: a wire-byte cache hit is already encoded and almost
                 // always fits the UDP limit — send it as-is. Otherwise (a
                 // `Message`, or oversized wire needing truncation) fall back to
@@ -169,10 +159,10 @@ async fn serve_tcp_conn(
             _ => return Ok(()), // body error or stall: close.
         }
 
-        let Some(query) = decode(&msg_buf) else {
+        let Some(ingress) = Ingress::parse(&msg_buf) else {
             return Ok(());
         };
-        let resp = engine.handle(query, peer.ip()).await;
+        let resp = engine.handle(ingress, peer.ip()).await;
         let bytes = match resp.into_wire() {
             Some(b) => b,
             None => return Ok(()),

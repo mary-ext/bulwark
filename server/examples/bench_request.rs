@@ -35,7 +35,7 @@ use bulwark_engine::cache::{CachedResponse, DnsCache};
 use bulwark_engine::clients::ClientMatcher;
 use bulwark_engine::querylog::QueryLog;
 use bulwark_engine::stats::Stats;
-use bulwark_engine::{Engine, EngineResponse, EngineState};
+use bulwark_engine::{Engine, EngineResponse, EngineState, Ingress};
 use bulwark_filter::{ClientInfo, Compiler, FilterEngine};
 use bulwark_upstream::{PoolEntry, PoolSettings, QueryKey, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -393,6 +393,13 @@ fn local() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
 
+/// Encode a query and run it through the real listener ingress (`Ingress::parse`,
+/// the minimal fast path), so timed batches feed `handle` exactly what the server
+/// does. Done outside timed loops, so the encode/parse isn't charged to `handle`.
+fn ingress(m: Message) -> Ingress {
+    Ingress::parse(&m.to_vec().unwrap()).expect("query should be decodable")
+}
+
 // ---------------------------------------------------------------------------
 // Measurement helpers.
 // ---------------------------------------------------------------------------
@@ -423,14 +430,14 @@ fn report(label: &str, mut ns: Vec<u64>) {
 /// messages are NOT timed: warming the *timed* set would turn ~10% of a
 /// miss-labelled scenario into cache hits and understate the path. Pass an empty
 /// `warm` when the engine was already primed externally.
-async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Message>, timed: Vec<Message>) {
-    for m in warm {
-        let _ = engine.handle(m, local()).await;
+async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Ingress>, timed: Vec<Ingress>) {
+    for ing in warm {
+        let _ = engine.handle(ing, local()).await;
     }
     let mut ns = Vec::with_capacity(timed.len());
-    for m in timed {
+    for ing in timed {
         let t = Instant::now();
-        let _ = engine.handle(m, local()).await;
+        let _ = engine.handle(ing, local()).await;
         ns.push(t.elapsed().as_nanos() as u64);
     }
     report(label, ns);
@@ -439,13 +446,13 @@ async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Message>, timed: 
 /// Split a batch into a warmup slice (first ~10%, cloned) and the full timed
 /// batch — the right shape for hit/warm-cache scenarios where re-timing the
 /// warmed messages is correct (they are cache hits either way).
-fn warm_then_time(msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
+fn warm_then_time(msgs: Vec<Ingress>) -> (Vec<Ingress>, Vec<Ingress>) {
     let warm = msgs.iter().take((msgs.len() / 10).max(1)).cloned().collect();
     (warm, msgs)
 }
 
-fn many(domains: impl Iterator<Item = String>, rtype: RecordType) -> Vec<Message> {
-    domains.map(|d| query(&d, rtype)).collect()
+fn many(domains: impl Iterator<Item = String>, rtype: RecordType) -> Vec<Ingress> {
+    domains.map(|d| ingress(query(&d, rtype))).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -722,7 +729,7 @@ async fn phase2_scenarios(
     // Cache hit (fresh): warm one domain, then hammer it (already primed, so the
     // timed batch needs no further warmup).
     let _ = engine
-        .handle(query("cache-hot.example.", RecordType::A), local())
+        .handle(ingress(query("cache-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "cache-hot.example".to_string());
     scenario(&engine, "cache hit (fresh)", Vec::new(), many(hot, RecordType::A)).await;
@@ -757,7 +764,7 @@ async fn phase2_scenarios(
     )
     .await;
     let _ = nofilter
-        .handle(query("nf-hot.example.", RecordType::A), local())
+        .handle(ingress(query("nf-hot.example.", RecordType::A)), local())
         .await;
     let nf = (0..n).map(|_| "nf-hot.example".to_string());
     scenario(
@@ -817,7 +824,7 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
     // stats + log ON (production default).
     let on = build_engine_obs(filter.clone(), upstream, true, true).await;
     let _ = on
-        .handle(query("fin-hot.example.", RecordType::A), local())
+        .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
     scenario(&on, "cache hit (stats+log on)", Vec::new(), many(hot, RecordType::A)).await;
@@ -825,7 +832,7 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
     // stats + log OFF (finalize early-returns the response untouched).
     let off = build_engine_obs(filter.clone(), upstream, false, false).await;
     let _ = off
-        .handle(query("fin-hot.example.", RecordType::A), local())
+        .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
     scenario(&off, "cache hit (obs off)", Vec::new(), many(hot, RecordType::A)).await;
@@ -833,14 +840,14 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
     // stats only / log only, to attribute the cost between the two recorders.
     let stats_only = build_engine_obs(filter.clone(), upstream, true, false).await;
     let _ = stats_only
-        .handle(query("fin-hot.example.", RecordType::A), local())
+        .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
     scenario(&stats_only, "cache hit (stats only)", Vec::new(), many(hot, RecordType::A)).await;
 
     let log_only = build_engine_obs(filter.clone(), upstream, false, true).await;
     let _ = log_only
-        .handle(query("fin-hot.example.", RecordType::A), local())
+        .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
     scenario(&log_only, "cache hit (log only)", Vec::new(), many(hot, RecordType::A)).await;
@@ -1008,7 +1015,7 @@ async fn phase2e_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) 
     println!("\n== Phase 2e: end-to-end cache hit incl. wire encode (handle + send-ready) ==");
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let _ = engine
-        .handle(query("e2e-hot.example.", RecordType::A), local())
+        .handle(ingress(query("e2e-hot.example.", RecordType::A)), local())
         .await;
 
     // Real path: a wire-byte hit is already encoded; send it directly.
@@ -1059,7 +1066,7 @@ async fn phase3_concurrency(
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
 
     // Realistic mix: ~30% blocked, ~50% repeated popular (cache hits), ~20% unique forward.
-    let mut msgs: Vec<Message> = Vec::with_capacity(total);
+    let mut msgs: Vec<Ingress> = Vec::with_capacity(total);
     for i in 0..total {
         let m = match i % 10 {
             0..=2 => query(&blocked[i % blocked.len()], RecordType::A),
@@ -1069,7 +1076,7 @@ async fn phase3_concurrency(
                 RecordType::A,
             ),
         };
-        msgs.push(m);
+        msgs.push(ingress(m));
     }
 
     let idx = Arc::new(AtomicUsize::new(0));
@@ -1121,7 +1128,7 @@ async fn phase3_concurrency(
     )
     .await;
     let burst = 200usize;
-    let q = query("single-flight.bench.example", RecordType::A);
+    let q = ingress(query("single-flight.bench.example", RecordType::A));
     let mut tasks = Vec::new();
     for _ in 0..burst {
         let e = sf_engine.clone();
@@ -1429,10 +1436,125 @@ fn phase5_cache_contention() {
 // bench cannot model; see the loopback/live profile for those.
 // ---------------------------------------------------------------------------
 
-/// Max UDP payload the client will accept — mirrors `server::udp_max_payload`.
-fn udp_max_payload(query: &Message) -> usize {
-    let advertised = query.edns.as_ref().map(|e| e.max_payload()).unwrap_or(512);
-    (advertised as usize).clamp(512, 4096)
+// ---------------------------------------------------------------------------
+// Experimental: zero-alloc ingress parser A/B.
+//
+// Compares `Message::from_vec` (the full parse the listener does on EVERY query
+// today) against `wire::parse_query` (a minimal parser that extracts only the
+// hot-path fields with no Message allocation). Same-run best-of-5 — the only
+// reliable yardstick here. Prints the per-query delta, the ceiling on what a
+// zero-alloc ingress path could save on a cache hit.
+// ---------------------------------------------------------------------------
+fn parse_ab() {
+    use bulwark_engine::wire;
+
+    println!("\n== Ingress parse A/B: Message::from_vec vs wire::parse_query ==");
+
+    let plain = query("cache-hit.example.com.", RecordType::A).to_vec().unwrap();
+    let mut m = query("cache-hit.example.com.", RecordType::A);
+    let mut e = hickory_proto::op::Edns::new();
+    e.set_max_payload(1232);
+    e.set_dnssec_ok(true);
+    m.set_edns(e);
+    let edns = m.to_vec().unwrap();
+    let cases = [("no-edns", plain), ("edns+DO", edns)];
+
+    // Correctness gate: the parser must agree with hickory before we trust the
+    // timing (a parser that bailed to None would look unfairly fast).
+    for (label, raw) in &cases {
+        let p = wire::parse_query(raw).expect("parse_query");
+        let hm = Message::from_vec(raw).unwrap();
+        let hq = hm.queries.first().unwrap();
+        assert_eq!(p.id, hm.metadata.id);
+        assert_eq!(p.qname, hq.name().to_ascii());
+        assert_eq!(p.qtype, u16::from(hq.query_type()));
+        assert_eq!(p.qclass, u16::from(hq.query_class()));
+        assert_eq!(p.dnssec_ok, hm.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok));
+        assert_eq!(p.edns_payload, hm.edns.as_ref().map(|e| e.max_payload()));
+        println!("  {label:<8} parser matches hickory");
+    }
+
+    for (label, raw) in &cases {
+        let fv = best_of_5(|| {
+            let m = Message::from_vec(raw).unwrap();
+            std::hint::black_box(&m).queries.len()
+        });
+        let pq = best_of_5(|| {
+            let p = wire::parse_query(raw).unwrap();
+            std::hint::black_box(&p).qname.len()
+        });
+        let saved = fv as i128 - pq as i128;
+        let pct = (fv as f64 - pq as f64) / fv as f64 * 100.0;
+        println!("  {label:<8} from_vec={fv:>4} ns   parse_query={pq:>4} ns   saved={saved:>3} ns ({pct:.0}%)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Integrated ingress A/B: does the win survive end-to-end?
+//
+// parse_ab() compares the parsers in isolation. This compares the *whole*
+// per-request CPU on a cache hit — ingress + handle + UDP encode — two ways on
+// the same primed engine: the new fast path (Ingress::parse -> minimal fields,
+// no Message) vs. the old behavior (Message::from_vec -> Ingress::Full). The two
+// arms are interleaved per iteration so they share one thermal window (no
+// cross-phase drift). The delta is the real cache-hit saving from this change.
+// ---------------------------------------------------------------------------
+async fn ingress_ab(n: usize) {
+    use bulwark_filter::Compiler;
+    println!("\n== Ingress integration A/B: full cache-hit request, Fast vs Full (interleaved) ==");
+
+    let filter = Arc::new(Compiler::new().build().0);
+    let (upstream, _count) = mock_upstream(Duration::from_micros(0)).await;
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+
+    // A typical real client query: EDNS + DO (the shape parse_query wins most on).
+    let mut q = query("ingress-ab-hot.example.", RecordType::A);
+    let mut e = hickory_proto::op::Edns::new();
+    e.set_max_payload(1232);
+    e.set_dnssec_ok(true);
+    q.set_edns(e);
+    let raw = q.to_vec().unwrap();
+
+    // Prime the cache so every timed query is a wire-byte hit.
+    let _ = engine.handle(Ingress::parse(&raw).unwrap(), local()).await;
+
+    let warm = (n / 10).max(1);
+    let mut fast = Vec::with_capacity(n);
+    let mut full = Vec::with_capacity(n);
+    for i in 0..(n + warm) {
+        // Fast: minimal parse, no Message allocation on the hit.
+        let t = Instant::now();
+        let ing = Ingress::parse(&raw).unwrap();
+        let max = ing.udp_max_payload();
+        let out = encode_udp_response(engine.handle(ing, local()).await, max);
+        let fast_ns = t.elapsed().as_nanos() as u64;
+        std::hint::black_box(out.len());
+
+        // Full: the pre-change path — full hickory parse, then handle.
+        let t = Instant::now();
+        let ing = Ingress::Full(Message::from_vec(&raw).unwrap());
+        let max = ing.udp_max_payload();
+        let out = encode_udp_response(engine.handle(ing, local()).await, max);
+        let full_ns = t.elapsed().as_nanos() as u64;
+        std::hint::black_box(out.len());
+
+        if i >= warm {
+            fast.push(fast_ns);
+            full.push(full_ns);
+        }
+    }
+    let med = |mut v: Vec<u64>| {
+        v.sort_unstable();
+        v[v.len() / 2]
+    };
+    let (mf, mu) = (med(fast.clone()), med(full.clone()));
+    report("cache hit: Fast (Ingress::parse)", fast);
+    report("cache hit: Full (Message::from_vec)", full);
+    println!(
+        "  => p50 saved = {} ns/req ({:.0}%)",
+        mu as i64 - mf as i64,
+        (mu as f64 - mf as f64) / mu as f64 * 100.0
+    );
 }
 
 /// Encode an `EngineResponse` for UDP exactly as the listener does: a wire hit
@@ -1451,9 +1573,9 @@ async fn full_request_scenario(engine: &Arc<Engine>, label: &str, pool: Vec<Vec<
     let mut ns = Vec::with_capacity(pool.len());
     for raw in &pool {
         let t = Instant::now();
-        let q = Message::from_vec(raw).unwrap();
-        let max = udp_max_payload(&q);
-        let resp = engine.handle(q, peer).await;
+        let ing = Ingress::parse(raw).unwrap();
+        let max = ing.udp_max_payload();
+        let resp = engine.handle(ing, peer).await;
         let out = encode_udp_response(resp, max);
         ns.push(t.elapsed().as_nanos() as u64);
         std::hint::black_box(out.len());
@@ -1474,7 +1596,7 @@ async fn phase6_full_request(
     // Cache hit: prime once, then time parse+handle+encode of the same query.
     // This is the wire-byte fast path — the encode is a near-free passthrough.
     let _ = engine
-        .handle(query("req-hot.example.", RecordType::A), local())
+        .handle(ingress(query("req-hot.example.", RecordType::A)), local())
         .await;
     let hit_pool = std::iter::repeat_with(|| raw("req-hot.example."))
         .take(n)
@@ -1500,9 +1622,9 @@ async fn phase6_full_request(
     // Same-run handle-only (no parse, no encode) for blocked vs cache hit, so
     // the block-synthesis cost is isolated in one thermal context (cross-phase
     // subtraction is unreliable — see the "same-run A/B only" rule).
-    let blk_msgs = blocked.iter().cycle().take(n).map(|d| query(d, RecordType::A)).collect();
+    let blk_msgs = blocked.iter().cycle().take(n).map(|d| ingress(query(d, RecordType::A))).collect();
     handle_only(&engine, "blocked (handle only)", blk_msgs).await;
-    let hit_msgs = std::iter::repeat_with(|| query("req-hot.example.", RecordType::A)).take(n).collect();
+    let hit_msgs = std::iter::repeat_with(|| ingress(query("req-hot.example.", RecordType::A))).take(n).collect();
     handle_only(&engine, "cache hit (handle only)", hit_msgs).await;
 
     // Decomposition (same-run, best-of-5): attribute the blocked path's per-
@@ -1518,7 +1640,7 @@ async fn phase6_full_request(
     println!("  {:<32} {parse_ns:>6} ns/op", "Message::from_vec (request)");
     // (b) Blocked-response encode: to_vec of the synthesized NXDOMAIN+SOA.
     let blk_resp = engine
-        .handle(Message::from_vec(&blk_bytes).unwrap(), local())
+        .handle(Ingress::parse(&blk_bytes).unwrap(), local())
         .await
         .into_message();
     let blk_enc_ns = best_of_5(|| blk_resp.to_vec().unwrap().len());
@@ -1526,7 +1648,7 @@ async fn phase6_full_request(
     // (c) For contrast: to_vec of a typical A response (the positive case the
     // wire-byte cache lets us skip entirely on a hit).
     let a_resp = engine
-        .handle(query("req-hot.example.", RecordType::A), local())
+        .handle(ingress(query("req-hot.example.", RecordType::A)), local())
         .await
         .into_message();
     let a_enc_ns = best_of_5(|| a_resp.to_vec().unwrap().len());
@@ -1541,12 +1663,12 @@ async fn phase6_full_request(
 }
 
 /// Time engine.handle() only (no parse, no encode) over a batch of messages.
-async fn handle_only(engine: &Arc<Engine>, label: &str, msgs: Vec<Message>) {
+async fn handle_only(engine: &Arc<Engine>, label: &str, msgs: Vec<Ingress>) {
     let peer = local();
     let mut ns = Vec::with_capacity(msgs.len());
-    for m in msgs {
+    for ing in msgs {
         let t = Instant::now();
-        let resp = engine.handle(m, peer).await;
+        let resp = engine.handle(ing, peer).await;
         ns.push(t.elapsed().as_nanos() as u64);
         std::hint::black_box(matches!(resp, EngineResponse::Wire(_)));
     }
@@ -1581,7 +1703,7 @@ async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: S
     let peer = local();
     // Prime the cache-hit domain.
     let _ = engine
-        .handle(query("req-hot.example.", RecordType::A), peer)
+        .handle(ingress(query("req-hot.example.", RecordType::A)), peer)
         .await;
     // Pre-build the raw query byte-blobs OUTSIDE the timed loop — a real server
     // receives bytes off the socket, it does not synthesize them. Building them
@@ -1604,10 +1726,10 @@ async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: S
     for i in 0..iters {
         let bytes = &pool[i % pool.len()];
         let a = Instant::now();
-        let q = Message::from_vec(bytes).unwrap();
-        let max = udp_max_payload(&q);
+        let ing = Ingress::parse(bytes).unwrap();
+        let max = ing.udp_max_payload();
         let b = Instant::now();
-        let resp = engine.handle(q, peer).await;
+        let resp = engine.handle(ing, peer).await;
         let c = Instant::now();
         let out = encode_udp_response(resp, max);
         let d = Instant::now();
@@ -1640,6 +1762,17 @@ async fn main() {
 
     println!("== Bulwark per-request benchmark ==");
     println!("  iterations/scenario={n}  concurrency={concurrency}  upstream_delay={delay:?}");
+
+    // Isolated, list-free A/B for the zero-alloc ingress parser.
+    if std::env::var("BENCH_PROFILE").as_deref() == Ok("parse") {
+        parse_ab();
+        return;
+    }
+    // Integrated before/after: full cache-hit request, Fast vs Full path.
+    if std::env::var("BENCH_PROFILE").as_deref() == Ok("ingress_ab") {
+        ingress_ab(n).await;
+        return;
+    }
 
     println!("\n== Loading filter lists ==");
     let (filter, blocked) = build_filter().await;

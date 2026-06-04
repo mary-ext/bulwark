@@ -42,7 +42,7 @@ use bulwark_engine::cache::DnsCache;
 use bulwark_engine::clients::ClientMatcher;
 use bulwark_engine::querylog::QueryLog;
 use bulwark_engine::stats::Stats;
-use bulwark_engine::{Engine, EngineState};
+use bulwark_engine::{Engine, EngineState, Ingress};
 use bulwark_filter::{Compiler, FilterEngine};
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
 use bytes::{Buf, Bytes};
@@ -603,17 +603,16 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
         Arc::new(Stats::new(true, 24, false)),
     );
 
+    // Encode a query through the real listener ingress (minimal fast path).
+    let ingress = |m: Message| Ingress::parse(&m.to_vec().unwrap()).expect("decodable query");
+
     // Warmup.
     for _ in 0..(n / 10).max(1) {
-        let _ = engine
-            .handle(
-                query(
-                    &format!("warm-{}.chain.example", rand::random::<u32>()),
-                    RecordType::A,
-                ),
-                local(),
-            )
-            .await;
+        let q = query(
+            &format!("warm-{}.chain.example", rand::random::<u32>()),
+            RecordType::A,
+        );
+        let _ = engine.handle(ingress(q), local()).await;
     }
     let mut ns = Vec::with_capacity(n);
     for i in 0..n {
@@ -621,8 +620,11 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
             &format!("u{i}-{}.chain.example", rand::random::<u32>()),
             RecordType::A,
         );
+        // Convert outside the timed region — the server receives bytes; `handle`
+        // is what we measure here.
+        let ing = ingress(q);
         let t = Instant::now();
-        let _ = engine.handle(q, local()).await;
+        let _ = engine.handle(ing, local()).await;
         ns.push(t.elapsed().as_nanos() as u64);
     }
     report(&format!("whole-chain [{name}]"), ns);

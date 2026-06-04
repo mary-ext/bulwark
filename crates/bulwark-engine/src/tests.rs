@@ -19,7 +19,7 @@ use crate::cache::DnsCache;
 use crate::clients::ClientMatcher;
 use crate::querylog::{QueryAction, QueryLog};
 use crate::stats::Stats;
-use crate::{Engine, EngineState};
+use crate::{Engine, EngineState, Ingress};
 
 async fn mock_upstream(answer_ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicU64>) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -99,13 +99,19 @@ fn local() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
 
+/// Encode a query and feed it through the real listener ingress path, so these
+/// tests exercise the same `wire::parse_query` fast path production uses.
+fn ingest(m: Message) -> Ingress {
+    Ingress::parse(&m.to_vec().unwrap()).expect("query should be decodable")
+}
+
 #[tokio::test]
 async fn forwards_and_caches() {
     let (up, count) = mock_upstream(Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("", up).await;
 
     let r1 = engine
-        .handle(query("good.com.", RecordType::A), local())
+        .handle(ingest(query("good.com.", RecordType::A)), local())
         .await
         .into_message();
     assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
@@ -114,7 +120,7 @@ async fn forwards_and_caches() {
 
     // Second identical query should be served from cache (no new upstream hit).
     let r2 = engine
-        .handle(query("good.com.", RecordType::A), local())
+        .handle(ingest(query("good.com.", RecordType::A)), local())
         .await
         .into_message();
     assert_eq!(r2.answers.len(), 1);
@@ -129,13 +135,13 @@ async fn cache_hit_serves_patched_wire() {
 
     // Prime the cache (forwarded, stored as wire bytes with TTL 300).
     let _ = engine
-        .handle(query("hit.com.", RecordType::A), local())
+        .handle(ingest(query("hit.com.", RecordType::A)), local())
         .await;
 
     // Second query with a *different* transaction id -> wire-byte cache hit.
     let mut q = query("hit.com.", RecordType::A);
     q.metadata.id = 0x4242;
-    let r = engine.handle(q, local()).await.into_message();
+    let r = engine.handle(ingest(q), local()).await.into_message();
 
     assert_eq!(
         count.load(Ordering::SeqCst),
@@ -160,7 +166,7 @@ async fn blocks_filtered_domain() {
     engine.log().set_sink(tx);
 
     let r = engine
-        .handle(query("ads.example.com.", RecordType::A), local())
+        .handle(ingest(query("ads.example.com.", RecordType::A)), local())
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
@@ -178,7 +184,7 @@ async fn rewrites_to_custom_ip() {
     let engine = make_engine("||router.lan^$dnsrewrite=10.0.0.1", up).await;
 
     let r = engine
-        .handle(query("router.lan.", RecordType::A), local())
+        .handle(ingest(query("router.lan.", RecordType::A)), local())
         .await
         .into_message();
     assert_eq!(r.answers.len(), 1);
@@ -191,10 +197,10 @@ async fn records_statistics() {
     let engine = make_engine("||bad.com^", up).await;
 
     engine
-        .handle(query("bad.com.", RecordType::A), local())
+        .handle(ingest(query("bad.com.", RecordType::A)), local())
         .await;
     engine
-        .handle(query("good.com.", RecordType::A), local())
+        .handle(ingest(query("good.com.", RecordType::A)), local())
         .await;
 
     let snap = engine.stats().snapshot(10, &engine.clients());
@@ -210,7 +216,7 @@ async fn servfail_when_no_upstream_answers() {
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let engine = make_engine("", dead).await;
     let r = engine
-        .handle(query("anything.com.", RecordType::A), local())
+        .handle(ingest(query("anything.com.", RecordType::A)), local())
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::ServFail);

@@ -180,22 +180,37 @@ impl Engine {
     }
 
     /// Process a query and return the response, recording log + stats.
-    pub async fn handle(&self, query: Message, client_ip: IpAddr) -> EngineResponse {
+    ///
+    /// The [`Ingress`] carries either the cheap [`wire::parse_query`] fields (with
+    /// the raw bytes kept for a lazy full parse) or a fully-parsed `Message`. A
+    /// plain cache hit reads only the cheap fields and never builds a `Message`;
+    /// the full parse happens lazily on the block / rewrite / forward / refresh
+    /// paths, which need one to echo, synthesize, or forward.
+    pub async fn handle(&self, ingress: Ingress, client_ip: IpAddr) -> EngineResponse {
         let start = Instant::now();
         let state = self.state.load();
         let client = state.clients.identify(client_ip);
 
-        // A query must have a question.
-        let Some(question) = query.queries.first().cloned() else {
-            return EngineResponse::Message(error_response(&query, ResponseCode::FormErr));
+        // Extract the hot-path fields up front; `lazy` defers the full `Message`.
+        let (fields, lazy) = match ingress.into_parts() {
+            Ok(parts) => parts,
+            // No question to act on: FormErr against a best-effort echo.
+            Err(msg) => {
+                return EngineResponse::Message(error_response(&msg, ResponseCode::FormErr))
+            }
         };
-        let rtype = question.query_type();
+        let QueryFields {
+            id,
+            rtype,
+            class,
+            qname_display,
+            name_lower,
+            dnssec_ok,
+            checking_disabled,
+        } = fields;
         let rtype_str = rtype_label(rtype);
-        let qname_display = question.name().to_ascii();
-        // Normalize the name once (lowercased, dot-terminated) and reuse it for
-        // both filtering and the cache/single-flight key. `domain` is a borrow
-        // into it, so the common path allocates the name exactly once.
-        let name_lower = qname_display.to_ascii_lowercase();
+        // `domain` borrows `name_lower`; its last use is in `filter.check`, so the
+        // name can still be moved into the cache key afterwards.
         let domain = name_lower.trim_end_matches('.');
 
         // Cloning a borrowed Cow is a pointer copy (no allocation) for the common
@@ -211,6 +226,9 @@ impl Engine {
             };
             match state.filter.check(domain, rtype_str.as_ref(), &ci) {
                 Verdict::Block(info) => {
+                    let Some(query) = lazy.into_message() else {
+                        return self.finalize(formerr(id), QueryAction::Error, log, start);
+                    };
                     let resp = block_response(
                         &query,
                         state.blocking_mode,
@@ -225,6 +243,9 @@ impl Engine {
                     return self.finalize(resp, action, log, start);
                 }
                 Verdict::Rewrite { info, data } => {
+                    let Some(query) = lazy.into_message() else {
+                        return self.finalize(formerr(id), QueryAction::Error, log, start);
+                    };
                     let action = QueryAction::Rewritten {
                         rule: info.rule,
                         list_id: info.list_id,
@@ -254,17 +275,22 @@ impl Engine {
         let key = QueryKey {
             name: name_lower,
             rtype,
-            class: question.query_class(),
+            class,
             // Keep DNSSEC-sensitive queries in distinct cache/single-flight
             // entries so a DO/CD response is never cross-served (see `QueryKey`).
-            dnssec_ok: bulwark_upstream::dnssec_ok(&query),
-            checking_disabled: query.metadata.checking_disabled,
+            dnssec_ok,
+            checking_disabled,
         };
-        if let Some(hit) = self.cache.get(&key, query.metadata.id) {
+        if let Some(hit) = self.cache.get(&key, id) {
             if hit.stale {
                 // Optimistic: refresh in the background (single-flight in the
-                // pool ensures only one upstream request).
-                self.spawn_refresh(state.pool.clone(), query.clone(), key.clone());
+                // pool ensures only one upstream request). This is the one cache
+                // hit that needs the full `Message` — to forward upstream. If it
+                // somehow won't re-parse, just skip the refresh and still serve
+                // the cached hit.
+                if let Some(refresh) = lazy.into_message() {
+                    self.spawn_refresh(state.pool.clone(), refresh, key.clone());
+                }
             }
             return match hit.response {
                 // Fast path: pre-encoded bytes with id + TTLs already patched.
@@ -280,6 +306,9 @@ impl Engine {
         }
 
         // ---- Upstream ----
+        let Some(query) = lazy.into_message() else {
+            return self.finalize(formerr(id), QueryAction::Error, log, start);
+        };
         match state.pool.resolve(&query).await {
             Ok(resolved) => {
                 self.cache.insert(key, &resolved.message);
@@ -421,6 +450,140 @@ impl Engine {
             start,
         );
         EngineResponse::Wire(bytes)
+    }
+}
+
+/// What the listener hands [`Engine::handle`]: either the cheap
+/// [`wire::parse_query`] fields with the raw bytes kept for a lazy full parse, or
+/// a fully-parsed `Message` for anything the minimal parser couldn't handle.
+#[derive(Clone)]
+pub enum Ingress {
+    /// Fast path: minimal parse plus the original bytes, re-parsed into a
+    /// `Message` only if a block / rewrite / forward / refresh path needs one.
+    Fast {
+        bytes: Vec<u8>,
+        parsed: wire::ParsedQuery,
+    },
+    /// The minimal parser bailed (compression, escaping, or a quirk it declines
+    /// to handle); the listener fell back to a full parse.
+    Full(Message),
+}
+
+impl Ingress {
+    /// Parse inbound query bytes: the minimal fast path when possible, else a
+    /// full `Message`. Returns `None` only when the bytes aren't a decodable DNS
+    /// query at all (the listener drops those without replying).
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        match wire::parse_query(bytes) {
+            Some(parsed) => Some(Ingress::Fast {
+                bytes: bytes.to_vec(),
+                parsed,
+            }),
+            None => Message::from_vec(bytes).ok().map(Ingress::Full),
+        }
+    }
+
+    /// The client's maximum acceptable UDP payload (EDNS advertised size, clamped
+    /// to 512..=4096) — identical to what the full-parse path computed from `edns`.
+    pub fn udp_max_payload(&self) -> usize {
+        let advertised = match self {
+            Ingress::Fast { parsed, .. } => parsed.edns_payload.unwrap_or(512),
+            Ingress::Full(m) => m.edns.as_ref().map(|e| e.max_payload()).unwrap_or(512),
+        };
+        (advertised as usize).clamp(512, 4096)
+    }
+
+    /// Split into the cheap hot-path fields and the lazy `Message` source. Returns
+    /// `Err(message)` when a fully-parsed query carries no question, so the caller
+    /// can answer FormErr against it. The error message is boxed — it is the rare
+    /// path, and boxing keeps the common `Ok` return small.
+    fn into_parts(self) -> Result<(QueryFields, Lazy), Box<Message>> {
+        match self {
+            Ingress::Fast { bytes, parsed } => {
+                Ok((QueryFields::from_parsed(parsed), Lazy::Bytes(bytes)))
+            }
+            Ingress::Full(msg) => match QueryFields::from_message(&msg) {
+                Some(fields) => Ok((fields, Lazy::Msg(msg))),
+                None => Err(Box::new(msg)),
+            },
+        }
+    }
+}
+
+/// The lazily-materialised full `Message`: either already parsed, or the raw
+/// bytes re-parsed on demand for a path that needs a structured query.
+enum Lazy {
+    Bytes(Vec<u8>),
+    Msg(Message),
+}
+
+impl Lazy {
+    /// Build the full `Message` for a path that needs one. For the fast variant
+    /// this re-parses the kept bytes; [`wire::parse_query`] accepts only a strict
+    /// subset of what `from_vec` accepts, so this succeeds for every query that
+    /// took the fast path. `None` (a `from_vec` failure) is therefore effectively
+    /// unreachable — but the caller handles it by answering FORMERR rather than
+    /// fabricating a question-less query for the block/rewrite/forward synthesis.
+    fn into_message(self) -> Option<Message> {
+        match self {
+            Lazy::Msg(m) => Some(m),
+            Lazy::Bytes(b) => Message::from_vec(&b).ok(),
+        }
+    }
+}
+
+/// A header-only FORMERR response carrying `id`, for the effectively-unreachable
+/// path where a fast-parsed query fails to re-parse into a full `Message`. Safer
+/// than fabricating a question-less query for the response-synthesis paths.
+fn formerr(id: u16) -> Message {
+    let mut m = Message::new(id, MessageType::Response, OpCode::Query);
+    m.metadata.response_code = ResponseCode::FormErr;
+    m
+}
+
+/// The cheap, allocation-light fields the hot path reads from a query — sourced
+/// from either [`wire::parse_query`] or a full `Message`, identically either way.
+struct QueryFields {
+    id: u16,
+    rtype: RecordType,
+    class: DNSClass,
+    /// Original on-the-wire case, for the query log.
+    qname_display: String,
+    /// Lowercased, dot-terminated — the cache/filter key.
+    name_lower: String,
+    dnssec_ok: bool,
+    checking_disabled: bool,
+}
+
+impl QueryFields {
+    fn from_parsed(p: wire::ParsedQuery) -> Self {
+        let name_lower = p.qname.to_ascii_lowercase();
+        QueryFields {
+            id: p.id,
+            // `From<u16>` is hickory's own inverse of the encode, so these match
+            // the full-parse path's `query_type()` / `query_class()` exactly.
+            rtype: RecordType::from(p.qtype),
+            class: DNSClass::from(p.qclass),
+            qname_display: p.qname,
+            name_lower,
+            dnssec_ok: p.dnssec_ok,
+            checking_disabled: p.checking_disabled,
+        }
+    }
+
+    fn from_message(m: &Message) -> Option<Self> {
+        let q = m.queries.first()?;
+        let qname_display = q.name().to_ascii();
+        let name_lower = qname_display.to_ascii_lowercase();
+        Some(QueryFields {
+            id: m.metadata.id,
+            rtype: q.query_type(),
+            class: q.query_class(),
+            qname_display,
+            name_lower,
+            dnssec_ok: bulwark_upstream::dnssec_ok(m),
+            checking_disabled: m.metadata.checking_disabled,
+        })
     }
 }
 
