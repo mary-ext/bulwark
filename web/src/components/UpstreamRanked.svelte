@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { num, ms } from "../lib/format";
+  import { num, duration } from "../lib/format";
   import type { TopEntryDto, LatencyPercentilesDto } from "../api/generated";
 
   let {
@@ -50,7 +50,7 @@
   const max = $derived(Math.max(1, ...rows.map((r) => r.count)));
   const denom = $derived(rows.reduce((s, r) => s + r.count, 0) || 1);
 
-  const latTitle = (r: Row) => `p50 ${ms(r.p50)} · p90 ${ms(r.p90)} · p99 ${ms(r.p99)}`;
+  const latTitle = (r: Row) => `p50 ${duration(r.p50)} · p90 ${duration(r.p90)} · p99 ${duration(r.p99)}`;
 </script>
 
 {#if rows.length}
@@ -60,7 +60,7 @@
         <span class="rk-name mono" title={r.name}>{r.name}</span>
         <div class="rk-value">
           <div class="rk-meta">
-            <span class="rk-lat" title={latTitle(r)}>{ms(r.p50)}</span>
+            <span class="rk-lat" title={latTitle(r)}>{duration(r.p50)}</span>
             <span class="rk-count">{num(r.count)} · {((r.count / denom) * 100).toFixed(0)}%</span>
           </div>
           <div class="rk-track">

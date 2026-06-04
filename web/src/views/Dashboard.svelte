@@ -4,7 +4,7 @@
   import type { StatsResponse } from "../api/generated";
   import { isStatus } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
-  import { num, pct, ms } from "../lib/format";
+  import { num, pct, duration } from "../lib/format";
   import Icon from "../components/Icon.svelte";
   import StatCard from "../components/StatCard.svelte";
   import RankedList from "../components/RankedList.svelte";
@@ -62,7 +62,7 @@
     />
     <StatCard
       label="Avg processing"
-      value={ms(stats.avg_processing_ms)}
+      value={duration(stats.avg_processing_ms)}
       sub="{num(stats.rewritten)} rewritten"
     />
   </div>

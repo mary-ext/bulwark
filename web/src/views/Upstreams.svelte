@@ -4,7 +4,7 @@
   import type { UpstreamStatDto, UpstreamsConfig } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
-  import { ms, num, parseList } from "../lib/format";
+  import { duration, num, parseList } from "../lib/format";
   import Icon from "../components/Icon.svelte";
   import Field from "../components/Field.svelte";
   import ResponsiveTable from "../components/ResponsiveTable.svelte";
@@ -58,7 +58,7 @@
     testing = spec;
     try {
       const r = await ok(api.testUpstream({ spec }));
-      if (r.ok) toaster.show(`OK — ${r.rtt_ms?.toFixed(1)} ms`);
+      if (r.ok) toaster.show(`OK — ${duration(r.rtt_ms)}`);
       else toaster.show(`Failed: ${r.error}`, true);
     } finally {
       testing = null;
@@ -95,7 +95,7 @@
         </td>
         <td class="mono up-name" title={s.last_error ?? s.spec}>{s.name}</td>
         <td><span class="tag">{s.kind.toUpperCase()}</span></td>
-        <td class="num">{ms(s.avg_rtt_ms)}</td>
+        <td class="num">{duration(s.avg_rtt_ms)}</td>
         <td class="num">{num(s.total_queries)}</td>
         <td class="num" class:bad={s.total_failures > 0}>{num(s.total_failures)}</td>
         <td style="text-align:right">
@@ -118,7 +118,7 @@
         </div>
         {#if s.last_error}<div class="up-error" title={s.last_error}>{s.last_error}</div>{/if}
         <div class="up-metrics muted">
-          <span>avg {ms(s.avg_rtt_ms)}</span>
+          <span>avg {duration(s.avg_rtt_ms)}</span>
           <span>{num(s.total_queries)} q</span>
           <span class:bad={s.total_failures > 0}>{num(s.total_failures)} fail</span>
         </div>

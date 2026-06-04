@@ -6,11 +6,35 @@ export function pct(frac: number): string {
   return (frac * 100).toFixed(1) + "%";
 }
 
-export function ms(v: number | null | undefined): string {
-  if (v == null) return "—";
-  if (v < 1) return v.toFixed(2) + " ms";
-  if (v < 1000) return v.toFixed(1) + " ms";
-  return (v / 1000).toFixed(2) + " s";
+// Reused across every render; instantiating Intl.NumberFormat is comparatively
+// expensive, so keep one per (unit, precision) we display. `style: "unit"` lets
+// the formatter emit the locale-aware unit label ("ms", "μs", "s") for us.
+const unitFmt = (unit: string, max: number) =>
+  new Intl.NumberFormat(undefined, {
+    style: "unit",
+    unit,
+    unitDisplay: "short",
+    maximumFractionDigits: max,
+  });
+const usFmt1 = unitFmt("microsecond", 1);
+const usFmt0 = unitFmt("microsecond", 0);
+const msFmt = unitFmt("millisecond", 1);
+const sFmt = unitFmt("second", 2);
+
+/**
+ * Format a duration given in **milliseconds**, auto-scaling the unit so
+ * sub-millisecond values (e.g. cache hits at ~0.001 ms) stay legible as
+ * microseconds instead of collapsing to "0.00 ms".
+ */
+export function duration(milliseconds: number | null | undefined): string {
+  if (milliseconds == null) return "—";
+  if (milliseconds <= 0) return msFmt.format(0);
+  if (milliseconds < 1) {
+    const us = milliseconds * 1000;
+    return (us < 10 ? usFmt1 : usFmt0).format(us);
+  }
+  if (milliseconds < 1000) return msFmt.format(milliseconds);
+  return sFmt.format(milliseconds / 1000);
 }
 
 export function relTime(epochMs: number): string {

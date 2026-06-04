@@ -5,7 +5,7 @@
   import type { LogEntryView } from "../api/generated";
   import { isStatus, errMsg } from "../lib/errors";
   import { toaster } from "../lib/toast.svelte";
-  import { relTime, ms, dateTime } from "../lib/format";
+  import { relTime, duration, dateTime } from "../lib/format";
   import { isMobile } from "../lib/media.svelte";
   import Icon from "../components/Icon.svelte";
   import Badge from "../components/Badge.svelte";
@@ -175,7 +175,7 @@
         <td class="resp-col">
           <div class="response-cell">
             <span class="status status-{tone(e)}">{statusLabel(e)}</span>
-            <span class="resp-latency muted" title="Response time">{ms(e.elapsed_ms)}</span>
+            <span class="resp-latency muted" title="Response time">{duration(e.elapsed_ms)}</span>
           </div>
         </td>
         <td class="actions-cell" onclick={(ev) => ev.stopPropagation()}>
@@ -206,7 +206,7 @@
           <Badge tone={tone(e)}>{statusLabel(e)}</Badge>
         </div>
         <div class="log-card-meta muted">
-          {relTime(e.time_ms)} · {e.qtype} · {e.client_name ?? e.client_ip} · {ms(e.elapsed_ms)}
+          {relTime(e.time_ms)} · {e.qtype} · {e.client_name ?? e.client_ip} · {duration(e.elapsed_ms)}
         </div>
       </button>
     {/snippet}
@@ -262,7 +262,7 @@
           <dt>Upstream</dt>
           <dd class="mono">{detail.upstream ?? (detail.action === "cached" ? "cache" : "—")}</dd>
           <dt>Elapsed</dt>
-          <dd>{ms(detail.elapsed_ms)}</dd>
+          <dd>{duration(detail.elapsed_ms)}</dd>
           <dt>Answers</dt>
           <dd class="answers">
             {#if detail.answers.length}
