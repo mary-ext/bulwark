@@ -6,7 +6,7 @@ use std::str::FromStr;
 use bulwark_config::BlockingMode;
 use bulwark_filter::{RewriteData, RewriteRcode};
 use hickory_proto::op::{Message, MessageType, ResponseCode};
-use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, PTR, TXT};
+use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, PTR, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
 /// Build a response shell echoing the query's id, question, and EDNS.
@@ -64,6 +64,29 @@ fn qtype_of(_name: &Name, msg: &Message) -> RecordType {
         .unwrap_or(RecordType::A)
 }
 
+/// A synthetic SOA for the authority section so clients negative-cache a blocked
+/// response for `blocked_ttl` (RFC 2308: the negative TTL is `min(SOA.minimum,
+/// record TTL)`). Without it, NXDOMAIN/NODATA blocks aren't cached and the same
+/// blocked name is re-queried (and re-logged) on every lookup.
+fn negative_soa(name: Name, ttl: u32) -> Record {
+    let mname =
+        Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap_or_else(|_| Name::root());
+    let rname = Name::from_str("hostmaster.bulwark.invalid.").unwrap_or_else(|_| Name::root());
+    // blocked_ttl is small in practice; clamp to a positive i32 for the
+    // refresh/retry/expire fields just in case.
+    let secs = ttl.min(i32::MAX as u32) as i32;
+    let soa = SOA::new(
+        mname,
+        rname,
+        1,                       // serial
+        secs,                    // refresh
+        secs,                    // retry
+        secs.saturating_mul(10), // expire
+        ttl,                     // minimum — drives the negative-cache TTL
+    );
+    Record::from_rdata(name, ttl, RData::SOA(soa))
+}
+
 /// Synthesize a blocked response per the configured [`BlockingMode`].
 pub fn block_response(
     query: &Message,
@@ -75,9 +98,12 @@ pub fn block_response(
     let mut m = base(query);
     let name = qname(query);
     match mode {
-        BlockingMode::NxDomain => m.metadata.response_code = ResponseCode::NXDomain,
+        BlockingMode::NxDomain => {
+            m.metadata.response_code = ResponseCode::NXDomain;
+            m.authorities.push(negative_soa(name, ttl));
+        }
         BlockingMode::Refused => m.metadata.response_code = ResponseCode::Refused,
-        BlockingMode::NoData => {} // NOERROR, empty
+        BlockingMode::NoData => m.authorities.push(negative_soa(name, ttl)), // NOERROR, empty + SOA
         BlockingMode::NullIp => push_ip(
             &mut m,
             name,
@@ -211,6 +237,28 @@ mod tests {
         );
         assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
         assert_eq!(r.metadata.id, 7);
+    }
+
+    #[test]
+    fn nxdomain_and_nodata_carry_soa_for_negative_caching() {
+        for mode in [BlockingMode::NxDomain, BlockingMode::NoData] {
+            let r = block_response(
+                &query("a.com.", RecordType::A),
+                mode,
+                Ipv4Addr::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
+                42,
+            );
+            assert_eq!(r.authorities.len(), 1, "{mode:?} should carry an SOA");
+            match &r.authorities[0].data {
+                RData::SOA(soa) => assert_eq!(
+                    soa.minimum, 42,
+                    "SOA minimum drives the negative-cache TTL"
+                ),
+                other => panic!("expected SOA authority, got {other:?}"),
+            }
+            assert_eq!(r.authorities[0].ttl, 42);
+        }
     }
 
     #[test]

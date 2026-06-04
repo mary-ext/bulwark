@@ -66,24 +66,44 @@ impl ClientMatcher {
         Self { entries }
     }
 
+    /// The entry whose most-specific (longest-prefix) net contains `ip`, if any.
+    /// Longest-prefix wins so a specific host/subnet overrides a broader CIDR
+    /// regardless of config order (e.g. a `/32` beats a `10.0.0.0/8` listed
+    /// first). Ties on prefix length go to the earlier-configured entry.
+    fn best_match(&self, ip: IpAddr) -> Option<&ClientEntry> {
+        let mut best: Option<(u8, &ClientEntry)> = None;
+        for e in &self.entries {
+            if let Some(plen) = e
+                .nets
+                .iter()
+                .filter(|n| n.contains(&ip))
+                .map(|n| n.prefix_len())
+                .max()
+            {
+                if best.is_none_or(|(b, _)| plen > b) {
+                    best = Some((plen, e));
+                }
+            }
+        }
+        best.map(|(_, e)| e)
+    }
+
     /// Identify the client behind `ip`. Unknown IPs resolve to an unnamed client
     /// with filtering enabled.
     pub fn identify(&self, ip: IpAddr) -> ResolvedClient {
-        for e in &self.entries {
-            if e.nets.iter().any(|n| n.contains(&ip)) {
-                return ResolvedClient {
-                    ip,
-                    name: Some(e.name.clone()),
-                    tags: e.tags.clone(),
-                    filtering_enabled: e.filtering_enabled,
-                };
-            }
-        }
-        ResolvedClient {
-            ip,
-            name: None,
-            tags: Vec::new(),
-            filtering_enabled: true,
+        match self.best_match(ip) {
+            Some(e) => ResolvedClient {
+                ip,
+                name: Some(e.name.clone()),
+                tags: e.tags.clone(),
+                filtering_enabled: e.filtering_enabled,
+            },
+            None => ResolvedClient {
+                ip,
+                name: None,
+                tags: Vec::new(),
+                filtering_enabled: true,
+            },
         }
     }
 
@@ -91,10 +111,7 @@ impl ClientMatcher {
     /// matcher (no allocation). Used to resolve display names at read time so a
     /// rename or removal in the client config applies retroactively.
     pub fn name_for(&self, ip: IpAddr) -> Option<&str> {
-        self.entries
-            .iter()
-            .find(|e| e.nets.iter().any(|n| n.contains(&ip)))
-            .map(|e| e.name.as_str())
+        self.best_match(ip).map(|e| e.name.as_str())
     }
 
     /// Resolve a stored client-IP string to its current configured name, if any.
@@ -134,6 +151,28 @@ mod tests {
             Some("guests")
         );
         assert_eq!(m.identify("8.8.8.8".parse().unwrap()).name, None);
+    }
+
+    #[test]
+    fn longest_prefix_wins_over_config_order() {
+        let m = ClientMatcher::build(&[
+            // Broad range listed first, with filtering off...
+            ClientConfig {
+                filtering_enabled: false,
+                ..cfg("lan", &["10.0.0.0/8"], &["broad"])
+            },
+            // ...and a specific host listed second, with filtering on.
+            cfg("server", &["10.1.2.3"], &["specific"]),
+        ]);
+        // 10.1.2.3 matches both; the /32 host must win despite being listed last.
+        let c = m.identify("10.1.2.3".parse().unwrap());
+        assert_eq!(c.name.as_deref(), Some("server"));
+        assert!(c.filtering_enabled, "specific entry's policy applies");
+        // A different 10.x address still falls to the broad client.
+        assert_eq!(
+            m.identify("10.9.9.9".parse().unwrap()).name.as_deref(),
+            Some("lan")
+        );
     }
 
     #[test]
