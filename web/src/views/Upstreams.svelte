@@ -30,8 +30,12 @@
   }
 
   async function loadCfg() {
-    const c = await ok(api.getConfig());
-    cfg = (c.upstreams ?? null) as UpstreamsCfg | null;
+    try {
+      const c = await ok(api.getConfig());
+      cfg = (c.upstreams ?? null) as UpstreamsCfg | null;
+    } catch (e) {
+      if (!isStatus(e, 401)) toaster.show("Failed to load upstreams config", true);
+    }
   }
 
   // Load once on mount — no background polling.

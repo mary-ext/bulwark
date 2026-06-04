@@ -2,6 +2,7 @@
   import * as api from "../api/generated";
   import { ok } from "@oazapfts/runtime";
   import type {
+    Config,
     CacheConfig,
     QueryLogConfig,
     StatsConfig,
@@ -37,7 +38,14 @@
   let privacy = $state<Required<PrivacyConfig> | null>(null);
 
   async function load() {
-    const c = await ok(api.getConfig());
+    let c: Config;
+    try {
+      c = await ok(api.getConfig());
+    } catch (e) {
+      // Without this the page sticks on "Loading…" forever on a failed load.
+      toaster.show(errMsg(e, "Failed to load settings"), true);
+      return;
+    }
     filtering = {
       enabled: c.filtering?.enabled ?? true,
       blocking_mode: c.filtering?.blocking_mode ?? "nx_domain",

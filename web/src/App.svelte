@@ -3,6 +3,7 @@
   import { ok } from "@oazapfts/runtime";
   import type { StatusResponse } from "./api/generated";
   import { toaster } from "./lib/toast.svelte";
+  import { session } from "./lib/session.svelte";
   import { router } from "./lib/router.svelte";
   import AppShell from "./components/AppShell.svelte";
   import Toast from "./components/Toast.svelte";
@@ -20,6 +21,9 @@
   async function refreshStatus() {
     try {
       status = await ok(api.status());
+      // A successful status fetch means we're talking to the server again; if a
+      // prior 401 had flagged the session expired, this re-auth clears it.
+      session.clear();
     } catch {
       toaster.show("Failed to reach server", true);
     } finally {
@@ -28,13 +32,28 @@
   }
 
   async function logout() {
-    await ok(api.logout()).catch(() => {});
+    // Pessimistically drop to the login screen even if the logout call fails, so
+    // we never leave a half-logged-out UI showing privileged data.
+    try {
+      await ok(api.logout());
+    } catch {
+      /* ignore — we clear local auth state regardless */
+    }
+    if (status) status = { ...status, authed: false };
     await refreshStatus();
   }
 
   refreshStatus();
 
-  const authed = $derived(status?.authed === true && !status?.setup_needed);
+  // Any 401 from an API call flips `session.expired`; treat that as logged-out.
+  const authed = $derived(
+    status?.authed === true && !status?.setup_needed && !session.expired,
+  );
+
+  // Surface the expiry once, so the user knows why they're back at the login.
+  $effect(() => {
+    if (session.expired) toaster.show("Session expired — please sign in again", true);
+  });
 </script>
 
 {#if loading}

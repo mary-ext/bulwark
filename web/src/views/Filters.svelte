@@ -67,7 +67,12 @@
   }
 
   async function toggleList(l: FilterListConfig) {
-    await ok(api.updateList(l.id, { enabled: !l.enabled }));
+    try {
+      await ok(api.updateList(l.id, { enabled: !l.enabled }));
+    } catch (err) {
+      toaster.show(errMsg(err, "Failed to update list"), true);
+    }
+    // Reload either way so the UI reflects the server's actual state.
     await load();
   }
 
@@ -83,7 +88,12 @@
   }
 
   async function remove(l: FilterListConfig) {
-    await ok(api.deleteList(l.id));
+    try {
+      await ok(api.deleteList(l.id));
+      toaster.show(`Removed ${l.name}`);
+    } catch (err) {
+      toaster.show(errMsg(err, "Failed to remove list"), true);
+    }
     await load();
   }
 

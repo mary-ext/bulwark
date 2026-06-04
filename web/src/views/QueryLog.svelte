@@ -27,7 +27,12 @@
   let detail = $state<LogEntryView | null>(null);
   let sheetOpen = $state(false);
 
+  // Monotonic request id: a slow response from an old filter/search must not
+  // overwrite results for the controls the user is now looking at.
+  let loadSeq = 0;
+
   async function load() {
+    const seq = ++loadSeq;
     loading = true;
     try {
       const r = await ok(
@@ -39,12 +44,15 @@
           limit,
         }),
       );
+      if (seq !== loadSeq) return; // superseded by a newer load
       entries = r.entries;
       total = r.total;
     } catch (e) {
-      if (!isStatus(e, 401)) toaster.show("Failed to load query log", true);
+      if (seq === loadSeq && !isStatus(e, 401)) {
+        toaster.show("Failed to load query log", true);
+      }
     } finally {
-      loading = false;
+      if (seq === loadSeq) loading = false;
     }
   }
 
