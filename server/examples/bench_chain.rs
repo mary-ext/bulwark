@@ -478,6 +478,8 @@ fn phase0_ab(blocked: &[String]) {
             name: name_lower,
             rtype: q.query_type(),
             class: q.query_class(),
+            dnssec_ok: false,
+            checking_disabled: false,
         };
         dlen + key.name.len()
     });

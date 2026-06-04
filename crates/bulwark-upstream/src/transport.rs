@@ -28,6 +28,15 @@ pub struct QueryKey {
     pub name: String,
     pub rtype: RecordType,
     pub class: DNSClass,
+    /// EDNS DNSSEC-OK (DO) bit. A DO query gets RRSIGs and can receive different
+    /// answers, so it must not share a cache / single-flight entry with a non-DO
+    /// query for the same name/type/class — otherwise a DNSSEC response could be
+    /// served to a client that didn't ask for one, or a stripped (non-DO)
+    /// response to a validating client, breaking validation.
+    pub dnssec_ok: bool,
+    /// Header CD (checking-disabled) bit. A CD=1 query may receive data a
+    /// validating (CD=0) query would not, so it is keyed separately too.
+    pub checking_disabled: bool,
 }
 
 impl QueryKey {
@@ -38,8 +47,15 @@ impl QueryKey {
             name: q.name().to_ascii().to_ascii_lowercase(),
             rtype: q.query_type(),
             class: q.query_class(),
+            dnssec_ok: dnssec_ok(msg),
+            checking_disabled: msg.metadata.checking_disabled,
         })
     }
+}
+
+/// Whether the message's EDNS OPT record has the DNSSEC-OK (DO) bit set.
+pub fn dnssec_ok(msg: &Message) -> bool {
+    msg.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok)
 }
 
 /// Encode a DNS message to wire format.

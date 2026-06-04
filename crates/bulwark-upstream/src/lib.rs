@@ -25,7 +25,7 @@ pub use pool::{
     test_spec, PoolEntry, PoolSettings, Resolved, Upstream, UpstreamPool, UpstreamStat,
 };
 pub use spec::{Host, TransportKind, UpstreamSpec};
-pub use transport::{QueryKey, Transport};
+pub use transport::{dnssec_ok, QueryKey, Transport};
 
 #[cfg(feature = "test-trust-roots")]
 pub use tlsconf::test_roots::add_trust_root;

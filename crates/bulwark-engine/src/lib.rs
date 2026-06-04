@@ -255,6 +255,10 @@ impl Engine {
             name: name_lower,
             rtype,
             class: question.query_class(),
+            // Keep DNSSEC-sensitive queries in distinct cache/single-flight
+            // entries so a DO/CD response is never cross-served (see `QueryKey`).
+            dnssec_ok: bulwark_upstream::dnssec_ok(&query),
+            checking_disabled: query.metadata.checking_disabled,
         };
         if let Some(hit) = self.cache.get(&key, query.metadata.id) {
             if hit.stale {

@@ -21,7 +21,9 @@ const DEFAULT_NEGATIVE_TTL: u32 = 30;
 const STALE_SERVE_TTL: u32 = 1;
 /// Magic + version header for the persisted snapshot blob. Bump the trailing
 /// digit on any format change so stale snapshots are ignored, not misread.
-const SNAPSHOT_MAGIC: &[u8; 8] = b"BLWKCSN1";
+// Identifies the snapshot format. A blob whose magic doesn't match (a different
+// or older format) fails the check and is ignored — a safe cold start.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"BLWKCSN2";
 
 /// How a cached response is held. The common case is `Wire`: the response we
 /// already encoded once, plus the byte offsets of every TTL field, so serving a
@@ -486,6 +488,8 @@ fn write_record(
     out.extend_from_slice(name);
     out.extend_from_slice(&u16::from(key.rtype).to_le_bytes());
     out.extend_from_slice(&u16::from(key.class).to_le_bytes());
+    // Pack the DNSSEC-relevant key bits into one flags byte (bit0=DO, bit1=CD).
+    out.push((key.dnssec_ok as u8) | ((key.checking_disabled as u8) << 1));
     out.extend_from_slice(&age.to_le_bytes());
     out.extend_from_slice(&ttl.to_le_bytes());
     out.extend_from_slice(&u16::from(rcode).to_le_bytes());
@@ -519,6 +523,9 @@ fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
     let name = String::from_utf8_lossy(r.take(name_len)?).into_owned();
     let rtype = r.u16()?.into();
     let class = r.u16()?.into();
+    let flags = r.u8()?;
+    let dnssec_ok = flags & 0b01 != 0;
+    let checking_disabled = flags & 0b10 != 0;
     let age = r.u32()?;
     let ttl = r.u32()?;
     // Use the `From<u16>` trait impl, not the inherent `from(high, low)`.
@@ -541,7 +548,13 @@ fn read_record(r: &mut Reader) -> Option<ParsedEntry> {
     }
 
     Some(ParsedEntry {
-        key: QueryKey { name, rtype, class },
+        key: QueryKey {
+            name,
+            rtype,
+            class,
+            dnssec_ok,
+            checking_disabled,
+        },
         age,
         ttl,
         stored: Stored::Wire {
@@ -571,6 +584,10 @@ impl<'a> Reader<'a> {
         let s = self.data.get(self.pos..end)?;
         self.pos = end;
         Some(s)
+    }
+
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
     }
 
     fn u16(&mut self) -> Option<u16> {
@@ -629,6 +646,8 @@ mod tests {
             name: name.to_string(),
             rtype: RecordType::A,
             class: DNSClass::IN,
+            dnssec_ok: false,
+            checking_disabled: false,
         }
     }
 
@@ -828,5 +847,39 @@ mod tests {
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
         assert!(cache.get(&key("i.com."), 0).is_none());
+    }
+
+    #[test]
+    fn dnssec_do_query_does_not_reuse_non_do_entry() {
+        let cache = DnsCache::new(100, 0, 0, 0);
+        let plain = key("dnssec.test.");
+        let with_do = QueryKey {
+            dnssec_ok: true,
+            ..key("dnssec.test.")
+        };
+        cache.insert(plain.clone(), &answer("dnssec.test.", 60));
+        assert!(cache.get(&plain, 0).is_some());
+        assert!(
+            cache.get(&with_do, 0).is_none(),
+            "a DO query must not be served the non-DO cache entry"
+        );
+    }
+
+    #[test]
+    fn snapshot_roundtrips_dnssec_flags() {
+        let cache = DnsCache::new(100, 0, 0, 0);
+        let k = QueryKey {
+            dnssec_ok: true,
+            checking_disabled: true,
+            ..key("flags.test.")
+        };
+        cache.insert(k.clone(), &answer("flags.test.", 60));
+        let blob = cache.export_snapshot();
+
+        let restored = DnsCache::new(100, 0, 0, 0);
+        assert_eq!(restored.import_snapshot(&blob), 1);
+        // The restored entry keeps its DO/CD flags: a plain-key lookup misses.
+        assert!(restored.get(&key("flags.test."), 0).is_none());
+        assert!(restored.get(&k, 0).is_some());
     }
 }
