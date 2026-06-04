@@ -2,6 +2,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use bulwark_config::BlockingMode;
 use bulwark_filter::{RewriteData, RewriteRcode};
@@ -69,15 +70,21 @@ fn qtype_of(_name: &Name, msg: &Message) -> RecordType {
 /// record TTL)`). Without it, NXDOMAIN/NODATA blocks aren't cached and the same
 /// blocked name is re-queried (and re-logged) on every lookup.
 fn negative_soa(name: Name, ttl: u32) -> Record {
-    let mname =
-        Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap_or_else(|_| Name::root());
-    let rname = Name::from_str("hostmaster.bulwark.invalid.").unwrap_or_else(|_| Name::root());
+    // The SOA mname/rname are constant, so parse them once instead of on every
+    // blocked query (Name::from_str is ~300ns each — pure per-request waste at
+    // the rate an adblocker serves NXDOMAIN/NODATA). Cloning the cached Name is
+    // far cheaper than re-parsing the string.
+    static MNAME: LazyLock<Name> = LazyLock::new(|| {
+        Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap_or_else(|_| Name::root())
+    });
+    static RNAME: LazyLock<Name> =
+        LazyLock::new(|| Name::from_str("hostmaster.bulwark.invalid.").unwrap_or_else(|_| Name::root()));
     // blocked_ttl is small in practice; clamp to a positive i32 for the
     // refresh/retry/expire fields just in case.
     let secs = ttl.min(i32::MAX as u32) as i32;
     let soa = SOA::new(
-        mname,
-        rname,
+        MNAME.clone(),
+        RNAME.clone(),
         1,                       // serial
         secs,                    // refresh
         secs,                    // retry
