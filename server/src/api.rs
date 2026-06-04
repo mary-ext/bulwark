@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{middleware, Json, Router};
 use bulwark_config::{
-    BlockingMode, CacheConfig, ClientConfig, Config, FilterListConfig, QueryLogConfig,
-    ServerConfig, StatsConfig, UpstreamsConfig,
+    BlockingMode, CacheConfig, ClientConfig, Config, FilterListConfig, PrivacyConfig,
+    QueryLogConfig, ServerConfig, StatsConfig, UpstreamsConfig,
 };
 use bulwark_filter::{ClientInfo, Verdict};
 use bulwark_upstream::{test_spec, UpstreamSpec};
@@ -88,6 +88,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/server", put(put_server))
         .route("/api/config/querylog", put(put_querylog))
         .route("/api/config/stats", put(put_stats_cfg))
+        .route("/api/config/privacy", put(put_privacy))
         .route("/api/filters", get(get_filters))
         .route("/api/filters/custom", put(put_custom_rules))
         .route("/api/filters/rule", post(add_custom_rule))
@@ -424,6 +425,25 @@ pub async fn put_stats_cfg(
 ) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
     cfg.stats = body;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(OkResponse::ok())
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/config/privacy",
+    tag = "config",
+    request_body = PrivacyConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_privacy(
+    State(state): State<AppState>,
+    Json(body): Json<PrivacyConfig>,
+) -> ApiResult<Json<OkResponse>> {
+    let mut cfg = state.config.read().await.clone();
+    cfg.privacy = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

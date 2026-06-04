@@ -285,8 +285,8 @@ async fn build_engine(
     let engine = Engine::new(
         state,
         Arc::new(DnsCache::new(100_000, 0, max_ttl, stale_max_age)),
-        Arc::new(QueryLog::new(true)),
-        Arc::new(Stats::new(true, 24)),
+        Arc::new(QueryLog::new(true, false)),
+        Arc::new(Stats::new(true, 24, false)),
     );
     attach_drained_sink(&engine);
     engine
@@ -337,8 +337,8 @@ async fn build_engine_obs(
     let engine = Engine::new(
         state,
         Arc::new(DnsCache::new(100_000, 0, 0, 3600)),
-        Arc::new(QueryLog::new(log_on)),
-        Arc::new(Stats::new(stats_on, 24)),
+        Arc::new(QueryLog::new(log_on, false)),
+        Arc::new(Stats::new(stats_on, 24, false)),
     );
     if log_on {
         attach_drained_sink(&engine);
@@ -897,7 +897,7 @@ fn phase2d_log_microbench() {
     // receiver is attached and drained *between* timed trials — outside the
     // timer — so the unbounded channel stays bounded without charging the recv
     // cost to the measurement.
-    let log = QueryLog::new(true);
+    let log = QueryLog::new(true, false);
     // Cap exceeds the per-trial push count, so the bench never sheds entries.
     let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 20);
     log.set_sink(tx);
@@ -1209,7 +1209,7 @@ fn phase4_stats_contention(blocked: &[String]) {
             move |e| old.record(e)
         });
 
-        let new = Arc::new(Stats::new(true, 24));
+        let new = Arc::new(Stats::new(true, 24, false));
         let new_rate = run_record_bench(c, per_thread, entries.clone(), {
             let new = new.clone();
             move |e| new.record(e, None)

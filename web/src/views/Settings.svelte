@@ -6,6 +6,7 @@
     QueryLogConfig,
     StatsConfig,
     ServerConfig,
+    PrivacyConfig,
     BlockingMode,
   } from "../api/generated";
   import { errMsg } from "../lib/errors";
@@ -31,6 +32,9 @@
   let querylog = $state<Required<QueryLogConfig> | null>(null);
   let stats = $state<Required<StatsConfig> | null>(null);
   let server = $state<Required<ServerConfig> | null>(null);
+  // Privacy lives in its own config section (it affects stats too), but its
+  // control is shown in the Query log card below.
+  let privacy = $state<Required<PrivacyConfig> | null>(null);
 
   async function load() {
     const c = await ok(api.getConfig());
@@ -45,6 +49,7 @@
     querylog = (c.query_log ?? null) as Required<QueryLogConfig> | null;
     stats = (c.stats ?? null) as Required<StatsConfig> | null;
     server = (c.server ?? null) as Required<ServerConfig> | null;
+    privacy = (c.privacy ?? { anonymize_client_ips: false }) as Required<PrivacyConfig>;
     loaded = true;
   }
 
@@ -167,7 +172,6 @@
         <div class="stack">
           <SwitchRow bind:checked={querylog.enabled} label="Enable query log" />
           <SwitchRow bind:checked={querylog.persist} label="Persist to disk" />
-          <SwitchRow bind:checked={querylog.anonymize} label="Anonymize client IPs" />
           <Field
             label="Retention (days)"
             htmlFor="q-retention"
@@ -213,6 +217,29 @@
             </button>
             <button class="btn btn-danger" onclick={() => (confirmResetStats = true)}>
               Clear statistics
+            </button>
+          </div>
+        </div>
+      </section>
+    {/if}
+
+    <!-- Privacy -->
+    {#if privacy}
+      <section class="card">
+        <div class="card-title">Privacy</div>
+        <div class="stack">
+          <SwitchRow
+            bind:checked={privacy.anonymize_client_ips}
+            label="Anonymize client IPs"
+            hint="Drop client IPs from the query log and from statistics (top clients)."
+          />
+          <div>
+            <button
+              class="btn btn-primary"
+              onclick={() =>
+                privacy && run(() => ok(api.putPrivacy(privacy!)), "Privacy settings saved")}
+            >
+              Save
             </button>
           </div>
         </div>

@@ -47,6 +47,8 @@ pub struct Config {
     #[serde(default)]
     pub stats: StatsConfig,
     #[serde(default)]
+    pub privacy: PrivacyConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
 }
 
@@ -61,6 +63,7 @@ impl Default for Config {
             clients: Vec::new(),
             query_log: QueryLogConfig::default(),
             stats: StatsConfig::default(),
+            privacy: PrivacyConfig::default(),
             auth: AuthConfig::default(),
         }
     }
@@ -310,9 +313,6 @@ pub struct QueryLogConfig {
     /// (the log is kept indefinitely).
     #[serde(default = "default_log_retention_days")]
     pub retention_days: u32,
-    /// Whether to anonymize client IPs (drop last octet / suffix).
-    #[serde(default)]
-    pub anonymize: bool,
 }
 
 impl Default for QueryLogConfig {
@@ -321,9 +321,20 @@ impl Default for QueryLogConfig {
             enabled: true,
             persist: true,
             retention_days: default_log_retention_days(),
-            anonymize: false,
         }
     }
+}
+
+/// Privacy-related toggles that span more than one subsystem.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct PrivacyConfig {
+    /// When set, client IPs are dropped entirely from the query log (the stored
+    /// and API-returned `client_ip` is blank) **and** from statistics (the
+    /// dashboard's "top clients" panel is empty while on). The IP is still used
+    /// to identify the client for filtering before logging/recording — only the
+    /// retained/displayed copy is removed.
+    #[serde(default)]
+    pub anonymize_client_ips: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]

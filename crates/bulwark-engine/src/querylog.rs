@@ -2,8 +2,9 @@
 //!
 //! The log is disk-backed (see the server's query store). The DNS hot path
 //! builds a [`QueryLogEntry`] and, when logging is enabled, hands it to
-//! [`QueryLog::push`], which forwards it to the background writer over an
-//! unbounded channel. The [`LogFilter`]/[`LogPage`] shapes are defined here but
+//! [`QueryLog::push`], which forwards it to the background writer over a
+//! bounded channel (shedding entries if the writer can't keep up). The
+//! [`LogFilter`]/[`LogPage`] shapes are defined here but
 //! the filtering and pagination they describe run against the database.
 
 use std::borrow::Cow;
@@ -138,6 +139,11 @@ pub struct LogPage {
 /// paying to build an entry, then calls [`push`](Self::push) to hand it off.
 pub struct QueryLog {
     enabled: std::sync::atomic::AtomicBool,
+    /// When set, client IPs are dropped from logged entries before they reach the
+    /// store (and thus the API). The IP is still used to identify the client for
+    /// filtering and stats earlier in the pipeline — only the logged copy is
+    /// cleared, so enabling this loses per-client attribution in the query log.
+    anonymize: std::sync::atomic::AtomicBool,
     /// Count of entries dropped because the writer channel was full. Surfaced
     /// periodically so sustained loss isn't silent.
     dropped: AtomicU64,
@@ -149,9 +155,10 @@ pub struct QueryLog {
 }
 
 impl QueryLog {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool, anonymize: bool) -> Self {
         Self {
             enabled: std::sync::atomic::AtomicBool::new(enabled),
+            anonymize: std::sync::atomic::AtomicBool::new(anonymize),
             dropped: AtomicU64::new(0),
             sink: Mutex::new(None),
         }
@@ -162,9 +169,11 @@ impl QueryLog {
         *self.sink.lock() = Some(tx);
     }
 
-    pub fn reconfigure(&self, enabled: bool) {
+    pub fn reconfigure(&self, enabled: bool, anonymize: bool) {
         self.enabled
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.anonymize
+            .store(anonymize, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -178,9 +187,13 @@ impl QueryLog {
     /// Uses `try_send` on the bounded channel: under extreme burst (or a stalled
     /// writer) a full channel drops the entry rather than blocking the DNS hot
     /// path or growing memory unboundedly. Sustained loss is logged periodically.
-    pub fn push(&self, entry: QueryLogEntry) {
+    pub fn push(&self, mut entry: QueryLogEntry) {
         if !self.is_enabled() {
             return;
+        }
+        if self.anonymize.load(Ordering::Relaxed) {
+            // Drop the client IP entirely before it reaches the store/API.
+            entry.client_ip.clear();
         }
         if let Some(tx) = self.sink.lock().as_ref() {
             if tx.try_send(entry).is_err() {
@@ -201,9 +214,9 @@ mod tests {
     /// push with no sink attached is a harmless no-op.
     #[test]
     fn gate_respects_enabled_and_missing_sink() {
-        let log = QueryLog::new(false);
+        let log = QueryLog::new(false, false);
         log.push(QueryLogEntry::empty()); // disabled: dropped, no panic
-        log.reconfigure(true);
+        log.reconfigure(true, false);
         log.push(QueryLogEntry::empty()); // enabled but no sink: dropped, no panic
         assert!(log.is_enabled());
     }
@@ -211,7 +224,7 @@ mod tests {
     /// When a sink is attached, an enabled push forwards the entry to the writer.
     #[test]
     fn push_forwards_to_sink_when_enabled() {
-        let log = QueryLog::new(true);
+        let log = QueryLog::new(true, false);
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         log.set_sink(tx);
         let mut e = QueryLogEntry::empty();
@@ -221,9 +234,23 @@ mod tests {
         assert_eq!(got.id, 42);
 
         // Disabled: nothing forwarded.
-        log.reconfigure(false);
+        log.reconfigure(false, false);
         log.push(QueryLogEntry::empty());
         assert!(rx.try_recv().is_err());
+    }
+
+    /// With anonymization on, the client IP is stripped before the entry reaches
+    /// the writer (and thus the store/API).
+    #[test]
+    fn anonymize_clears_client_ip_on_push() {
+        let log = QueryLog::new(true, true);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        log.set_sink(tx);
+        let mut e = QueryLogEntry::empty();
+        e.client_ip = "10.0.0.1".into();
+        log.push(e);
+        let got = rx.try_recv().expect("entry forwarded");
+        assert!(got.client_ip.is_empty(), "client IP dropped when anonymizing");
     }
 }
 

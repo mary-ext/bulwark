@@ -290,6 +290,46 @@
         }
       }
     },
+    "/api/config/privacy": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_privacy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrivacyConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/config/querylog": {
       "put": {
         "tags": [
@@ -1393,6 +1433,9 @@
           "filtering": {
             "$ref": "#/components/schemas/FilteringConfig"
           },
+          "privacy": {
+            "$ref": "#/components/schemas/PrivacyConfig"
+          },
           "query_log": {
             "$ref": "#/components/schemas/QueryLogConfig"
           },
@@ -1759,13 +1802,19 @@
           }
         }
       },
+      "PrivacyConfig": {
+        "type": "object",
+        "description": "Privacy-related toggles that span more than one subsystem.",
+        "properties": {
+          "anonymize_client_ips": {
+            "type": "boolean",
+            "description": "When set, client IPs are dropped entirely from the query log (the stored\nand API-returned `client_ip` is blank) **and** from statistics (the\ndashboard's \"top clients\" panel is empty while on). The IP is still used\nto identify the client for filtering before logging/recording — only the\nretained/displayed copy is removed."
+          }
+        }
+      },
       "QueryLogConfig": {
         "type": "object",
         "properties": {
-          "anonymize": {
-            "type": "boolean",
-            "description": "Whether to anonymize client IPs (drop last octet / suffix)."
-          },
           "enabled": {
             "type": "boolean"
           },

@@ -27,6 +27,7 @@ use crate::{api, dto};
         api::put_server,
         api::put_querylog,
         api::put_stats_cfg,
+        api::put_privacy,
         api::get_filters,
         api::put_custom_rules,
         api::add_custom_rule,
@@ -86,6 +87,7 @@ use crate::{api, dto};
         bulwark_config::ClientConfig,
         bulwark_config::QueryLogConfig,
         bulwark_config::StatsConfig,
+        bulwark_config::PrivacyConfig,
         bulwark_config::AuthConfig,
     )),
     tags(

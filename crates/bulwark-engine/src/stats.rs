@@ -178,11 +178,14 @@ pub struct Stats {
     /// Per-shard distinct-key cap for the top-N maps.
     key_cap: usize,
     enabled: AtomicBool,
+    /// When set, per-client counts are not recorded, so the "top clients" view is
+    /// empty. Mirrors the query log's IP anonymization (see `privacy` config).
+    anonymize: AtomicBool,
     max_buckets: AtomicUsize,
 }
 
 impl Stats {
-    pub fn new(enabled: bool, retention_days: u32) -> Self {
+    pub fn new(enabled: bool, retention_days: u32, anonymize: bool) -> Self {
         let n = shard_count();
         let shards = (0..n)
             .map(|_| {
@@ -196,6 +199,7 @@ impl Stats {
             mask: n - 1,
             key_cap: (MAX_KEYS / n).max(1024),
             enabled: AtomicBool::new(enabled),
+            anonymize: AtomicBool::new(anonymize),
             max_buckets: AtomicUsize::new(((retention_days.max(1)) * 24) as usize),
         }
     }
@@ -205,8 +209,9 @@ impl Stats {
         &self.shards[thread_slot() & self.mask]
     }
 
-    pub fn reconfigure(&self, enabled: bool, retention_days: u32) {
+    pub fn reconfigure(&self, enabled: bool, retention_days: u32, anonymize: bool) {
         self.enabled.store(enabled, Ordering::Relaxed);
+        self.anonymize.store(anonymize, Ordering::Relaxed);
         let max = ((retention_days.max(1)) * 24) as usize;
         self.max_buckets.store(max, Ordering::Relaxed);
         for shard in &self.shards {
@@ -277,7 +282,12 @@ impl Stats {
         } else {
             bump(&mut s.resolved_domains, domain, 1, cap);
         }
-        bump(&mut s.clients, client, 1, cap);
+        // Skip per-client counts entirely when anonymizing, so "top clients" never
+        // retains a client IP. Stats record before the query-log push that clears
+        // the IP, so check the flag here rather than relying on an empty field.
+        if !self.anonymize.load(Ordering::Relaxed) {
+            bump(&mut s.clients, client, 1, cap);
+        }
         bump(&mut s.qtypes, entry.qtype.as_ref(), 1, cap);
         if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
@@ -616,7 +626,7 @@ mod tests {
 
     #[test]
     fn counts_and_top_n() {
-        let s = Stats::new(true, 30);
+        let s = Stats::new(true, 30, false);
         s.record(&entry("ads.com.", blocked(), 0.5), None);
         s.record(&entry("ads.com.", blocked(), 0.5), None);
         s.record(&entry("good.com.", forwarded("1.1.1.1"), 12.0), Some(12.0));
@@ -647,7 +657,7 @@ mod tests {
     fn top_clients_resolve_names_retroactively() {
         use bulwark_config::ClientConfig;
 
-        let s = Stats::new(true, 30);
+        let s = Stats::new(true, 30, false);
         // Two distinct IPs in the same /24, plus an unrelated one.
         s.record(&entry_ip("10.0.0.1", forwarded("u")), None);
         s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
@@ -680,18 +690,31 @@ mod tests {
     }
 
     #[test]
+    fn anonymize_skips_client_counts() {
+        let s = Stats::new(true, 30, true);
+        s.record(&entry_ip("10.0.0.1", forwarded("u")), None);
+        s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
+        let snap = s.snapshot(10, &ClientMatcher::default());
+        assert_eq!(snap.total, 2, "queries are still counted");
+        assert!(
+            snap.top_clients.is_empty(),
+            "no client IP is retained when anonymizing"
+        );
+    }
+
+    #[test]
     fn export_import_roundtrip() {
-        let s = Stats::new(true, 30);
+        let s = Stats::new(true, 30, false);
         s.record(&entry("x.com.", forwarded("8.8.8.8"), 3.0), Some(3.0));
         let dump = s.export();
-        let s2 = Stats::new(true, 30);
+        let s2 = Stats::new(true, 30, false);
         s2.import(&dump);
         assert_eq!(s2.snapshot(10, &ClientMatcher::default()).total, 1);
     }
 
     #[test]
     fn per_upstream_percentiles() {
-        let s = Stats::new(true, 30);
+        let s = Stats::new(true, 30, false);
         // 100 fast samples (~5ms) and a few slow ones to push the tail up.
         for _ in 0..95 {
             s.record(&entry("a.com.", forwarded("up"), 5.0), Some(5.0));
@@ -716,7 +739,7 @@ mod tests {
         // because an earlier upstream timed out (1s) before failover. The answering
         // upstream's percentiles must reflect its own 5ms RTT, not the 1s timeout
         // it had nothing to do with.
-        let s = Stats::new(true, 30);
+        let s = Stats::new(true, 30, false);
         for _ in 0..100 {
             s.record(&entry("a.com.", forwarded("fast"), 1010.0), Some(5.0));
         }
@@ -746,7 +769,7 @@ mod tests {
 
     #[test]
     fn time_series_buckets_by_hour() {
-        let s = Stats::new(true, 1);
+        let s = Stats::new(true, 1, false);
         s.record(&entry("x.com.", forwarded("1.1.1.1"), 1.0), Some(1.0));
         s.record(&entry("y.com.", blocked(), 1.0), None);
         let snap = s.snapshot(10, &ClientMatcher::default());
@@ -759,7 +782,7 @@ mod tests {
     fn aggregates_across_shards() {
         // Spread records across many threads so multiple shards are populated,
         // then confirm the merged snapshot is exact.
-        let s = std::sync::Arc::new(Stats::new(true, 30));
+        let s = std::sync::Arc::new(Stats::new(true, 30, false));
         let mut handles = Vec::new();
         for _ in 0..16 {
             let s = s.clone();

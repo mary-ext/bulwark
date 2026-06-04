@@ -77,9 +77,15 @@ export type FilteringConfig = {
     enabled?: boolean;
     lists?: FilterListConfig[];
 };
+export type PrivacyConfig = {
+    /** When set, client IPs are dropped entirely from the query log (the stored
+    and API-returned `client_ip` is blank) **and** from statistics (the
+    dashboard's "top clients" panel is empty while on). The IP is still used
+    to identify the client for filtering before logging/recording — only the
+    retained/displayed copy is removed. */
+    anonymize_client_ips?: boolean;
+};
 export type QueryLogConfig = {
-    /** Whether to anonymize client IPs (drop last octet / suffix). */
-    anonymize?: boolean;
     enabled?: boolean;
     /** Persist the query log to disk so it survives restarts. When off, the log
     is kept in an in-memory database for the lifetime of the process. */
@@ -123,6 +129,7 @@ export type Config = {
     cache?: CacheConfig;
     clients?: ClientConfig[];
     filtering?: FilteringConfig;
+    privacy?: PrivacyConfig;
     query_log?: QueryLogConfig;
     server?: ServerConfig;
     stats?: StatsConfig;
@@ -383,6 +390,19 @@ export function putFiltering(filteringSettings: FilteringSettings, opts?: Oazapf
         ...opts,
         method: "PUT",
         body: filteringSettings
+    }));
+}
+export function putPrivacy(privacyConfig: PrivacyConfig, opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: OkResponse;
+    } | {
+        status: 400;
+        data: ErrorResponse;
+    }>("/api/config/privacy", oazapfts.json({
+        ...opts,
+        method: "PUT",
+        body: privacyConfig
     }));
 }
 export function putQuerylog(queryLogConfig: QueryLogConfig, opts?: Oazapfts.RequestOpts) {

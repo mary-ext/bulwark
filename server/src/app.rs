@@ -138,8 +138,15 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
         cfg.cache.max_ttl_secs,
         cfg.cache.optimistic_max_age_secs,
     );
-    let log = Arc::new(QueryLog::new(cfg.query_log.enabled));
-    let stats = Arc::new(Stats::new(cfg.stats.enabled, cfg.stats.retention_days));
+    let log = Arc::new(QueryLog::new(
+        cfg.query_log.enabled,
+        cfg.privacy.anonymize_client_ips,
+    ));
+    let stats = Arc::new(Stats::new(
+        cfg.stats.enabled,
+        cfg.stats.retention_days,
+        cfg.privacy.anonymize_client_ips,
+    ));
     Ok(Engine::new(state, cache, log, stats))
 }
 
@@ -171,11 +178,15 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
     state
         .engine
         .log()
-        .reconfigure(new_cfg.query_log.enabled);
-    state
-        .engine
-        .stats()
-        .reconfigure(new_cfg.stats.enabled, new_cfg.stats.retention_days);
+        .reconfigure(
+            new_cfg.query_log.enabled,
+            new_cfg.privacy.anonymize_client_ips,
+        );
+    state.engine.stats().reconfigure(
+        new_cfg.stats.enabled,
+        new_cfg.stats.retention_days,
+        new_cfg.privacy.anonymize_client_ips,
+    );
 
     new_cfg.save(&state.paths.config).context("saving config")?;
     *state.config.write().await = new_cfg;
