@@ -58,8 +58,6 @@
   --chart-4: #d97706;
   --chart-5: #dc2626;
   --chart-6: #0891b2;
-  --chart-grid: #ededf1;
-  --chart-axis: #9a9aa7;
   --chart-track: #ededf1;
 
   /* Typography */
@@ -150,8 +148,6 @@
   --chart-4: #fbbf24;
   --chart-5: #f87171;
   --chart-6: #22d3ee;
-  --chart-grid: #232b35;
-  --chart-axis: #6e7681;
   --chart-track: #232b35;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);

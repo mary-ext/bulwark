@@ -56,20 +56,16 @@ struct StatsInner {
 
     proc_time_sum_ms: f64,
     proc_time_count: u64,
-    /// Histogram with `LATENCY_BUCKETS_MS.len() + 1` slots.
-    #[serde(default)]
-    latency_hist: Vec<u64>,
 
     #[serde(default)]
     resolved_domains: HashMap<String, u64>,
     blocked_domains: HashMap<String, u64>,
     clients: HashMap<String, u64>,
     upstreams: HashMap<String, u64>,
-    qtypes: HashMap<String, u64>,
     upstream_rtt_sum: HashMap<String, f64>,
     upstream_rtt_count: HashMap<String, u64>,
-    /// Per-upstream latency histograms (same buckets as `latency_hist`), kept so
-    /// the snapshot can derive approximate p50/p90/p99 per upstream.
+    /// Per-upstream latency histograms (bucketed by `LATENCY_BUCKETS_MS`), kept
+    /// so the snapshot can derive approximate p50/p90/p99 per upstream.
     #[serde(default)]
     upstream_latency_hist: HashMap<String, Vec<u64>>,
 
@@ -78,12 +74,6 @@ struct StatsInner {
 }
 
 impl StatsInner {
-    fn ensure_hist(&mut self) {
-        if self.latency_hist.len() != LATENCY_BUCKETS_MS.len() + 1 {
-            self.latency_hist = vec![0; LATENCY_BUCKETS_MS.len() + 1];
-        }
-    }
-
     /// Fold another shard's state into this accumulator (used for snapshots).
     fn merge_from(&mut self, other: &StatsInner) {
         self.total += other.total;
@@ -94,18 +84,10 @@ impl StatsInner {
         self.proc_time_sum_ms += other.proc_time_sum_ms;
         self.proc_time_count += other.proc_time_count;
 
-        self.ensure_hist();
-        if other.latency_hist.len() == self.latency_hist.len() {
-            for (a, b) in self.latency_hist.iter_mut().zip(&other.latency_hist) {
-                *a += b;
-            }
-        }
-
         merge_counts(&mut self.resolved_domains, &other.resolved_domains);
         merge_counts(&mut self.blocked_domains, &other.blocked_domains);
         merge_counts(&mut self.clients, &other.clients);
         merge_counts(&mut self.upstreams, &other.upstreams);
-        merge_counts(&mut self.qtypes, &other.qtypes);
         for (k, v) in &other.upstream_rtt_sum {
             *self.upstream_rtt_sum.entry(k.clone()).or_insert(0.0) += v;
         }
@@ -188,11 +170,7 @@ impl Stats {
     pub fn new(enabled: bool, retention_days: u32, anonymize: bool) -> Self {
         let n = shard_count();
         let shards = (0..n)
-            .map(|_| {
-                let mut inner = StatsInner::default();
-                inner.ensure_hist();
-                Mutex::new(inner)
-            })
+            .map(|_| Mutex::new(StatsInner::default()))
             .collect();
         Self {
             shards,
@@ -246,7 +224,6 @@ impl Stats {
         // presentation concern resolved at snapshot time, so renaming a client
         // doesn't split its history into a separate bucket.
         let client = entry.client_ip.as_str();
-        let idx = hist_index(entry.elapsed_ms);
         // Per-upstream latency is keyed off the answering upstream's own RTT, not
         // the whole-query wall-clock. Fall back to `elapsed_ms` if a forwarded
         // entry arrives without one (e.g. older imported data / tests).
@@ -257,7 +234,6 @@ impl Stats {
         let cap = self.key_cap;
 
         let mut s = self.shard().lock();
-        s.ensure_hist();
         s.total += 1;
 
         match entry.action {
@@ -273,7 +249,6 @@ impl Stats {
         // Latency.
         s.proc_time_sum_ms += entry.elapsed_ms;
         s.proc_time_count += 1;
-        s.latency_hist[idx] += 1;
 
         // Top-N counters. A query name lands in exactly one of the two domain
         // lists — resolved or blocked.
@@ -288,7 +263,6 @@ impl Stats {
         if !self.anonymize.load(Ordering::Relaxed) {
             bump(&mut s.clients, client, 1, cap);
         }
-        bump(&mut s.qtypes, entry.qtype.as_ref(), 1, cap);
         if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
             // Avoid cloning the upstream name on the hot (existing-key) path.
@@ -344,7 +318,6 @@ impl Stats {
         for shard in &self.shards {
             let mut inner = shard.lock();
             *inner = StatsInner::default();
-            inner.ensure_hist();
         }
     }
 
@@ -353,7 +326,6 @@ impl Stats {
     /// point — acceptable for monotonic, approximate statistics.
     fn merged(&self) -> StatsInner {
         let mut acc = StatsInner::default();
-        acc.ensure_hist();
         for shard in &self.shards {
             let s = shard.lock();
             acc.merge_from(&s);
@@ -401,13 +373,10 @@ impl Stats {
                 0.0
             },
             avg_processing_ms: avg_proc,
-            latency_buckets: latency_labels(),
-            latency_hist: s.latency_hist.clone(),
             top_resolved_domains: top_n_of(&s.resolved_domains, top_n),
             top_blocked_domains: top_n_of(&s.blocked_domains, top_n),
             top_clients: top_clients_resolved(&s.clients, clients, top_n),
             top_upstreams: top_n_of(&s.upstreams, top_n),
-            qtypes: top_n_of(&s.qtypes, top_n),
             upstream_avg_rtt_ms: upstream_rtt,
             upstream_latency_pct,
             series: s
@@ -431,29 +400,18 @@ impl Stats {
     /// Load persisted state (best-effort; ignores malformed data). Everything is
     /// loaded into a single shard; the rest are cleared.
     pub fn import(&self, json: &str) {
-        let Ok(mut loaded) = serde_json::from_str::<StatsInner>(json) else {
+        let Ok(loaded) = serde_json::from_str::<StatsInner>(json) else {
             return;
         };
-        loaded.ensure_hist();
         for (i, shard) in self.shards.iter().enumerate() {
             let mut g = shard.lock();
             if i == 0 {
                 *g = loaded.clone();
             } else {
                 *g = StatsInner::default();
-                g.ensure_hist();
             }
         }
     }
-}
-
-fn latency_labels() -> Vec<String> {
-    let mut v: Vec<String> = LATENCY_BUCKETS_MS
-        .iter()
-        .map(|b| format!("≤{b}ms"))
-        .collect();
-    v.push(format!(">{}ms", LATENCY_BUCKETS_MS.last().unwrap()));
-    v
 }
 
 /// Inclusive lower / exclusive upper bound (ms) of histogram bucket `i`. The
@@ -570,14 +528,11 @@ pub struct StatsSummary {
     pub errors: u64,
     pub block_rate: f64,
     pub avg_processing_ms: f64,
-    pub latency_buckets: Vec<String>,
-    pub latency_hist: Vec<u64>,
     /// Most-resolved (non-blocked) query names.
     pub top_resolved_domains: Vec<TopEntry>,
     pub top_blocked_domains: Vec<TopEntry>,
     pub top_clients: Vec<TopEntry>,
     pub top_upstreams: Vec<TopEntry>,
-    pub qtypes: Vec<TopEntry>,
     pub upstream_avg_rtt_ms: HashMap<String, f64>,
     pub upstream_latency_pct: HashMap<String, LatencyPercentiles>,
     pub series: Vec<SeriesPoint>,
@@ -642,8 +597,6 @@ mod tests {
         assert!(snap.top_resolved_domains.iter().all(|t| t.name != "ads.com"));
         assert_eq!(snap.top_blocked_domains[0].count, 2);
         assert!(snap.upstream_avg_rtt_ms.contains_key("1.1.1.1"));
-        // latency histogram recorded
-        assert!(snap.latency_hist.iter().sum::<u64>() == 4);
     }
 
     fn entry_ip(ip: &str, action: QueryAction) -> QueryLogEntry {
@@ -799,6 +752,5 @@ mod tests {
         assert_eq!(snap.total, 16_000);
         assert_eq!(snap.blocked, 16_000);
         assert_eq!(snap.top_blocked_domains[0].count, 16_000);
-        assert_eq!(snap.latency_hist.iter().sum::<u64>(), 16_000);
     }
 }

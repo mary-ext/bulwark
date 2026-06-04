@@ -235,15 +235,15 @@ export type QueryLogResponse = {
     /** Total entries matching the filter (across all pages), for pagination. */
     total: number;
 };
-export type TopEntryDto = {
-    count: number;
-    name: string;
-};
 export type SeriesPointDto = {
     blocked: number;
     cached: number;
     hour: number;
     total: number;
+};
+export type TopEntryDto = {
+    count: number;
+    name: string;
 };
 export type LatencyPercentilesDto = {
     p50: number;
@@ -257,9 +257,6 @@ export type StatsResponse = {
     cache_size: number;
     cached: number;
     errors: number;
-    latency_buckets: string[];
-    latency_hist: number[];
-    qtypes: TopEntryDto[];
     rewritten: number;
     series: SeriesPointDto[];
     top_blocked_domains: TopEntryDto[];

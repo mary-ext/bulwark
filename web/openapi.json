@@ -1949,13 +1949,10 @@
           "errors",
           "block_rate",
           "avg_processing_ms",
-          "latency_buckets",
-          "latency_hist",
           "top_resolved_domains",
           "top_blocked_domains",
           "top_clients",
           "top_upstreams",
-          "qtypes",
           "upstream_avg_rtt_ms",
           "upstream_latency_pct",
           "series",
@@ -1988,26 +1985,6 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
-          },
-          "latency_buckets": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            }
-          },
-          "latency_hist": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "format": "int64",
-              "minimum": 0
-            }
-          },
-          "qtypes": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/TopEntryDto"
-            }
           },
           "rewritten": {
             "type": "integer",

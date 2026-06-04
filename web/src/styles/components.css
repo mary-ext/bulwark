@@ -264,26 +264,6 @@
   max-width: 18rem;
 }
 
-/* ── Charts (LayerChart / SVG) ──────────────────────── */
-.bw-chart {
-  width: 100%;
-}
-.bw-chart text {
-  fill: var(--chart-axis);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-}
-.bw-chart .tick line,
-.bw-chart .grid line,
-.bw-chart line.rule,
-.bw-chart .rule line {
-  stroke: var(--chart-grid);
-  stroke-width: 1;
-}
-.bw-chart .axis path,
-.bw-chart .tick path {
-  stroke: var(--chart-grid);
-}
 
 /* ── Animations ─────────────────────────────────────── */
 @keyframes bw-fade-in {
