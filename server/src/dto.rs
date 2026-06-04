@@ -191,7 +191,7 @@ impl LogEntryView {
             list_id,
             allowlisted: e.allowlisted,
             rcode: e.rcode.into_owned(),
-            answers: e.answers,
+            answers: e.answers.to_vec(),
             elapsed_ms: e.elapsed_ms,
             list_name,
         }

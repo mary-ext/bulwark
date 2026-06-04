@@ -561,7 +561,7 @@ mod tests {
             action,
             allowlisted: false,
             rcode: "NOERROR".into(),
-            answers: vec![],
+            answers: std::sync::Arc::from([]),
             elapsed_ms: ms,
         }
     }

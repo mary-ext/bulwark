@@ -344,11 +344,11 @@ fn row_to_entry(row: &turso::Row) -> turso::Result<QueryLogEntry> {
         "error" => QueryAction::Error,
         _ => QueryAction::Cached,
     };
-    let answers: Vec<String> = row
+    let answers: std::sync::Arc<[String]> = row
         .get::<String>(11)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+        .unwrap_or_else(|| std::sync::Arc::from([]));
     Ok(QueryLogEntry {
         id: row.get::<i64>(0)? as u64,
         time_ms: row.get(1)?,
@@ -423,7 +423,7 @@ mod tests {
             },
             allowlisted: false,
             rcode: "NOERROR".into(),
-            answers: vec!["A 1.2.3.4".into()],
+            answers: std::sync::Arc::from(["A 1.2.3.4".to_string()]),
             elapsed_ms: 0.5,
         }
     }

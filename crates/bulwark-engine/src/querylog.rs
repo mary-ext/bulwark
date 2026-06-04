@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -55,8 +56,10 @@ pub struct QueryLogEntry {
     /// Response code label (`"NOERROR"`, `"NXDOMAIN"`, …); `Cow` for the same
     /// no-allocation reason as `qtype`.
     pub rcode: Cow<'static, str>,
-    /// Short summary of answer records (e.g. `["A 1.2.3.4"]`).
-    pub answers: Vec<String>,
+    /// Short summary of answer records (e.g. `["A 1.2.3.4"]`). An `Arc<[String]>`
+    /// so the wire-byte cache hit can share the summaries it already holds rather
+    /// than deep-copying them per query (serde `rc` (de)serializes the slice).
+    pub answers: Arc<[String]>,
     pub elapsed_ms: f64,
 }
 
@@ -73,7 +76,7 @@ impl QueryLogEntry {
             action: QueryAction::Cached,
             allowlisted: false,
             rcode: Cow::Borrowed(""),
-            answers: Vec::new(),
+            answers: Arc::from([]),
             elapsed_ms: 0.0,
         }
     }
@@ -275,7 +278,7 @@ mod wire_tests {
             },
             allowlisted: false,
             rcode: "NXDOMAIN".into(),
-            answers: vec![],
+            answers: Arc::from([]),
             elapsed_ms: 0.5,
         };
 

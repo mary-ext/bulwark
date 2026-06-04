@@ -66,31 +66,13 @@ fn now_ms() -> i64 {
 /// `dst`'s existing `String` buffers (clear + rewrite) instead of allocating
 /// fresh ones. `dst` comes from a recycled log entry, so at steady state this
 /// allocates nothing.
-fn fill_answer_summaries(dst: &mut Vec<String>, src: &[hickory_proto::rr::Record]) {
-    use std::fmt::Write as _;
-    for (i, rec) in src.iter().enumerate() {
-        if let Some(s) = dst.get_mut(i) {
-            s.clear();
-            let _ = write!(s, "{} {}", rec.record_type(), rec.data);
-        } else {
-            dst.push(format!("{} {}", rec.record_type(), rec.data));
-        }
-    }
-    dst.truncate(src.len());
-}
-
-/// Copy precomputed answer summaries into `dst`, reusing its existing `String`
-/// buffers. Used by the wire cache path, whose summaries are stored on the entry.
-fn fill_from_summaries(dst: &mut Vec<String>, src: &[String]) {
-    for (i, s) in src.iter().enumerate() {
-        if let Some(d) = dst.get_mut(i) {
-            d.clear();
-            d.push_str(s);
-        } else {
-            dst.push(s.clone());
-        }
-    }
-    dst.truncate(src.len());
+/// Build the short answer-record summaries (e.g. `"A 1.2.3.4"`) for the query
+/// log, used by the non-cache paths that have a freshly-built `Message`. The
+/// wire-byte cache hit instead shares the `Arc<[String]>` the cache already holds.
+fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
+    src.iter()
+        .map(|rec| format!("{} {}", rec.record_type(), rec.data))
+        .collect()
 }
 
 /// The display label for a response code. Returns a borrowed `&'static str` for
@@ -361,7 +343,7 @@ impl Engine {
     }
 
     /// Build + record the query-log entry and stats for a completed query.
-    /// `rcode` and `fill_answers` supply the response-derived fields without
+    /// `rcode` and `make_answers` supply the response-derived fields without
     /// requiring a `Message`, so the wire fast path needs no decode. The entry is
     /// handed to the background writer (or dropped if logging is off).
     fn record(
@@ -369,7 +351,7 @@ impl Engine {
         log: LogBuilder,
         action: QueryAction,
         rcode: Cow<'static, str>,
-        fill_answers: impl FnOnce(&mut Vec<String>),
+        make_answers: impl FnOnce() -> Arc<[String]>,
         start: Instant,
     ) {
         // If nothing will consume the entry, don't pay to build it: the answer
@@ -399,7 +381,12 @@ impl Engine {
         entry.action = action;
         entry.allowlisted = log.allowlisted;
         entry.rcode = rcode;
-        fill_answers(&mut entry.answers);
+        // The answer summaries feed only the query log, not stats — so build them
+        // only when logging is on. On a wire-byte hit this is an `Arc` clone of
+        // the summaries the cache already holds, not a per-string deep copy.
+        if log_on {
+            entry.answers = make_answers();
+        }
         entry.elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         if stats_on {
@@ -425,7 +412,7 @@ impl Engine {
             log,
             action,
             rcode,
-            |dst| fill_answer_summaries(dst, &resp.answers),
+            || summarize_answers(&resp.answers),
             start,
         );
         EngineResponse::Message(resp)
@@ -442,11 +429,13 @@ impl Engine {
         log: LogBuilder,
         start: Instant,
     ) -> EngineResponse {
+        // The cache already holds these summaries as an `Arc`; share it (clone the
+        // pointer) instead of deep-copying each string into the entry.
         self.record(
             log,
             QueryAction::Cached,
             rcode_label(rcode),
-            |dst| fill_from_summaries(dst, &answers),
+            || answers,
             start,
         );
         EngineResponse::Wire(bytes)

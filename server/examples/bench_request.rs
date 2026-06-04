@@ -1251,7 +1251,7 @@ fn entry_for(domain: &str, blocked: bool) -> QueryLogEntry {
         },
         allowlisted: false,
         rcode: "NOERROR".into(),
-        answers: vec![],
+        answers: std::sync::Arc::from([]),
         elapsed_ms: 1.5,
     }
 }
