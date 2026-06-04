@@ -1,26 +1,42 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
+
   let {
     label,
     value,
     sub,
     tone = "default",
+    spark,
   }: {
     label: string;
     value: string | number;
     sub?: string;
     tone?: "default" | "good" | "bad" | "accent";
+    /** Optional trend visual rendered flush to the bottom of the card. */
+    spark?: Snippet;
   } = $props();
 </script>
 
-<div class="stat card">
+<div class="stat card" class:has-spark={spark}>
   <div class="stat-label">{label}</div>
   <div class="stat-value {tone}">{value}</div>
   {#if sub}<div class="stat-sub">{sub}</div>{/if}
+  {#if spark}<div class="stat-spark">{@render spark()}</div>{/if}
 </div>
 
 <style>
   .stat {
     padding: var(--sp-4) var(--sp-5);
+  }
+  /* Reserve room so the bottom-bled sparkline never overlaps the text. */
+  .stat.has-spark {
+    display: flex;
+    flex-direction: column;
+    padding-bottom: 0;
+  }
+  .stat-spark {
+    /* Bleed to the card's left/right edges and sit flush on the bottom. */
+    margin: var(--sp-3) calc(var(--sp-5) * -1) 0;
   }
   .stat-label {
     color: var(--text-dim);

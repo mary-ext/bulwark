@@ -7,6 +7,7 @@
   import { num, pct, duration } from "../lib/format";
   import Icon from "../components/Icon.svelte";
   import StatCard from "../components/StatCard.svelte";
+  import Sparkline from "../components/Sparkline.svelte";
   import RankedList from "../components/RankedList.svelte";
   import UpstreamRanked from "../components/UpstreamRanked.svelte";
 
@@ -38,6 +39,21 @@
     const lookups = stats.total - stats.blocked - stats.rewritten;
     return lookups > 0 ? stats.cached / lookups : 0;
   });
+
+  // Hourly trend, oldest → newest, for the stat-card sparklines.
+  const series = $derived([...(stats?.series ?? [])].sort((a, b) => a.hour - b.hour));
+  const sparkLabels = $derived(
+    series.map((p) =>
+      new Date(p.hour * 3_600_000).toLocaleString(undefined, {
+        weekday: "short",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      }),
+    ),
+  );
+  const totalTrend = $derived(series.map((p) => p.total));
+  const blockedTrend = $derived(series.map((p) => p.blocked));
 </script>
 
 <div class="page-head">
@@ -51,13 +67,35 @@
 
 {#if stats}
   <div class="grid cols-4">
-    <StatCard label="Total queries" value={num(stats.total)} sub="{num(stats.errors)} errors" />
+    <StatCard label="Total queries" value={num(stats.total)} sub="{num(stats.errors)} errors">
+      {#snippet spark()}
+        {#if totalTrend.length > 1}
+          <Sparkline
+            values={totalTrend}
+            labels={sparkLabels}
+            color="var(--accent)"
+            ariaLabel="Hourly query volume"
+          />
+        {/if}
+      {/snippet}
+    </StatCard>
     <StatCard
       label="Blocked"
       value={num(stats.blocked)}
       sub="{pct(stats.block_rate)} of queries"
       tone="bad"
-    />
+    >
+      {#snippet spark()}
+        {#if blockedTrend.length > 1}
+          <Sparkline
+            values={blockedTrend}
+            labels={sparkLabels}
+            color="var(--bad)"
+            ariaLabel="Hourly blocked volume"
+          />
+        {/if}
+      {/snippet}
+    </StatCard>
     <StatCard
       label="Cache hit rate"
       value={pct(cacheRate)}
