@@ -65,16 +65,10 @@ impl DotTransport {
         Err(last)
     }
 
-    async fn query_locked(
-        &self,
-        conn: &mut Option<TlsStream<TcpStream>>,
-        query: &Message,
-    ) -> Result<Message> {
-        // (Re)establish if needed.
-        if conn.is_none() {
-            *conn = Some(self.connect().await?);
-        }
-        let stream = conn.as_mut().unwrap();
+    /// Write the query and read until a matching response. Operates on an owned
+    /// stream so a cancelled query drops the connection rather than leaving it in
+    /// `self.conn` with an outstanding/partial response.
+    async fn exchange(stream: &mut TlsStream<TcpStream>, query: &Message) -> Result<Message> {
         write_tcp_message(stream, query).await?;
         loop {
             let resp = read_tcp_message(stream).await?;
@@ -89,13 +83,31 @@ impl Transport for DotTransport {
     fn query<'a>(&'a self, query: &'a Message) -> BoxFuture<'a, Result<Message>> {
         async move {
             let mut guard = self.conn.lock().await;
-            match self.query_locked(&mut guard, query).await {
-                Ok(resp) => Ok(resp),
+            // Take the persistent stream OUT of `conn` for the duration of the
+            // exchange. If this future is cancelled mid-await (e.g. the pool's
+            // outer timeout fires), the local stream is dropped and `conn` stays
+            // empty — so the next query dials fresh instead of reusing a
+            // connection that still has a late response in flight. The stream is
+            // only returned to `conn` after a clean, matched response.
+            let stream = guard.take();
+            let mut stream = match stream {
+                Some(s) => s,
+                None => self.connect().await?,
+            };
+            match Self::exchange(&mut stream, query).await {
+                Ok(resp) => {
+                    *guard = Some(stream);
+                    Ok(resp)
+                }
                 Err(e) => {
-                    // Drop the (possibly broken) connection and retry once fresh.
-                    *guard = None;
+                    // Reused connection may be broken: drop it and retry once on a
+                    // fresh one (a freshly-dialed stream that still fails errors out).
+                    drop(stream);
                     tracing::debug!(upstream = %self.desc, error = %e, "DoT retry on fresh connection");
-                    self.query_locked(&mut guard, query).await
+                    let mut fresh = self.connect().await?;
+                    let resp = Self::exchange(&mut fresh, query).await?;
+                    *guard = Some(fresh);
+                    Ok(resp)
                 }
             }
         }

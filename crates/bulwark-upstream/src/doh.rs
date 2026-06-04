@@ -24,7 +24,6 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use hickory_proto::op::Message;
 use parking_lot::Mutex;
-use tokio::sync::OnceCell;
 
 use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
@@ -32,6 +31,14 @@ use crate::spec::UpstreamSpec;
 use crate::transport::{decode, encode, matches_query, Transport};
 
 const DNS_MESSAGE: &str = "application/dns-message";
+
+/// Maximum DoH response body we'll buffer (a DNS message is at most 64 KiB).
+const MAX_DOH_BODY: usize = 64 * 1024;
+
+/// How long bootstrap-resolved IPs (and the clients pinned to them) are reused
+/// before re-resolving, so upstream IP rotation or a transient bad bootstrap
+/// answer self-heals instead of sticking until the process restarts.
+const DOH_PIN_TTL: Duration = Duration::from_secs(300);
 
 /// Default Alt-Svc lifetime when the advertisement omits `ma=` (RFC 7838 §3.1).
 const DEFAULT_ALT_SVC_MA: Duration = Duration::from_secs(86_400);
@@ -65,11 +72,15 @@ pub struct DohTransport {
     bootstrap: SharedBootstrap,
     url: String,
     /// Bootstrap-resolved addresses for the upstream host, pinned on the clients.
-    ips: OnceCell<Vec<IpAddr>>,
-    /// HTTP/1.1 + HTTP/2 client (also the discovery path for Alt-Svc).
-    client_h12: OnceCell<reqwest::Client>,
-    /// HTTP/3-only client (`http3_prior_knowledge`), built lazily on first use.
-    client_h3: OnceCell<reqwest::Client>,
+    /// Cached with the time of resolution and refreshed after [`DOH_PIN_TTL`].
+    ips: Mutex<Option<(Instant, Vec<IpAddr>)>>,
+    /// HTTP/1.1 + HTTP/2 client (also the discovery path for Alt-Svc). Rebuilt
+    /// when the pinned IPs are refreshed. `reqwest::Client` is Arc-backed, so a
+    /// clone is cheap.
+    client_h12: Mutex<Option<(Instant, reqwest::Client)>>,
+    /// HTTP/3-only client (`http3_prior_knowledge`), built lazily, refreshed like
+    /// `client_h12`.
+    client_h3: Mutex<Option<(Instant, reqwest::Client)>>,
     h3: H3Mode,
     desc: String,
 }
@@ -89,21 +100,25 @@ impl DohTransport {
             url,
             spec,
             bootstrap,
-            ips: OnceCell::new(),
-            client_h12: OnceCell::new(),
-            client_h3: OnceCell::new(),
+            ips: Mutex::new(None),
+            client_h12: Mutex::new(None),
+            client_h3: Mutex::new(None),
             h3,
         }
     }
 
-    /// Bootstrap-resolve the upstream host once.
-    async fn ips(&self) -> Result<&Vec<IpAddr>> {
-        self.ips
-            .get_or_try_init(|| async {
-                let host = self.spec.host.to_string();
-                self.bootstrap.resolve(&host).await
-            })
-            .await
+    /// Bootstrap-resolve the upstream host, reusing the cached result until it
+    /// ages past [`DOH_PIN_TTL`], then re-resolving.
+    async fn ips(&self) -> Result<Vec<IpAddr>> {
+        if let Some((at, ips)) = self.ips.lock().as_ref() {
+            if at.elapsed() < DOH_PIN_TTL {
+                return Ok(ips.clone());
+            }
+        }
+        let host = self.spec.host.to_string();
+        let ips = self.bootstrap.resolve(&host).await?;
+        *self.ips.lock() = Some((Instant::now(), ips.clone()));
+        Ok(ips)
     }
 
     fn build_client(&self, ips: &[IpAddr], force_h3: bool) -> Result<reqwest::Client> {
@@ -145,18 +160,28 @@ impl DohTransport {
             .map_err(|e| UpstreamError::Http(e.to_string()))
     }
 
-    async fn h12(&self) -> Result<&reqwest::Client> {
+    async fn h12(&self) -> Result<reqwest::Client> {
+        if let Some((at, c)) = self.client_h12.lock().as_ref() {
+            if at.elapsed() < DOH_PIN_TTL {
+                return Ok(c.clone());
+            }
+        }
         let ips = self.ips().await?;
-        self.client_h12
-            .get_or_try_init(|| async { self.build_client(ips, false) })
-            .await
+        let client = self.build_client(&ips, false)?;
+        *self.client_h12.lock() = Some((Instant::now(), client.clone()));
+        Ok(client)
     }
 
-    async fn h3(&self) -> Result<&reqwest::Client> {
+    async fn h3(&self) -> Result<reqwest::Client> {
+        if let Some((at, c)) = self.client_h3.lock().as_ref() {
+            if at.elapsed() < DOH_PIN_TTL {
+                return Ok(c.clone());
+            }
+        }
         let ips = self.ips().await?;
-        self.client_h3
-            .get_or_try_init(|| async { self.build_client(ips, true) })
-            .await
+        let client = self.build_client(&ips, true)?;
+        *self.client_h3.lock() = Some((Instant::now(), client.clone()));
+        Ok(client)
     }
 
     /// Whether a previously advertised HTTP/3 alternative is still within its
@@ -190,16 +215,18 @@ impl DohTransport {
 
         // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
+            let client = self.h3().await?;
             return self
-                .exchange(self.h3().await?, &body, &q, original_id, false, true)
+                .exchange(&client, &body, &q, original_id, false, true)
                 .await;
         }
 
         // Auto-upgrade: prefer HTTP/3 while a fresh advertisement stands, but fall
         // back to h1/h2 (and forget the advertisement) if the h3 attempt fails.
         if self.h3_fresh() {
+            let client = self.h3().await?;
             match self
-                .exchange(self.h3().await?, &body, &q, original_id, false, true)
+                .exchange(&client, &body, &q, original_id, false, true)
                 .await
             {
                 Ok(msg) => return Ok(msg),
@@ -211,7 +238,8 @@ impl DohTransport {
         }
 
         // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
-        self.exchange(self.h12().await?, &body, &q, original_id, true, false)
+        let client = self.h12().await?;
+        self.exchange(&client, &body, &q, original_id, true, false)
             .await
     }
 
@@ -239,7 +267,7 @@ impl DohTransport {
         if http3 {
             req = req.version(reqwest::Version::HTTP_3);
         }
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| UpstreamError::Http(e.to_string()))?;
@@ -258,11 +286,28 @@ impl DohTransport {
             }
         }
 
-        let bytes = resp
-            .bytes()
+        // Cap the body: a DNS message is at most 64 KiB, so a hostile upstream
+        // must not be able to stream an unbounded body into memory. Reject by the
+        // declared Content-Length and again while accumulating chunks (covers a
+        // chunked response with no declared length).
+        if resp
+            .content_length()
+            .is_some_and(|n| n as usize > MAX_DOH_BODY)
+        {
+            return Err(UpstreamError::Http("DoH response too large".into()));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| UpstreamError::Http(e.to_string()))?;
-        let mut msg = decode(&bytes)?;
+            .map_err(|e| UpstreamError::Http(e.to_string()))?
+        {
+            if body.len() + chunk.len() > MAX_DOH_BODY {
+                return Err(UpstreamError::Http("DoH response exceeded size cap".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let mut msg = decode(&body)?;
         // `expect` and the response both carry id 0 (RFC 8484), so verify the
         // response answers our question before trusting it — otherwise a buggy
         // or hostile server could get its answer cached under our key.
