@@ -75,14 +75,25 @@ pub struct FilterEngine {
     /// hash, so it uses an identity hasher (no re-hashing on probe).
     scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher>,
     /// Wildcard rules without a safe token + all regex rules: checked for every
-    /// query (kept small in practice). `fallback_set` (a `RegexSet`) matches all
-    /// of them in a single pass and reports *which* matched (preserving rule
-    /// attribution); `scan_fallback[i]` is the rule id for set pattern `i`. If
-    /// the `RegexSet` failed to build (e.g. size limit), `fallback_set` is
-    /// `None` and we fall back to checking each rule individually.
-    scan_fallback: Vec<u32>,
-    fallback_set: Option<regex::RegexSet>,
+    /// query (kept small in practice). They're grouped into bounded-size
+    /// `RegexSet` chunks so matching is a handful of fused DFA passes rather than
+    /// an O(rules) sweep of individual `.is_match` calls — even for a list with
+    /// thousands of tokenless regexes. Each chunk's `Vec<u32>` holds the rule ids
+    /// parallel to that set's patterns, preserving attribution. A chunk that
+    /// can't build within the size limit degrades to per-rule scanning for *just
+    /// that chunk* (collected into `fallback_individual`), logged so it isn't
+    /// silent.
+    fallback_sets: Vec<(regex::RegexSet, Vec<u32>)>,
+    fallback_individual: Vec<u32>,
 }
+
+/// Fallback rules are grouped into `RegexSet` chunks of at most this many
+/// patterns, so each set stays within its size limit and matching stays a
+/// bounded number of fused passes.
+const FALLBACK_CHUNK: usize = 256;
+
+/// Compiled-size cap for each fallback `RegexSet` chunk (bytes).
+const FALLBACK_REGEXSET_SIZE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Returns true if `domain` equals `base` or is a subdomain of it.
 fn is_subdomain_of(domain: &str, base: &str) -> bool {
@@ -135,21 +146,40 @@ impl FilterEngine {
             }
         }
 
-        // Build a RegexSet over the fallback rules so they can be matched in a
-        // single pass (adblock-rust-style fusion, but the set tells us *which*
-        // rule matched, so we keep per-rule attribution).
-        let fallback_patterns: Vec<&str> = scan_fallback
-            .iter()
-            .filter_map(|&id| match &rules[id as usize].pattern {
-                Pattern::Wildcard(re) | Pattern::Regex(re) => Some(re.as_str()),
-                _ => None,
-            })
-            .collect();
-        let fallback_set = if fallback_patterns.is_empty() {
-            None
-        } else {
-            regex::RegexSet::new(&fallback_patterns).ok()
-        };
+        // Group the fallback rules into bounded RegexSet chunks (adblock-rust-style
+        // fusion, but each set tells us *which* rule matched so we keep per-rule
+        // attribution). Chunking bounds each set's compiled size and guarantees
+        // matching never degrades to an O(rules) per-query sweep.
+        let mut fallback_sets: Vec<(regex::RegexSet, Vec<u32>)> = Vec::new();
+        let mut fallback_individual: Vec<u32> = Vec::new();
+        for chunk in scan_fallback.chunks(FALLBACK_CHUNK) {
+            let mut pats: Vec<&str> = Vec::with_capacity(chunk.len());
+            let mut ids: Vec<u32> = Vec::with_capacity(chunk.len());
+            for &id in chunk {
+                if let Pattern::Wildcard(re) | Pattern::Regex(re) = &rules[id as usize].pattern {
+                    pats.push(re.as_str());
+                    ids.push(id);
+                }
+            }
+            if pats.is_empty() {
+                continue;
+            }
+            match regex::RegexSetBuilder::new(&pats)
+                .size_limit(FALLBACK_REGEXSET_SIZE_LIMIT)
+                .build()
+            {
+                Ok(set) => fallback_sets.push((set, ids)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        rules = ids.len(),
+                        "filter fallback RegexSet chunk exceeded its size limit; \
+                         scanning those rules individually"
+                    );
+                    fallback_individual.extend_from_slice(&ids);
+                }
+            }
+        }
 
         // The signature strings and index tokens are only needed during
         // compilation; drop them to save memory on large rule sets.
@@ -164,8 +194,8 @@ impl FilterEngine {
             subdomain,
             exact,
             scan_index,
-            scan_fallback,
-            fallback_set,
+            fallback_sets,
+            fallback_individual,
         }
     }
 
@@ -203,18 +233,15 @@ impl FilterEngine {
                 out.push(id);
             }
         };
-        // Fallback set: one RegexSet pass instead of N individual matches.
-        match &self.fallback_set {
-            Some(set) => {
-                for idx in set.matches(domain) {
-                    out.push(self.scan_fallback[idx]);
-                }
+        // Fallback: a few fused RegexSet passes (one per chunk) instead of N
+        // individual matches, plus any chunk that couldn't build, scanned per-rule.
+        for (set, ids) in &self.fallback_sets {
+            for idx in set.matches(domain) {
+                out.push(ids[idx]);
             }
-            None => {
-                for &id in &self.scan_fallback {
-                    check(id, out);
-                }
-            }
+        }
+        for &id in &self.fallback_individual {
+            check(id, out);
         }
         if !self.scan_index.is_empty() {
             // Reuse a per-thread token buffer so the common query path doesn't

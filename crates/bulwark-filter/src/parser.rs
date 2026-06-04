@@ -14,9 +14,27 @@
 
 use std::net::IpAddr;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 
 use crate::rule::*;
+
+/// Maximum source length of a `/regex/` rule. Rust's `regex` engine matches in
+/// linear time (no catastrophic backtracking), but a pathological source can
+/// still blow up *compile* time/memory, so over-long regexes are rejected.
+const MAX_REGEX_LEN: usize = 1000;
+
+/// Per-regex compiled-size cap (bytes). Bounds the memory a single rule's
+/// compiled program may use, so one hostile list entry can't exhaust memory.
+const REGEX_SIZE_LIMIT: usize = 256 * 1024;
+
+/// Compile `src` (which already carries any needed flags like `(?i)`) with the
+/// shared size cap, mapping failures to a [`ParseError::Regex`].
+fn compile_regex(src: &str) -> Result<Regex, ParseError> {
+    RegexBuilder::new(src)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| ParseError::Regex(e.to_string()))
+}
 
 /// Outcome of parsing one line.
 #[derive(Debug)]
@@ -327,8 +345,13 @@ fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
     // Regex rule (always falls back to a linear scan — no safe literal tokens).
     if p.starts_with('/') && p.ends_with('/') && p.len() >= 2 {
         let inner = &p[1..p.len() - 1];
-        let re =
-            Regex::new(&format!("(?i){inner}")).map_err(|e| ParseError::Regex(e.to_string()))?;
+        if inner.len() > MAX_REGEX_LEN {
+            return Err(ParseError::Regex(format!(
+                "regex too long ({} > {MAX_REGEX_LEN} chars)",
+                inner.len()
+            )));
+        }
+        let re = compile_regex(&format!("(?i){inner}"))?;
         return Ok((Pattern::Regex(re), Vec::new()));
     }
 
@@ -404,7 +427,7 @@ fn build_wildcard_regex(
     if end_anchor {
         re.push('$');
     }
-    Regex::new(&re).map_err(|e| ParseError::Regex(e.to_string()))
+    compile_regex(&re)
 }
 
 fn parse_dnstype(value: &str) -> Result<DnsTypeFilter, ParseError> {

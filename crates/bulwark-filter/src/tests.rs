@@ -425,3 +425,29 @@ fn non_dns_hostname_patterns_rejected() {
     assert_eq!(compile_one("||xn--80ak6aa92e.com^").len(), 1);
     assert_eq!(compile_one("||_dmarc.example.com^").len(), 1);
 }
+
+#[test]
+fn oversized_regex_rule_rejected() {
+    // A pathologically long regex source is dropped rather than compiled.
+    let long = "a".repeat(2000);
+    let e = compile_one(&format!("/{long}/"));
+    assert_eq!(e.len(), 0, "over-long regex rule should be dropped");
+    // A normal regex still compiles and matches.
+    let e = compile_one(r"/^ads\d+\./");
+    assert!(e.check("ads42.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn many_regex_fallback_rules_match_across_chunks() {
+    // More than one RegexSet chunk worth of tokenless regex rules: every rule
+    // must still match through the chunked fused-matching path.
+    let mut text = String::new();
+    for i in 0..600 {
+        text.push_str(&format!("/^ads{i}\\./\n"));
+    }
+    let e = compile_one(&text);
+    assert_eq!(e.len(), 600);
+    assert!(e.check("ads0.example.com", "A", &ci()).is_blocked());
+    assert!(e.check("ads599.example.com", "A", &ci()).is_blocked());
+    assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
+}
