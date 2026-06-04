@@ -156,7 +156,7 @@ async fn blocks_filtered_domain() {
     let engine = make_engine("||ads.example.com^", up).await;
 
     // Capture what gets handed to the writer for this query.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     engine.log().set_sink(tx);
 
     let r = engine

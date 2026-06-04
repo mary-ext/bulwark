@@ -9,9 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bulwark_engine::querylog::QueryLogEntry;
 use bulwark_engine::Engine;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use crate::store::QueryStore;
+
+/// Bound on the query-log writer channel. Caps how many log entries can queue
+/// ahead of the background writer before the DNS hot path sheds them (see
+/// [`bulwark_engine::querylog::QueryLog::push`]), so a stalled or slow writer
+/// can't grow memory without limit.
+pub const QUERYLOG_CHANNEL_CAP: usize = 16_384;
 
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -23,7 +29,7 @@ fn now_ms() -> i64 {
 /// Spawn the background writer that batches new log entries into the store.
 pub fn spawn_querylog_writer(
     store: Arc<QueryStore>,
-    mut rx: UnboundedReceiver<QueryLogEntry>,
+    mut rx: Receiver<QueryLogEntry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {

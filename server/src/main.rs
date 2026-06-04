@@ -56,8 +56,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("opening query-log store")?,
     );
-    // Wire the engine's hot-path sink to the background writer.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // Wire the engine's hot-path sink to the background writer. Bounded so a slow
+    // writer sheds load instead of growing memory without limit.
+    let (tx, rx) = tokio::sync::mpsc::channel(persist::QUERYLOG_CHANNEL_CAP);
     engine.log().set_sink(tx);
     persist::spawn_querylog_writer(store.clone(), rx);
 

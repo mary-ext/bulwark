@@ -296,7 +296,8 @@ async fn build_engine(
 /// each logged entry is sent to the writer task. Without this the log's `push`
 /// would be a no-op (no sink), under-counting the per-query send cost.
 fn attach_drained_sink(engine: &Arc<Engine>) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // Generous bound: the drainer keeps it near-empty, so nothing is dropped.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 20);
     engine.log().set_sink(tx);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 }
@@ -897,7 +898,8 @@ fn phase2d_log_microbench() {
     // timer — so the unbounded channel stays bounded without charging the recv
     // cost to the measurement.
     let log = QueryLog::new(true);
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // Cap exceeds the per-trial push count, so the bench never sheds entries.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 20);
     log.set_sink(tx);
     let mut buildpush = u128::MAX;
     for _ in 0..5 {

@@ -43,10 +43,24 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_queries_blocked ON queries(id) WHERE blocked = 1;
 ";
 
-const INSERT_SQL: &str = "INSERT OR REPLACE INTO queries
-    (id, time_ms, client_ip, question, qtype, action, blocked,
+// `id` is intentionally omitted: SQLite assigns the rowid (`max(rowid)+1`, which
+// is persisted on disk), so after a restart the log keeps growing above the
+// existing rows instead of a process-local counter resetting to 0 and an
+// `INSERT OR REPLACE` clobbering history one row at a time. Plain `INSERT` so a
+// (never-expected) id collision surfaces as an error rather than an overwrite.
+// This works unchanged on pre-existing DBs: `CREATE TABLE IF NOT EXISTS` leaves
+// their schema alone, but `id INTEGER PRIMARY KEY` is already the rowid alias.
+const INSERT_SQL: &str = "INSERT INTO queries
+    (time_ms, client_ip, question, qtype, action, blocked,
      upstream, rule, list_id, allowlisted, rcode, answers, elapsed_ms)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+/// Resolves every column [`row_to_entry`]/[`insert_params`] depend on without
+/// returning rows. Used by [`QueryStore::try_open`] to detect an incompatible
+/// pre-existing schema.
+const SCHEMA_PROBE: &str = "SELECT id, time_ms, client_ip, question, qtype, action, \
+    blocked, upstream, rule, list_id, allowlisted, rcode, answers, elapsed_ms \
+    FROM queries LIMIT 0";
 
 pub struct QueryStore {
     /// All writes (inserts, retention deletes, clear) go through this one
@@ -60,10 +74,36 @@ pub struct QueryStore {
 impl QueryStore {
     /// Open (creating if needed) the store at `path`. Pass `":memory:"` for a
     /// non-persistent log (used when `query_log.persist` is off).
+    ///
+    /// The query log is pure observability data, so if an existing on-disk DB is
+    /// corrupt or has an incompatible schema we can't initialise, we wipe and
+    /// recreate it rather than fail startup. A schema-compatible existing DB is
+    /// left untouched — new rows just continue from its current `max(rowid)`.
     pub async fn open(path: &str) -> turso::Result<Self> {
+        match Self::try_open(path).await {
+            Ok(store) => Ok(store),
+            // Never reset the shared in-memory DB — there's nothing to recover and
+            // a failure there is a real bug, not a bad file.
+            Err(e) if path != ":memory:" => {
+                tracing::warn!(error = %e, path, "query log DB unusable; recreating from scratch");
+                reset_db_files(path);
+                Self::try_open(path).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Open the DB, apply the schema, and probe that it has the columns we
+    /// read/write. Any failure (corrupt file, incompatible schema) is returned so
+    /// [`open`](Self::open) can decide whether to reset the file.
+    async fn try_open(path: &str) -> turso::Result<Self> {
         let db = Builder::new_local(path).build().await?;
         let write = db.connect()?;
         write.execute_batch(SCHEMA).await?;
+        // `CREATE TABLE IF NOT EXISTS` leaves a pre-existing table's schema alone,
+        // so probe that it actually matches what we expect. `LIMIT 0` resolves
+        // every column name without scanning rows; a missing column errors here.
+        write.query(SCHEMA_PROBE, ()).await?;
         let read = db.connect()?;
         Ok(Self {
             write: tokio::sync::Mutex::new(write),
@@ -72,19 +112,36 @@ impl QueryStore {
     }
 
     /// Insert a batch of entries in a single transaction, reusing one prepared
-    /// statement. `INSERT OR REPLACE` keeps the writer idempotent if an id ever
-    /// repeats (e.g. a migration re-run).
+    /// statement. On any failure the whole transaction is rolled back, so a bad
+    /// batch never leaves the writer connection stuck inside an open, failed
+    /// transaction (which would poison every subsequent batch).
     pub async fn insert_batch(&self, entries: &[QueryLogEntry]) -> turso::Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let conn = self.write.lock().await;
         conn.execute("BEGIN IMMEDIATE", ()).await?;
+        match Self::insert_all(&conn, entries).await {
+            Ok(()) => {
+                conn.execute("COMMIT", ()).await?;
+                Ok(())
+            }
+            Err(e) => {
+                // Best-effort rollback; even if it fails, dropping the lock guard
+                // releases the connection for the next batch to BEGIN afresh.
+                let _ = conn.execute("ROLLBACK", ()).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Insert every entry through one prepared statement. Caller owns the
+    /// surrounding transaction (see [`insert_batch`](Self::insert_batch)).
+    async fn insert_all(conn: &Connection, entries: &[QueryLogEntry]) -> turso::Result<()> {
         let mut stmt = conn.prepare(INSERT_SQL).await?;
         for e in entries {
             stmt.execute(insert_params(e)).await?;
         }
-        conn.execute("COMMIT", ()).await?;
         Ok(())
     }
 
@@ -249,7 +306,6 @@ fn insert_params(e: &QueryLogEntry) -> Params {
         QueryAction::Error => ("error", None, None, None),
     };
     Params::Positional(vec![
-        Value::Integer(e.id as i64),
         Value::Integer(e.time_ms),
         Value::Text(e.client_ip.clone()),
         Value::Text(e.question.clone()),
@@ -321,6 +377,15 @@ fn opt_int(v: Value) -> Option<i64> {
     }
 }
 
+/// Remove a SQLite DB file and its WAL/journal sidecars, so a corrupt or
+/// incompatible query-log DB can be recreated clean. Best-effort: missing files
+/// are ignored. The connections that opened them must already be dropped.
+fn reset_db_files(path: &str) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
 /// Escape the LIKE metacharacters in a user-supplied substring so it matches
 /// literally (paired with `ESCAPE '\'`).
 fn like_escape(s: &str) -> String {
@@ -375,6 +440,8 @@ mod tests {
 
     #[tokio::test]
     async fn newest_first_with_pagination_total() {
+        // The store ignores the supplied id and assigns its own (SQLite rowid) in
+        // insert order, so assert ordering via time_ms, which we set to match.
         let entries: Vec<_> = (0..5).map(|i| entry(i, "x.com", "10.0.0.1", false)).collect();
         let store = store_with(&entries).await;
         let clients = ClientMatcher::default();
@@ -382,12 +449,50 @@ mod tests {
         let p = store.query(&LogFilter::default(), 0, 2, &clients).await.unwrap();
         assert_eq!(p.total, 5, "total counts all matches, not just the page");
         assert_eq!(p.entries.len(), 2);
-        assert_eq!(p.entries[0].id, 4, "newest first");
-        assert_eq!(p.entries[1].id, 3);
+        assert_eq!(p.entries[0].time_ms, 4, "newest first");
+        assert_eq!(p.entries[1].time_ms, 3);
+        // Ids are DB-assigned, monotonic, and ordered the same as insert order.
+        assert!(p.entries[0].id > p.entries[1].id, "ids descend with recency");
 
         // Second page continues the descending order.
         let p2 = store.query(&LogFilter::default(), 2, 2, &clients).await.unwrap();
-        assert_eq!(p2.entries[0].id, 2);
+        assert_eq!(p2.entries[0].time_ms, 2);
+    }
+
+    #[tokio::test]
+    async fn ids_continue_across_reopen() {
+        // The core C1 regression: after a "restart" (reopen) ids must keep
+        // climbing from the persisted max, never reset to 0 and overwrite history.
+        let dir = std::env::temp_dir().join(format!("bulwark-store-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ql.db");
+        let path_str = path.to_str().unwrap();
+        reset_db_files(path_str);
+
+        let s1 = QueryStore::open(path_str).await.unwrap();
+        s1.insert_batch(&[entry(0, "a.com", "10.0.0.1", false)])
+            .await
+            .unwrap();
+        let clients = ClientMatcher::default();
+        let first_id = s1.query(&LogFilter::default(), 0, 10, &clients).await.unwrap().entries[0].id;
+        drop(s1);
+
+        // Reopen and insert again; the new row must get a larger id.
+        let s2 = QueryStore::open(path_str).await.unwrap();
+        s2.insert_batch(&[entry(0, "b.com", "10.0.0.1", false)])
+            .await
+            .unwrap();
+        let page = s2.query(&LogFilter::default(), 0, 10, &clients).await.unwrap();
+        assert_eq!(page.total, 2, "both rows survive the reopen");
+        assert!(
+            page.entries[0].id > first_id,
+            "id continues above the persisted max ({} should be > {})",
+            page.entries[0].id,
+            first_id
+        );
+        assert_eq!(page.entries[0].question, "b.com", "newest first");
+        drop(s2);
+        reset_db_files(path_str);
     }
 
     #[tokio::test]

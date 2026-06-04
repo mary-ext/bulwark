@@ -19,7 +19,6 @@ pub mod wire;
 
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,7 +53,6 @@ pub struct Engine {
     cache: Arc<DnsCache>,
     log: Arc<QueryLog>,
     stats: Arc<Stats>,
-    seq: AtomicU64,
 }
 
 fn now_ms() -> i64 {
@@ -150,7 +148,6 @@ impl Engine {
             cache,
             log,
             stats,
-            seq: AtomicU64::new(0),
         })
     }
 
@@ -353,12 +350,12 @@ impl Engine {
 
         // Only forwarded queries set the per-upstream RTT.
         let upstream_rtt_ms = log.upstream_rtt_ms;
-        let id = self.seq.fetch_add(1, Ordering::Relaxed);
 
         // Build the entry. The `question` buffer is moved in from the name we
-        // already normalised, so it costs no extra allocation.
+        // already normalised, so it costs no extra allocation. `id` is left 0:
+        // the disk store assigns the real id (SQLite rowid) on insert, and only
+        // the stored id is ever read back.
         let mut entry = QueryLogEntry::empty();
-        entry.id = id;
         entry.time_ms = now_ms();
         {
             use std::fmt::Write as _;

@@ -7,6 +7,7 @@
 //! the filtering and pagination they describe run against the database.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -137,21 +138,27 @@ pub struct LogPage {
 /// paying to build an entry, then calls [`push`](Self::push) to hand it off.
 pub struct QueryLog {
     enabled: std::sync::atomic::AtomicBool,
+    /// Count of entries dropped because the writer channel was full. Surfaced
+    /// periodically so sustained loss isn't silent.
+    dropped: AtomicU64,
     /// Channel to the background writer. Set once at startup; `None` until then
-    /// (or when persistence is unwired), in which case pushes are dropped.
-    sink: Mutex<Option<tokio::sync::mpsc::UnboundedSender<QueryLogEntry>>>,
+    /// (or when persistence is unwired), in which case pushes are dropped. The
+    /// channel is **bounded** so a stalled or slow writer sheds load instead of
+    /// growing memory without limit.
+    sink: Mutex<Option<tokio::sync::mpsc::Sender<QueryLogEntry>>>,
 }
 
 impl QueryLog {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled: std::sync::atomic::AtomicBool::new(enabled),
+            dropped: AtomicU64::new(0),
             sink: Mutex::new(None),
         }
     }
 
     /// Attach the writer sink. Entries pushed afterwards are sent here.
-    pub fn set_sink(&self, tx: tokio::sync::mpsc::UnboundedSender<QueryLogEntry>) {
+    pub fn set_sink(&self, tx: tokio::sync::mpsc::Sender<QueryLogEntry>) {
         *self.sink.lock() = Some(tx);
     }
 
@@ -166,13 +173,22 @@ impl QueryLog {
 
     /// Forward a completed entry to the background writer. A no-op if logging is
     /// disabled or no sink is attached. Cheap on the hot path: one atomic load
-    /// plus a lock-free channel send (the entry is moved, not cloned).
+    /// plus a non-blocking channel send (the entry is moved, not cloned).
+    ///
+    /// Uses `try_send` on the bounded channel: under extreme burst (or a stalled
+    /// writer) a full channel drops the entry rather than blocking the DNS hot
+    /// path or growing memory unboundedly. Sustained loss is logged periodically.
     pub fn push(&self, entry: QueryLogEntry) {
         if !self.is_enabled() {
             return;
         }
         if let Some(tx) = self.sink.lock().as_ref() {
-            let _ = tx.send(entry);
+            if tx.try_send(entry).is_err() {
+                let n = self.dropped.fetch_add(1, Ordering::Relaxed);
+                if n.is_multiple_of(4096) {
+                    tracing::warn!(dropped = n + 1, "query log channel full; dropping entries");
+                }
+            }
         }
     }
 }
@@ -196,7 +212,7 @@ mod tests {
     #[test]
     fn push_forwards_to_sink_when_enabled() {
         let log = QueryLog::new(true);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         log.set_sink(tx);
         let mut e = QueryLogEntry::empty();
         e.id = 42;
