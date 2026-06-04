@@ -1,6 +1,6 @@
 //! Per-transport benchmark + profiler for the upstream layer.
 //!
-//! `bench_chain` only ever talks to an in-process **UDP** mock, so the encrypted
+//! `bench_request` only ever talks to an in-process **UDP** mock, so the encrypted
 //! transports (DoT, DoH, DoQ) are never exercised in a controlled benchmark. This
 //! example stands up an in-process mock upstream for **every** transport bulwark
 //! speaks — plain UDP/TCP, DoT, DoH over HTTP/1.1+HTTP/2, DoH forced over HTTP/3,
@@ -394,7 +394,7 @@ async fn mock_doh_h3(delay: Duration, certs: &Certs) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Filter list loading (download-once + cache; shares bench_chain's directory).
+// Filter list loading (download-once + cache; shares bench_request's directory).
 // ---------------------------------------------------------------------------
 
 const ADGUARD_URL: &str = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";

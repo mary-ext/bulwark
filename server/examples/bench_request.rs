@@ -7,7 +7,7 @@
 //! internet at query time.
 //!
 //! Run with:
-//!   cargo run --release --example bench_chain -p bulwark
+//!   cargo run --release --example bench_request -p bulwark
 //!
 //! The filter lists are downloaded once into `target/bench-data/` (override the
 //! directory with `BENCH_DATA_DIR`). If the network is unavailable, a synthetic
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bulwark_config::BlockingMode;
+use bulwark_config::{BlockingMode, ClientConfig};
 use bulwark_engine::cache::{CachedResponse, DnsCache};
 use bulwark_engine::clients::ClientMatcher;
 use bulwark_engine::querylog::QueryLog;
@@ -197,6 +197,31 @@ const POPULAR: &[&str] = &[
     "wordpress.org",
     "debian.org",
 ];
+
+/// A representative set of configured clients (~16 CIDR/host entries) so the
+/// client-matcher microbench exercises a realistic longest-prefix scan rather
+/// than an empty matcher that returns on the first check.
+fn sample_clients() -> Vec<ClientConfig> {
+    let mut clients: Vec<ClientConfig> = (0..15)
+        .map(|i| ClientConfig {
+            id: format!("c{i}"),
+            name: format!("client-{i}"),
+            ids: vec![format!("10.{i}.0.0/16")],
+            tags: vec!["lan".into()],
+            filtering_enabled: true,
+        })
+        .collect();
+    // The IP the microbench probes (192.168.1.50) matches this entry, so the
+    // scan walks every CIDR before settling on the longest-prefix match.
+    clients.push(ClientConfig {
+        id: "home".into(),
+        name: "home-lan".into(),
+        ids: vec!["192.168.1.0/24".into()],
+        tags: vec!["trusted".into()],
+        filtering_enabled: true,
+    });
+    clients
+}
 
 // ---------------------------------------------------------------------------
 // Mock upstream.
@@ -389,20 +414,30 @@ fn report(label: &str, mut ns: Vec<u64>) {
     );
 }
 
-/// Time one async whole-chain scenario over a pre-built batch of queries.
-async fn scenario(engine: &Arc<Engine>, label: &str, msgs: Vec<Message>) {
-    // Warmup (~10% of the batch).
-    let warm = (msgs.len() / 10).max(1);
-    for m in msgs.iter().take(warm) {
-        let _ = engine.handle(m.clone(), local()).await;
+/// Time one async whole-chain scenario over `timed`, after priming code paths
+/// (and, where intended, the cache) with the separate `warm` batch. `warm`
+/// messages are NOT timed: warming the *timed* set would turn ~10% of a
+/// miss-labelled scenario into cache hits and understate the path. Pass an empty
+/// `warm` when the engine was already primed externally.
+async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Message>, timed: Vec<Message>) {
+    for m in warm {
+        let _ = engine.handle(m, local()).await;
     }
-    let mut ns = Vec::with_capacity(msgs.len());
-    for m in msgs {
+    let mut ns = Vec::with_capacity(timed.len());
+    for m in timed {
         let t = Instant::now();
         let _ = engine.handle(m, local()).await;
         ns.push(t.elapsed().as_nanos() as u64);
     }
     report(label, ns);
+}
+
+/// Split a batch into a warmup slice (first ~10%, cloned) and the full timed
+/// batch — the right shape for hit/warm-cache scenarios where re-timing the
+/// warmed messages is correct (they are cache hits either way).
+fn warm_then_time(msgs: Vec<Message>) -> (Vec<Message>, Vec<Message>) {
+    let warm = msgs.iter().take((msgs.len() / 10).max(1)).cloned().collect();
+    (warm, msgs)
 }
 
 fn many(domains: impl Iterator<Item = String>, rtype: RecordType) -> Vec<Message> {
@@ -540,7 +575,11 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
     println!("\n== Phase 1: per-stage CPU cost (single-threaded, ns/op) ==");
     let n = 500_000usize;
     let ci = ClientInfo::default();
-    let matcher = ClientMatcher::default();
+    // Two matchers: the empty default (unknown-IP fast path — the common case
+    // when no named clients are configured) and a populated one (~16 CIDRs) so
+    // the longest-prefix scan cost is represented for setups that name clients.
+    let empty_matcher = ClientMatcher::default();
+    let populated_matcher = ClientMatcher::build(&sample_clients());
     let ip: IpAddr = "192.168.1.50".parse().unwrap();
 
     // Build a representative set of query names.
@@ -583,15 +622,28 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         t.elapsed().as_nanos() / n as u128
     );
 
-    // (c) Client identification.
+    // (c) Client identification. The real identify() returns a ResolvedClient
+    // without stringifying the IP, so the sink reads a cheap bool field rather
+    // than calling to_string() (which previously added ~40 ns of bench-only work
+    // and pessimistically inflated this line).
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..n {
-        acc += matcher.identify(ip).ip.to_string().len();
+        acc += empty_matcher.identify(ip).filtering_enabled as usize;
     }
     println!(
         "  {:<28} {:>6} ns/op  (sink={acc})",
-        "clients.identify",
+        "clients.identify (no clients)",
+        t.elapsed().as_nanos() / n as u128
+    );
+    let t = Instant::now();
+    let mut acc = 0usize;
+    for _ in 0..n {
+        acc += populated_matcher.identify(ip).filtering_enabled as usize;
+    }
+    println!(
+        "  {:<28} {:>6} ns/op  (sink={acc})",
+        "clients.identify (16 CIDRs)",
         t.elapsed().as_nanos() / n as u128
     );
 
@@ -646,34 +698,46 @@ async fn phase2_scenarios(
 
     // Blocked: real list domains -> synthesized NXDOMAIN, never touches upstream.
     let bset: Vec<String> = blocked.iter().cloned().cycle().take(n).collect();
-    scenario(&engine, "blocked", many(bset.into_iter(), RecordType::A)).await;
+    let (warm, timed) = warm_then_time(many(bset.into_iter(), RecordType::A));
+    scenario(&engine, "blocked", warm, timed).await;
 
     // Forwarded miss: unique never-seen domains -> mock upstream + cache insert.
+    // Warm with a *distinct* set of misses so every timed query is a genuine
+    // miss — warming the timed set itself would cache ~10% of them.
+    let warm_fwd = (0..(n / 10).max(1))
+        .map(|i| format!("warm{i}-{}.bench-fwd.example", rand::random::<u32>()));
     let fwd = (0..n).map(|i| format!("u{i}-{}.bench-fwd.example", rand::random::<u32>()));
-    scenario(&engine, "forwarded (miss+insert)", many(fwd, RecordType::A)).await;
+    scenario(
+        &engine,
+        "forwarded (miss+insert)",
+        many(warm_fwd, RecordType::A),
+        many(fwd, RecordType::A),
+    )
+    .await;
 
-    // Cache hit (fresh): warm one domain, then hammer it.
+    // Cache hit (fresh): warm one domain, then hammer it (already primed, so the
+    // timed batch needs no further warmup).
     let _ = engine
         .handle(query("cache-hot.example.", RecordType::A), local())
         .await;
     let hot = (0..n).map(|_| "cache-hot.example".to_string());
-    scenario(&engine, "cache hit (fresh)", many(hot, RecordType::A)).await;
+    scenario(&engine, "cache hit (fresh)", Vec::new(), many(hot, RecordType::A)).await;
 
     // Allowlisted / popular: forwarded, exercises the full miss-then-cache mix
     // across a small working set (mostly cache hits after warmup).
     let pop = (0..n).map(|i| POPULAR[i % POPULAR.len()].to_string());
-    scenario(
-        &engine,
-        "popular set (warm cache)",
-        many(pop, RecordType::A),
-    )
-    .await;
+    let (warm, timed) = warm_then_time(many(pop, RecordType::A));
+    scenario(&engine, "popular set (warm cache)", warm, timed).await;
 
     // Negative cache: nx- domains -> NXDOMAIN, cached negatively after first.
+    // Only 64 unique names, so warm all 64 to measure the steady negative-hit
+    // path (the first occurrence of each would otherwise be a miss).
+    let nx_warm = (0..64).map(|i| format!("nx-{}.bench.example", i));
     let nx = (0..n).map(|i| format!("nx-{}.bench.example", i % 64));
     scenario(
         &engine,
         "negative cache (NXDOMAIN)",
+        many(nx_warm, RecordType::A),
         many(nx, RecordType::A),
     )
     .await;
@@ -695,6 +759,7 @@ async fn phase2_scenarios(
     scenario(
         &nofilter,
         "filtering disabled (cache)",
+        Vec::new(),
         many(nf, RecordType::A),
     )
     .await;
@@ -727,6 +792,7 @@ async fn phase2_scenarios(
     scenario(
         &stale_engine,
         "cache hit (stale+refresh)",
+        Vec::new(),
         many(stale, RecordType::A),
     )
     .await;
@@ -750,7 +816,7 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
         .handle(query("fin-hot.example.", RecordType::A), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&on, "cache hit (stats+log on)", many(hot, RecordType::A)).await;
+    scenario(&on, "cache hit (stats+log on)", Vec::new(), many(hot, RecordType::A)).await;
 
     // stats + log OFF (finalize early-returns the response untouched).
     let off = build_engine_obs(filter.clone(), upstream, false, false).await;
@@ -758,7 +824,7 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
         .handle(query("fin-hot.example.", RecordType::A), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&off, "cache hit (obs off)", many(hot, RecordType::A)).await;
+    scenario(&off, "cache hit (obs off)", Vec::new(), many(hot, RecordType::A)).await;
 
     // stats only / log only, to attribute the cost between the two recorders.
     let stats_only = build_engine_obs(filter.clone(), upstream, true, false).await;
@@ -766,14 +832,14 @@ async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: us
         .handle(query("fin-hot.example.", RecordType::A), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&stats_only, "cache hit (stats only)", many(hot, RecordType::A)).await;
+    scenario(&stats_only, "cache hit (stats only)", Vec::new(), many(hot, RecordType::A)).await;
 
     let log_only = build_engine_obs(filter.clone(), upstream, false, true).await;
     let _ = log_only
         .handle(query("fin-hot.example.", RecordType::A), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&log_only, "cache hit (log only)", many(hot, RecordType::A)).await;
+    scenario(&log_only, "cache hit (log only)", Vec::new(), many(hot, RecordType::A)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1346,6 +1412,89 @@ fn phase5_cache_contention() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6: full per-request CPU — parse(from_vec) -> handle -> encode.
+//
+// Every other phase times handle() over a *pre-parsed* Message and drops the
+// response without encoding. The real UDP listener (crate::server) does more on
+// EVERY query: decode raw wire bytes into a Message, run handle(), then encode
+// the response back to bytes (a wire-cache hit that fits passes through; a
+// Message — blocked/forwarded/oversized — is re-encoded via to_vec). This phase
+// times that whole CPU path with no socket I/O, so the per-request figure is the
+// closest deterministic proxy for production cost. It is OPTIMISTIC only by the
+// missing recv_from/send_to syscalls and per-query tokio::spawn — which a CPU
+// bench cannot model; see the loopback/live profile for those.
+// ---------------------------------------------------------------------------
+
+/// Max UDP payload the client will accept — mirrors `server::udp_max_payload`.
+fn udp_max_payload(query: &Message) -> usize {
+    let advertised = query.edns.as_ref().map(|e| e.max_payload()).unwrap_or(512);
+    (advertised as usize).clamp(512, 4096)
+}
+
+/// Encode an `EngineResponse` for UDP exactly as the listener does: a wire hit
+/// that fits is sent as-is, otherwise the message is re-encoded.
+fn encode_udp_response(resp: EngineResponse, max: usize) -> Vec<u8> {
+    match resp {
+        EngineResponse::Wire(b) if b.len() <= max => b,
+        other => other.into_message().to_vec().unwrap_or_default(),
+    }
+}
+
+/// Time parse + handle + encode over a pool of raw query byte-blobs, indexed by
+/// `i % pool.len()` so unique-per-query workloads (misses) hit a fresh blob.
+async fn full_request_scenario(engine: &Arc<Engine>, label: &str, pool: Vec<Vec<u8>>) {
+    let peer = local();
+    let mut ns = Vec::with_capacity(pool.len());
+    for raw in &pool {
+        let t = Instant::now();
+        let q = Message::from_vec(raw).unwrap();
+        let max = udp_max_payload(&q);
+        let resp = engine.handle(q, peer).await;
+        let out = encode_udp_response(resp, max);
+        ns.push(t.elapsed().as_nanos() as u64);
+        std::hint::black_box(out.len());
+    }
+    report(label, ns);
+}
+
+async fn phase6_full_request(
+    filter: Arc<FilterEngine>,
+    blocked: &[String],
+    upstream: SocketAddr,
+    n: usize,
+) {
+    println!("\n== Phase 6: full per-request CPU — parse + handle + encode (no socket) ==");
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let raw = |name: &str| query(name, RecordType::A).to_vec().unwrap();
+
+    // Cache hit: prime once, then time parse+handle+encode of the same query.
+    // This is the wire-byte fast path — the encode is a near-free passthrough.
+    let _ = engine
+        .handle(query("req-hot.example.", RecordType::A), local())
+        .await;
+    let hit_pool = std::iter::repeat_with(|| raw("req-hot.example."))
+        .take(n)
+        .collect();
+    full_request_scenario(&engine, "cache hit (parse+handle+enc)", hit_pool).await;
+
+    // Blocked: real list domains -> synthesized NXDOMAIN+SOA, which is a Message
+    // and so pays the to_vec re-encode (incl. the authority section).
+    let blk_pool = blocked
+        .iter()
+        .cycle()
+        .take(n)
+        .map(|d| raw(d))
+        .collect();
+    full_request_scenario(&engine, "blocked (parse+handle+enc)", blk_pool).await;
+
+    // Forwarded miss: unique domains -> upstream + cache insert + Message encode.
+    let fwd_pool = (0..n)
+        .map(|i| raw(&format!("r{i}-{}.bench-req.example", rand::random::<u32>())))
+        .collect();
+    full_request_scenario(&engine, "forwarded (parse+handle+enc)", fwd_pool).await;
+}
+
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -1353,7 +1502,7 @@ async fn main() {
     let concurrency = env_usize("BENCH_CONCURRENCY", 64);
     let delay = Duration::from_micros(env_usize("BENCH_UPSTREAM_DELAY_US", 0) as u64);
 
-    println!("== Bulwark whole-chain benchmark ==");
+    println!("== Bulwark per-request benchmark ==");
     println!("  iterations/scenario={n}  concurrency={concurrency}  upstream_delay={delay:?}");
 
     println!("\n== Loading filter lists ==");
@@ -1380,6 +1529,7 @@ async fn main() {
     .await;
     phase4_stats_contention(&blocked);
     phase5_cache_contention();
+    phase6_full_request(filter.clone(), &blocked, upstream, n).await;
 
     println!("\n== done ==");
 }
