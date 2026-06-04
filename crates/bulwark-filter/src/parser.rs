@@ -66,6 +66,54 @@ fn norm_domain(d: &str) -> String {
     d.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Does `line` carry an AdGuard/ABP **cosmetic** marker — element hiding (`##`,
+/// `#@#`), extended-CSS (`#?#`), CSS injection (`#$#`), scriptlets (`#%#`), their
+/// `@`-exception variants, or HTML filtering (`$$`, `$@$`)? Such rules act on
+/// page content and can never match a DNS hostname, so they're skipped rather
+/// than mis-parsed into a bogus domain. The marker shape is `#`, optional `@`,
+/// optional one of `? $ %`, then `#`. Mirrors urlfilter's cosmetic-marker set.
+fn is_cosmetic(line: &str) -> bool {
+    let b = line.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b'#' => {
+                let mut j = i + 1;
+                while j < n && matches!(b[j], b'@' | b'?' | b'$' | b'%') {
+                    j += 1;
+                }
+                if j < n && b[j] == b'#' {
+                    return true;
+                }
+            }
+            b'$' if line[i..].starts_with("$$") || line[i..].starts_with("$@$") => {
+                return true;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Is `d` a plausible DNS hostname (ASCII labels of letters/digits/`-`/`_`,
+/// dot-separated, within length limits)? Used to reject non-DNS junk — URL-path
+/// rules, cosmetic selectors, lines with spaces — that would otherwise be stored
+/// as a bogus domain pattern. Punycode (`xn--…`) and underscore service labels
+/// (`_dmarc`) pass; slashes, spaces, `#`, `:` and empty labels don't.
+fn is_dns_hostname(d: &str) -> bool {
+    !d.is_empty()
+        && d.len() <= 253
+        && d.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        })
+}
+
 /// Parse one line into zero or more rules.
 pub fn parse_line(line: &str) -> Result<Parsed, ParseError> {
     let line = line.trim();
@@ -84,6 +132,14 @@ pub fn parse_line(line: &str) -> Result<Parsed, ParseError> {
         } else {
             Parsed::Rules(rules)
         });
+    }
+
+    // Cosmetic / HTML-filtering rules act on page content, never on DNS names —
+    // skip them rather than mis-parse `example.com##.ad` into a bogus domain.
+    // Checked after hosts parsing so a `##`-style inline comment on a hosts line
+    // isn't mistaken for a cosmetic marker.
+    if is_cosmetic(line) {
+        return Ok(Parsed::Unsupported(line.to_string()));
     }
 
     parse_adblock(line)
@@ -192,16 +248,24 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
             match key {
                 "important" => m.important = true,
                 "badfilter" => badfilter = true,
-                "dnstype" => m.dnstype = Some(parse_dnstype(value.unwrap_or(""))),
+                "dnstype" => m.dnstype = Some(parse_dnstype(value.unwrap_or(""))?),
                 "client" => m.client = Some(parse_client(value.unwrap_or(""))?),
-                "ctag" => m.ctag = Some(parse_ctag(value.unwrap_or(""))),
+                "ctag" => m.ctag = Some(parse_ctag(value.unwrap_or(""))?),
                 "denyallow" => {
-                    m.denyallow = value
+                    let domains: Vec<String> = value
                         .unwrap_or("")
                         .split('|')
                         .filter(|s| !s.is_empty())
                         .map(norm_domain)
                         .collect();
+                    // An empty `$denyallow=` would otherwise become a no-op that
+                    // silently changes the rule's meaning; reject it instead.
+                    if domains.is_empty() {
+                        return Err(ParseError::Invalid(
+                            "$denyallow requires at least one domain".into(),
+                        ));
+                    }
+                    m.denyallow = domains;
                 }
                 "dnsrewrite" => {
                     m.rewrite = Some(parse_dnsrewrite(value.unwrap_or(""))?);
@@ -298,6 +362,9 @@ fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
     if domain.is_empty() {
         return Err(ParseError::Invalid("empty domain".into()));
     }
+    if !is_dns_hostname(&domain) {
+        return Err(ParseError::Invalid(format!("not a DNS hostname: {domain}")));
+    }
     if start_anchor {
         // `|example.com|` — exact host match.
         Ok((Pattern::Exact(domain), Vec::new()))
@@ -340,7 +407,7 @@ fn build_wildcard_regex(
     Regex::new(&re).map_err(|e| ParseError::Regex(e.to_string()))
 }
 
-fn parse_dnstype(value: &str) -> DnsTypeFilter {
+fn parse_dnstype(value: &str) -> Result<DnsTypeFilter, ParseError> {
     let mut f = DnsTypeFilter::default();
     for t in value.split('|').filter(|s| !s.is_empty()) {
         if let Some(neg) = t.strip_prefix('~') {
@@ -349,7 +416,14 @@ fn parse_dnstype(value: &str) -> DnsTypeFilter {
             f.include.push(t.to_ascii_uppercase());
         }
     }
-    f
+    // An empty `$dnstype=` (or one with only separators) must not degrade to a
+    // match-everything rule; reject it.
+    if f.include.is_empty() && f.exclude.is_empty() {
+        return Err(ParseError::Invalid(
+            "$dnstype requires at least one record type".into(),
+        ));
+    }
+    Ok(f)
 }
 
 fn parse_client(value: &str) -> Result<ClientFilter, ParseError> {
@@ -374,10 +448,15 @@ fn parse_client(value: &str) -> Result<ClientFilter, ParseError> {
             f.include.push(m);
         }
     }
+    if f.include.is_empty() && f.exclude.is_empty() {
+        return Err(ParseError::Invalid(
+            "$client requires at least one client".into(),
+        ));
+    }
     Ok(f)
 }
 
-fn parse_ctag(value: &str) -> CtagFilter {
+fn parse_ctag(value: &str) -> Result<CtagFilter, ParseError> {
     let mut f = CtagFilter::default();
     for t in value.split('|').filter(|s| !s.is_empty()) {
         if let Some(neg) = t.strip_prefix('~') {
@@ -386,7 +465,12 @@ fn parse_ctag(value: &str) -> CtagFilter {
             f.include.push(t.to_string());
         }
     }
-    f
+    if f.include.is_empty() && f.exclude.is_empty() {
+        return Err(ParseError::Invalid(
+            "$ctag requires at least one tag".into(),
+        ));
+    }
+    Ok(f)
 }
 
 fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {

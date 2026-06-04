@@ -352,3 +352,76 @@ fn large_list_matches_fast() {
     assert!(e.check("evil42.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
 }
+
+#[test]
+fn empty_scoped_modifier_drops_rule_not_match_all() {
+    // An empty `$client=` must NOT become a match-everything rule; the whole rule
+    // is dropped, so the domain is not blocked for anyone.
+    for rule in [
+        "||corp.example^$client=",
+        "||corp.example^$ctag=",
+        "||corp.example^$dnstype=",
+        "||corp.example^$denyallow=",
+    ] {
+        let e = compile_one(rule);
+        assert_eq!(e.len(), 0, "rule should be dropped: {rule:?}");
+        let some_client = ClientInfo {
+            ip: Some("10.0.0.1".parse().unwrap()),
+            ..Default::default()
+        };
+        assert!(
+            !e.check("corp.example", "A", &some_client).is_blocked(),
+            "empty modifier must not match-all: {rule:?}"
+        );
+    }
+    // The non-empty form still works.
+    let e = compile_one("||corp.example^$client=10.0.0.1");
+    let target = ClientInfo {
+        ip: Some("10.0.0.1".parse().unwrap()),
+        ..Default::default()
+    };
+    let other = ClientInfo {
+        ip: Some("10.0.0.2".parse().unwrap()),
+        ..Default::default()
+    };
+    assert!(e.check("corp.example", "A", &target).is_blocked());
+    assert!(!e.check("corp.example", "A", &other).is_blocked());
+}
+
+#[test]
+fn cosmetic_rules_are_skipped() {
+    // Cosmetic markers must not be parsed into a bogus domain rule.
+    for rule in [
+        "example.com##.ad-banner",
+        "example.com#@#.ad",
+        "example.com#?#div:has(> .ad)",
+        "example.com#$#body { color: red }",
+        "example.com#%#//scriptlet('foo')",
+        "example.com$$script[data-ad]",
+    ] {
+        let e = compile_one(rule);
+        assert_eq!(e.len(), 0, "cosmetic rule should be skipped: {rule:?}");
+        assert!(
+            !e.check("example.com", "A", &ci()).is_blocked(),
+            "cosmetic rule must not block the domain: {rule:?}"
+        );
+    }
+    // A hosts line with a `##`-style inline comment is NOT mistaken for cosmetic.
+    let e = compile_one("0.0.0.0 ads.example.com ## inline note");
+    assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn non_dns_hostname_patterns_rejected() {
+    for rule in [
+        "||example.com/path^", // URL path
+        "||has space^",        // whitespace
+        "||foo|bar^",          // stray pipe (not a valid host)
+    ] {
+        let e = compile_one(rule);
+        assert_eq!(e.len(), 0, "non-DNS pattern should be rejected: {rule:?}");
+    }
+    // Punycode and underscore service labels remain valid.
+    assert_eq!(compile_one("||xn--80ak6aa92e.com^").len(), 1);
+    assert_eq!(compile_one("||_dmarc.example.com^").len(), 1);
+}
