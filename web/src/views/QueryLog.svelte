@@ -175,9 +175,6 @@
         <td class="resp-col">
           <div class="response-cell">
             <span class="status status-{tone(e)}">{statusLabel(e)}</span>
-            {#if e.rule}
-              <span class="resp-detail mono muted" title={e.rule}>{e.rule}</span>
-            {/if}
             <span class="resp-latency muted" title="Response time">{ms(e.elapsed_ms)}</span>
           </div>
         </td>
@@ -379,14 +376,6 @@
   }
   .status-neutral {
     color: var(--text-dim);
-  }
-  .resp-detail {
-    min-width: 0;
-    max-width: 240px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 0.8rem;
   }
   /* Response time, right-aligned within the cell so the values form a tidy
      column; td padding keeps it clear of the actions column. */
