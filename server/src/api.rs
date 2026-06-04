@@ -98,7 +98,8 @@ pub fn router(state: AppState) -> Router {
             put(update_list).delete(delete_list),
         )
         .route("/api/filters/lists/{id}/refresh", post(refresh_list))
-        .route("/api/clients", get(get_clients).put(put_clients))
+        .route("/api/clients", get(get_clients).post(post_client))
+        .route("/api/clients/{id}", put(put_client).delete(delete_client))
         .route("/api/stats", get(get_stats))
         .route("/api/stats/reset", post(reset_stats))
         .route("/api/querylog", get(get_querylog).delete(clear_querylog))
@@ -809,19 +810,114 @@ pub async fn get_clients(State(state): State<AppState>) -> Json<Vec<ClientConfig
     Json(cfg.clients.clone())
 }
 
+/// Editable fields of a client. The `id` is server-assigned and never part of
+/// the request body — it's allocated on create and taken from the path on update.
+#[derive(Deserialize, ToSchema)]
+pub struct ClientInput {
+    pub name: String,
+    #[serde(default)]
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_true")]
+    pub filtering_enabled: bool,
+}
+
+/// A random hex id not already in use by an existing client.
+fn new_client_id(existing: &[ClientConfig]) -> String {
+    use rand::RngCore;
+    loop {
+        let mut bytes = [0u8; 8];
+        rand::rng().fill_bytes(&mut bytes);
+        let id: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        if !existing.iter().any(|c| c.id == id) {
+            return id;
+        }
+    }
+}
+
 #[utoipa::path(
-    put,
+    post,
     path = "/api/clients",
     tag = "clients",
-    request_body = Vec<ClientConfig>,
-    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+    request_body = ClientInput,
+    responses((status = 200, body = ClientConfig), (status = 400, body = ErrorResponse))
 )]
-pub async fn put_clients(
+pub async fn post_client(
     State(state): State<AppState>,
-    Json(clients): Json<Vec<ClientConfig>>,
+    Json(body): Json<ClientInput>,
+) -> ApiResult<Json<ClientConfig>> {
+    if body.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("client name must not be empty".into()));
+    }
+    let mut cfg = state.config.read().await.clone();
+    let client = ClientConfig {
+        id: new_client_id(&cfg.clients),
+        name: body.name,
+        ids: body.ids,
+        tags: body.tags,
+        filtering_enabled: body.filtering_enabled,
+    };
+    cfg.clients.push(client.clone());
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(client))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/clients/{id}",
+    tag = "clients",
+    params(("id" = String, Path, description = "Client id")),
+    request_body = ClientInput,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = ErrorResponse),
+        (status = 404, body = ErrorResponse)
+    )
+)]
+pub async fn put_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ClientInput>,
+) -> ApiResult<Json<OkResponse>> {
+    if body.name.trim().is_empty() {
+        return Err(ApiError::BadRequest("client name must not be empty".into()));
+    }
+    let mut cfg = state.config.read().await.clone();
+    let client = cfg
+        .clients
+        .iter_mut()
+        .find(|c| c.id == id)
+        .ok_or_else(|| ApiError::NotFound(format!("client {id}")))?;
+    client.name = body.name;
+    client.ids = body.ids;
+    client.tags = body.tags;
+    client.filtering_enabled = body.filtering_enabled;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(OkResponse::ok())
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/clients/{id}",
+    tag = "clients",
+    params(("id" = String, Path, description = "Client id")),
+    responses((status = 200, body = OkResponse), (status = 404, body = ErrorResponse))
+)]
+pub async fn delete_client(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
 ) -> ApiResult<Json<OkResponse>> {
     let mut cfg = state.config.read().await.clone();
-    cfg.clients = clients;
+    let before = cfg.clients.len();
+    cfg.clients.retain(|c| c.id != id);
+    if cfg.clients.len() == before {
+        return Err(ApiError::NotFound(format!("client {id}")));
+    }
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;

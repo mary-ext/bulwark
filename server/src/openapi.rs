@@ -36,7 +36,9 @@ use crate::{api, dto};
         api::delete_list,
         api::refresh_list,
         api::get_clients,
-        api::put_clients,
+        api::post_client,
+        api::put_client,
+        api::delete_client,
         api::get_stats,
         api::reset_stats,
         api::get_querylog,
@@ -63,6 +65,7 @@ use crate::{api, dto};
         api::CheckResponse,
         api::TestUpstream,
         api::TestResult,
+        api::ClientInput,
         // Engine/upstream read-model DTOs.
         dto::StatsResponse,
         dto::TopEntryDto,
