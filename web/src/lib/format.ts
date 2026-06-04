@@ -6,6 +6,32 @@ export function pct(frac: number): string {
   return (frac * 100).toFixed(1) + "%";
 }
 
+/**
+ * Round a list of `counts` to whole-percent shares of `denom` using the
+ * largest-remainder (Hamilton) method, so the displayed integers add up to the
+ * same total the exact shares would (100 when `denom` is the sum of `counts`,
+ * less when `denom` is a larger grand total). Rounding each share independently
+ * with `toFixed(0)` lets the column drift past 100%; this distributes the
+ * leftover points to the rows with the largest fractional remainders instead.
+ */
+export function sharePcts(counts: number[], denom: number): number[] {
+  if (denom <= 0) return counts.map(() => 0);
+  const exact = counts.map((c) => (c / denom) * 100);
+  const floors = exact.map(Math.floor);
+  const target = Math.round(exact.reduce((s, v) => s + v, 0));
+  let leftover = target - floors.reduce((s, v) => s + v, 0);
+  // Hand out the remaining whole points to the largest fractional parts first.
+  const order = exact
+    .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+    .sort((a, b) => b.frac - a.frac);
+  for (const { i } of order) {
+    if (leftover <= 0) break;
+    floors[i] += 1;
+    leftover -= 1;
+  }
+  return floors;
+}
+
 // Reused across every render; instantiating Intl.NumberFormat is comparatively
 // expensive, so keep one per (unit, precision) we display. `style: "unit"` lets
 // the formatter emit the locale-aware unit label ("ms", "μs", "s") for us.

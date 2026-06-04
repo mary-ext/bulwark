@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { num } from "../lib/format";
+  import { num, sharePcts } from "../lib/format";
 
   type Entry = { name: string; count: number };
 
@@ -20,18 +20,20 @@
   } = $props();
 
   const max = $derived(Math.max(1, ...items.map((i) => i.count)));
-  const denom = $derived(total ?? (items.reduce((s, i) => s + i.count, 0) || 1));
+  // Largest-remainder rounding so the shares don't drift past their true total
+  // (100 when summing the items, less when `total` is a larger grand total).
+  const shares = $derived(sharePcts(items.map((i) => i.count), total ?? items.reduce((s, i) => s + i.count, 0)));
 </script>
 
 {#if items.length}
   <ul class="ranked" style="max-height:{maxHeight}px">
-    {#each items as it (it.name)}
+    {#each items as it, i (it.name)}
       <li class="rk-row">
         <span class="rk-name mono" title={it.name}>{it.name}</span>
         <div class="rk-value">
           <div class="rk-meta">
             <span class="rk-count">{num(it.count)}</span>
-            <span class="rk-pct">{((it.count / denom) * 100).toFixed(0)}%</span>
+            <span class="rk-pct">{shares[i]}%</span>
           </div>
           <div class="rk-track">
             <div class="rk-bar" style="width:{(it.count / max) * 100}%;background:{color}"></div>

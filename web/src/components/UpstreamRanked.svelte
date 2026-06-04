@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { num, duration } from "../lib/format";
+  import { num, duration, sharePcts } from "../lib/format";
   import type { TopEntryDto, LatencyPercentilesDto } from "../api/generated";
 
   let {
@@ -48,20 +48,22 @@
   );
 
   const max = $derived(Math.max(1, ...rows.map((r) => r.count)));
-  const denom = $derived(rows.reduce((s, r) => s + r.count, 0) || 1);
+  // Whole-percent query shares that always sum to 100, avoiding the per-row
+  // rounding drift that let the column read over 100%.
+  const shares = $derived(sharePcts(rows.map((r) => r.count), rows.reduce((s, r) => s + r.count, 0)));
 
   const latTitle = (r: Row) => `p50 ${duration(r.p50)} · p90 ${duration(r.p90)} · p99 ${duration(r.p99)}`;
 </script>
 
 {#if rows.length}
   <ul class="ranked" style="max-height:{maxHeight}px">
-    {#each rows as r (r.name)}
+    {#each rows as r, i (r.name)}
       <li class="rk-row">
         <span class="rk-name mono" title={r.name}>{r.name}</span>
         <div class="rk-value">
           <div class="rk-meta">
             <span class="rk-lat" title={latTitle(r)}>{duration(r.p50)}</span>
-            <span class="rk-count">{num(r.count)} · {((r.count / denom) * 100).toFixed(0)}%</span>
+            <span class="rk-count">{num(r.count)} · {shares[i]}%</span>
           </div>
           <div class="rk-track">
             <div class="rk-bar" style="width:{(r.count / max) * 100}%;background:{color}"></div>
