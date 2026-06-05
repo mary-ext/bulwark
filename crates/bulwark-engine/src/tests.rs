@@ -1,7 +1,7 @@
 //! Engine integration tests: full pipeline (filter → cache → upstream) against
 //! an in-process mock UDP upstream.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use bulwark_config::BlockingMode;
 use bulwark_filter::compile_one;
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::rdata::A;
+use hickory_proto::rr::rdata::{A, AAAA};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
@@ -118,6 +118,34 @@ async fn mock_upstream_https(hints: Vec<Ipv4Addr>) -> SocketAddr {
                     q.name().clone(),
                     300,
                     RData::HTTPS(HTTPS(svcb)),
+                ));
+            }
+            let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
+        }
+    });
+    addr
+}
+
+/// A mock upstream that answers every query with an `AAAA <answer_ip>` record.
+async fn mock_upstream_aaaa(answer_ip: Ipv6Addr) -> SocketAddr {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let query = Message::from_vec(&buf[..n]).unwrap();
+            let mut resp = query.clone();
+            resp.metadata.message_type = MessageType::Response;
+            resp.metadata.response_code = ResponseCode::NoError;
+            if let Some(q) = query.queries.first() {
+                resp.answers.push(Record::from_rdata(
+                    q.name().clone(),
+                    300,
+                    RData::AAAA(AAAA(answer_ip)),
                 ));
             }
             let _ = sock.send_to(&resp.to_vec().unwrap(), peer).await;
@@ -332,6 +360,23 @@ async fn blocks_response_on_blocked_https_hint() {
         ResponseCode::NXDomain,
         "a blocked ipv4hint should block the whole response"
     );
+}
+
+#[tokio::test]
+async fn aaaa_answer_is_forwarded_untouched() {
+    // Response-side filtering must never interfere with normal IPv6: an AAAA
+    // answer that matches no rule passes straight through.
+    let v6 = Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111);
+    let up = mock_upstream_aaaa(v6).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    let r = engine
+        .handle(ingest(query("ipv6.example.com.", RecordType::AAAA)), local())
+        .await
+        .into_message();
+    assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(r.answers.len(), 1);
+    assert!(matches!(&r.answers[0].data, RData::AAAA(AAAA(ip)) if *ip == v6));
 }
 
 #[tokio::test]
