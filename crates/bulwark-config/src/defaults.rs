@@ -13,9 +13,6 @@ pub(crate) fn five() -> u64 {
 pub(crate) fn ten() -> u32 {
     10
 }
-pub(crate) fn sixty() -> u64 {
-    60
-}
 pub(crate) fn btrue() -> bool {
     true
 }

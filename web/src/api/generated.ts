@@ -116,8 +116,6 @@ export type StatsConfig = {
 export type UpstreamsConfig = {
     /** Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames. */
     bootstrap?: string[];
-    /** Interval between background latency probes (seconds); 0 disables probing. */
-    probe_interval_secs?: number;
     /** Freeform upstream list: one spec per line. Lines starting with `#` are
     comments and blank lines are ignored — both are preserved verbatim so
     you can annotate and toggle entries by commenting them out. e.g.

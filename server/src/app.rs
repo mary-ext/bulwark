@@ -115,9 +115,13 @@ pub async fn build_pool(cfg: &Config) -> anyhow::Result<UpstreamPool> {
         bootstrap: cfg.upstreams.bootstrap.clone(),
         ..Default::default()
     };
-    UpstreamPool::build(&entries, settings)
+    let mut pool = UpstreamPool::build(&entries, settings)
         .await
-        .context("building upstream pool")
+        .context("building upstream pool")?;
+    // Each upstream drives its own probe schedule; the tasks stop when this pool
+    // is dropped (e.g. replaced on the next config reload).
+    pool.start_probing();
+    Ok(pool)
 }
 
 /// Build a fresh [`EngineState`] from the current config.

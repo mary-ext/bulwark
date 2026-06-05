@@ -79,8 +79,8 @@ async fn main() -> anyhow::Result<()> {
         update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    // Background tasks.
-    spawn_probe_loop(engine.clone(), config.clone());
+    // Background tasks. (Upstream probing is self-driven: the pool spawns one
+    // probe task per upstream in `build_pool`, so there's no global loop here.)
     persist::spawn_stats_snapshotter(engine.clone(), paths.stats.clone(), config.clone());
     persist::spawn_cache_snapshotter(engine.clone(), paths.cache_snapshot.clone());
     persist::spawn_querylog_pruner(store.clone(), config.clone());
@@ -134,21 +134,6 @@ fn init_tracing() {
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
-}
-
-/// Periodically run polite background latency probes against all upstreams.
-fn spawn_probe_loop(engine: Arc<bulwark_engine::Engine>, config: Arc<tokio::sync::RwLock<Config>>) {
-    tokio::spawn(async move {
-        loop {
-            let interval = config.read().await.upstreams.probe_interval_secs;
-            if interval == 0 {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                continue;
-            }
-            tokio::time::sleep(Duration::from_secs(interval)).await;
-            engine.pool().probe_all().await;
-        }
-    });
 }
 
 async fn shutdown_signal() {

@@ -149,12 +149,9 @@
       placeholder={"# Cloudflare\nhttps://cloudflare-dns.com/dns-query\n#tls://one.one.one.one"}
     ></textarea>
 
-    <div class="grid cols-3" style="margin-top:var(--sp-4)">
+    <div class="grid cols-2" style="margin-top:var(--sp-4)">
       <Field label="Query timeout (s)" htmlFor="to">
         <input id="to" type="number" bind:value={cfg.timeout_secs} min="1" />
-      </Field>
-      <Field label="Probe interval (s)" htmlFor="pi">
-        <input id="pi" type="number" bind:value={cfg.probe_interval_secs} min="0" />
       </Field>
       <Field label="Bootstrap servers" htmlFor="bs">
         <input

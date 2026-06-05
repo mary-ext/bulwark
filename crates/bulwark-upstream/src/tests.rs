@@ -210,6 +210,57 @@ async fn prefers_fastest_upstream_after_probing() {
 }
 
 #[tokio::test]
+async fn per_upstream_probe_fires_once_then_defers() {
+    // The pool spawns one probe task per upstream. A never-sampled upstream is
+    // due immediately, so the task probes it once on start — then, now healthy,
+    // it's deferred a full (jittered) window and isn't re-probed right away.
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
+    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+
+    assert_eq!(mock.received.load(Ordering::SeqCst), 0);
+    pool.start_probing();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.received.load(Ordering::SeqCst),
+        1,
+        "a never-sampled upstream is probed once on start"
+    );
+
+    // Now healthy → next probe is ~a minute out, so nothing fires meanwhile.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.received.load(Ordering::SeqCst),
+        1,
+        "a freshly-probed (healthy) upstream is not re-probed within the window"
+    );
+}
+
+#[tokio::test]
+async fn live_query_defers_the_probe() {
+    // A live query refreshes the same health a probe would, so an upstream that
+    // just answered a real query has its probe deferred — this is what lets a
+    // busy upstream stop being probed entirely.
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(7, 7, 7, 7), 0)).await;
+    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+
+    pool.resolve(&make_query("fresh.test.")).await.unwrap();
+    let after_query = mock.received.load(Ordering::SeqCst);
+
+    pool.start_probing();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.received.load(Ordering::SeqCst),
+        after_query,
+        "a freshly-used upstream must not be probed"
+    );
+}
+
+#[tokio::test]
 async fn all_upstreams_down_errors() {
     let dead = spawn_mock(Behaviour::Drop).await;
     let pool = UpstreamPool::build(&[entry(dead.addr)], settings())

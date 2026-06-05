@@ -55,6 +55,39 @@ impl Default for PoolSettings {
     }
 }
 
+/// How long after a healthy sample the next probe is scheduled. Live queries
+/// refresh the same health, so a busy upstream keeps pushing this out and is
+/// effectively never probed — only idle upstreams (e.g. standby fallbacks) get
+/// probed, and only to keep their latency estimate from going stale.
+const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(60);
+
+/// First retry delay after an upstream goes down. A downed upstream gets no live
+/// traffic (it sorts last), so probing is the only thing that can recover it —
+/// hence we retry soon at first, then [`retry_backoff`] doubles the gap on each
+/// further consecutive failure up to [`DOWN_PROBE_MAX`].
+const DOWN_PROBE_BASE: Duration = Duration::from_secs(5);
+
+/// Ceiling on the retry backoff so a long-dead upstream is still re-checked
+/// periodically rather than drifting toward never.
+const DOWN_PROBE_MAX: Duration = Duration::from_secs(300);
+
+/// Exponential backoff for a failing upstream: `DOWN_PROBE_BASE`, doubling on
+/// each consecutive failure, clamped to `DOWN_PROBE_MAX`. `consecutive_failures`
+/// is 1 on the first failure, so the first retry waits the base delay.
+fn retry_backoff(consecutive_failures: u32) -> Duration {
+    // Cap the shift well before it could overflow the seconds count; the `.min`
+    // clamp makes anything past a few steps moot anyway.
+    let steps = consecutive_failures.saturating_sub(1).min(16);
+    Duration::from_secs(DOWN_PROBE_BASE.as_secs() << steps).min(DOWN_PROBE_MAX)
+}
+
+/// Apply ±25% random jitter to a scheduling delay so probes across a fleet of
+/// upstreams de-correlate instead of stampeding in the same tick.
+fn jitter(delay: Duration) -> Duration {
+    let factor = 0.75 + rand::random::<f64>() * 0.5; // [0.75, 1.25)
+    delay.mul_f64(factor)
+}
+
 #[derive(Debug, Clone)]
 struct Health {
     ewma_ms: f64,
@@ -69,6 +102,13 @@ struct Health {
     total_failures: u64,
     last_rtt_ms: Option<f64>,
     last_error: Option<String>,
+    /// When this upstream is next due for a background probe. Rescheduled by
+    /// every probe *and* every live query: a healthy sample pushes it out a full
+    /// window, a failure pushes it out by an exponentially-backed-off (and
+    /// jittered) retry delay. `None` means "due now" — never sampled yet. This is
+    /// the whole self-tuning cadence: busy upstreams keep deferring their probe
+    /// via live traffic, idle ones get kept warm, dead ones back off.
+    next_probe_at: Option<Instant>,
 }
 
 impl Default for Health {
@@ -82,6 +122,7 @@ impl Default for Health {
             total_failures: 0,
             last_rtt_ms: None,
             last_error: None,
+            next_probe_at: None,
         }
     }
 }
@@ -109,6 +150,8 @@ impl Upstream {
         h.consecutive_failures = 0;
         h.up = true;
         h.last_error = None;
+        // Healthy: defer the next probe a full window (jittered to de-sync).
+        h.next_probe_at = Some(Instant::now() + jitter(HEALTHY_PROBE_WINDOW));
     }
 
     fn record_failure(&self, err: &UpstreamError, threshold: u32) {
@@ -120,6 +163,16 @@ impl Upstream {
         if h.consecutive_failures >= threshold {
             h.up = false;
         }
+        // Failing: retry with exponential backoff + jitter so a dead upstream is
+        // probed often at first, then ever less aggressively.
+        h.next_probe_at = Some(Instant::now() + jitter(retry_backoff(h.consecutive_failures)));
+    }
+
+    /// Remaining time until this upstream is next due for a probe, or `None` if
+    /// it's due now (never sampled, or its scheduled time has passed).
+    fn probe_due_in(&self, now: Instant) -> Option<Duration> {
+        let at = self.health.lock().next_probe_at?;
+        (at > now).then(|| at - now)
     }
 
     /// Sort key: healthy upstreams first, then by latency (unknown latency
@@ -207,6 +260,20 @@ pub struct UpstreamPool {
     inflight: Mutex<HashMap<QueryKey, ResolveFuture>>,
     settings: PoolSettings,
     bootstrap: SharedBootstrap,
+    /// One background probe task per upstream, spawned by [`start_probing`].
+    /// Aborted when the pool is dropped (e.g. on config reload) — each task
+    /// holds only an `Arc<Upstream>`, never the pool, so the pool can drop.
+    ///
+    /// [`start_probing`]: UpstreamPool::start_probing
+    probe_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for UpstreamPool {
+    fn drop(&mut self) {
+        for task in &self.probe_tasks {
+            task.abort();
+        }
+    }
 }
 
 impl UpstreamPool {
@@ -230,6 +297,7 @@ impl UpstreamPool {
             inflight: Mutex::new(HashMap::new()),
             settings,
             bootstrap,
+            probe_tasks: Vec::new(),
         })
     }
 
@@ -308,22 +376,56 @@ impl UpstreamPool {
         }
     }
 
-    /// Politely probe every upstream once to refresh latency/health. Intended to
-    /// be called on a timer by the server. Probes run sequentially.
+    /// Politely probe every upstream once to refresh latency/health, regardless
+    /// of staleness. Probes run sequentially.
     pub async fn probe_all(&self) {
         let query = probe_query();
         for up in &self.upstreams {
-            let start = Instant::now();
-            match tokio::time::timeout(self.settings.query_timeout, up.transport.query(&query))
-                .await
-            {
-                Ok(Ok(_)) => up.record_success(start.elapsed(), self.settings.ewma_alpha),
-                Ok(Err(e)) => up.record_failure(&e, self.settings.failure_threshold),
-                Err(_) => {
-                    up.record_failure(&UpstreamError::Timeout, self.settings.failure_threshold)
-                }
-            }
+            probe_once(up, &query, &self.settings).await;
         }
+    }
+
+    /// Spawn one self-scheduling probe task per upstream and keep their handles.
+    ///
+    /// This is what makes the probe cadence *self-tuning and per-upstream* —
+    /// there is no fixed interval and no global sweep. Each task owns its
+    /// upstream's deadline independently: sleep until due, probe, reschedule. So
+    /// a slow probe to one upstream never delays another, a busy upstream keeps
+    /// deferring its probe via live traffic (and is effectively never probed),
+    /// an idle one is kept warm a window at a time, and a down one backs off
+    /// exponentially (see [`retry_backoff`]). Deadlines are jittered to avoid a
+    /// stampede.
+    ///
+    /// Call once after building. The tasks are aborted when the pool is dropped.
+    pub fn start_probing(&mut self) {
+        for up in &self.upstreams {
+            let up = up.clone();
+            let settings = self.settings.clone();
+            self.probe_tasks.push(tokio::spawn(probe_loop(up, settings)));
+        }
+    }
+}
+
+/// A single upstream's probe loop: wait until it's due, probe it, repeat. Reads
+/// the deadline fresh each pass, so a live query that refreshes health while we
+/// sleep simply pushes the next probe out instead of us probing needlessly.
+async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings) {
+    let query = probe_query();
+    loop {
+        match up.probe_due_in(Instant::now()) {
+            Some(remaining) => tokio::time::sleep(remaining).await,
+            None => probe_once(&up, &query, &settings).await,
+        }
+    }
+}
+
+/// Probe a single upstream once and fold the outcome into its health.
+async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings) {
+    let start = Instant::now();
+    match tokio::time::timeout(settings.query_timeout, up.transport.query(query)).await {
+        Ok(Ok(_)) => up.record_success(start.elapsed(), settings.ewma_alpha),
+        Ok(Err(e)) => up.record_failure(&e, settings.failure_threshold),
+        Err(_) => up.record_failure(&UpstreamError::Timeout, settings.failure_threshold),
     }
 }
 
@@ -426,4 +528,30 @@ pub async fn test_spec(
         .await
         .map_err(|_| UpstreamError::Timeout)??;
     Ok(start.elapsed())
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn retry_backoff_doubles_then_caps() {
+        // First failure waits the base delay, then each further consecutive
+        // failure doubles it...
+        assert_eq!(retry_backoff(1), DOWN_PROBE_BASE);
+        assert_eq!(retry_backoff(2), DOWN_PROBE_BASE * 2);
+        assert_eq!(retry_backoff(3), DOWN_PROBE_BASE * 4);
+        // ...until it saturates at the ceiling and stays there.
+        assert_eq!(retry_backoff(100), DOWN_PROBE_MAX);
+        assert!(retry_backoff(u32::MAX) <= DOWN_PROBE_MAX);
+    }
+
+    #[test]
+    fn jitter_stays_within_25_percent() {
+        let base = Duration::from_secs(100);
+        for _ in 0..1000 {
+            let j = jitter(base);
+            assert!(j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25), "{j:?}");
+        }
+    }
 }

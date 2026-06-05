@@ -111,9 +111,6 @@ pub struct UpstreamsConfig {
     /// Per-attempt query timeout (seconds).
     #[serde(default = "five")]
     pub timeout_secs: u64,
-    /// Interval between background latency probes (seconds); 0 disables probing.
-    #[serde(default = "sixty")]
-    pub probe_interval_secs: u64,
 }
 
 impl Default for UpstreamsConfig {
@@ -122,7 +119,6 @@ impl Default for UpstreamsConfig {
             servers: default_upstreams(),
             bootstrap: default_bootstrap(),
             timeout_secs: 5,
-            probe_interval_secs: 60,
         }
     }
 }
