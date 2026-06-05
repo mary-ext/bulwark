@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bulwark_config::BlockingMode;
+use bulwark_config::{BlockingMode, ClientConfig};
 use bulwark_filter::compile_one;
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -475,4 +475,150 @@ async fn servfail_when_no_upstream_answers() {
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
+}
+
+/// An `EngineState` for reload / cross-client tests: compiles `rules`, reuses an
+/// existing `pool`, and uses the given client map. Mirrors `make_engine`'s knobs.
+fn state_with(rules: &str, pool: Arc<UpstreamPool>, clients: ClientMatcher) -> EngineState {
+    EngineState {
+        filter: Arc::new(compile_one(rules)),
+        pool,
+        clients: Arc::new(clients),
+        filtering_enabled: true,
+        blocking_mode: BlockingMode::NxDomain,
+        block_v4: Ipv4Addr::UNSPECIFIED,
+        block_v6: Ipv6Addr::UNSPECIFIED,
+        blocked_ttl: 10,
+    }
+}
+
+#[tokio::test]
+async fn reload_unblocks_cached_cloaked_answer() {
+    // Bug A: a CNAME-cloaked answer is blocked, which caches the *raw* upstream
+    // answer with a Block verdict. Removing the rule (config reload) must
+    // invalidate that verdict by generation: the next query serves the cached raw
+    // answer clean, without going back upstream.
+    let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    let r1 = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r1.metadata.response_code,
+        ResponseCode::NXDomain,
+        "blocked while the rule is active"
+    );
+
+    // Reload with the rule gone (same pool, same cache).
+    engine.swap_state(state_with("", engine.pool(), ClientMatcher::default()));
+
+    let r2 = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r2.metadata.response_code,
+        ResponseCode::NoError,
+        "the reload must un-block the cached answer"
+    );
+    assert!(
+        r2.answers
+            .iter()
+            .any(|a| matches!(&a.data, RData::A(A(ip)) if *ip == Ipv4Addr::new(1, 2, 3, 4))),
+        "the previously-cloaked raw answer is served straight from cache"
+    );
+    assert_eq!(
+        engine.cache().hit_count(),
+        1,
+        "served from the cached raw answer, not re-resolved upstream"
+    );
+}
+
+#[tokio::test]
+async fn reload_blocks_cached_clean_answer() {
+    // Bug A, the security-critical direction: an answer cached clean must start
+    // being blocked as soon as a reload adds a matching rule — not at entry expiry.
+    let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
+    let engine = make_engine("", up).await; // nothing blocked yet
+
+    let r1 = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r1.metadata.response_code,
+        ResponseCode::NoError,
+        "clean while no rule matches"
+    );
+
+    engine.swap_state(state_with(
+        "||tracker.evil.net^",
+        engine.pool(),
+        ClientMatcher::default(),
+    ));
+
+    let r2 = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r2.metadata.response_code,
+        ResponseCode::NXDomain,
+        "the reload must block the now-matching cached answer"
+    );
+    assert_eq!(
+        engine.cache().hit_count(),
+        1,
+        "decided from the cached raw answer, no re-resolve"
+    );
+}
+
+#[tokio::test]
+async fn unfiltered_client_cache_does_not_leak_to_filtered_client() {
+    // Bug B: the cache key carries no client identity. An *unfiltered* client
+    // resolves and caches the raw cloaked answer; a *filtered* client hitting the
+    // same entry must still be blocked — the verdict is re-gated per client, never
+    // served raw from a cache populated by someone who opted out of filtering.
+    let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
+    let engine = make_engine("||tracker.evil.net^", up).await;
+
+    // 127.0.0.2 is a client with filtering disabled; 127.0.0.1 (default) is filtered.
+    let clients = ClientMatcher::build(&[ClientConfig {
+        id: "nofilter".into(),
+        name: "nofilter".into(),
+        ids: vec!["127.0.0.2".into()],
+        tags: vec![],
+        filtering_enabled: false,
+    }]);
+    engine.swap_state(state_with("||tracker.evil.net^", engine.pool(), clients));
+
+    // Unfiltered client resolves first and gets the raw cloaked answer (it opted out).
+    let unfiltered: IpAddr = "127.0.0.2".parse().unwrap();
+    let rb = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), unfiltered)
+        .await
+        .into_message();
+    assert_eq!(
+        rb.metadata.response_code,
+        ResponseCode::NoError,
+        "the unfiltered client is not filtered"
+    );
+
+    // Filtered client hits the same cache entry and must be blocked.
+    let ra = engine
+        .handle(ingest(query("data.brand.com.", RecordType::A)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        ra.metadata.response_code,
+        ResponseCode::NXDomain,
+        "the filtered client must be blocked despite the cached raw answer"
+    );
+    assert_eq!(
+        engine.cache().hit_count(),
+        1,
+        "the filtered client decided from cache, with no second upstream round-trip"
+    );
 }

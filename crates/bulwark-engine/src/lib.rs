@@ -31,7 +31,7 @@ use hickory_proto::rr::rdata::svcb::{SvcParamValue, SVCB};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use crate::block::{block_response, error_response, rewrite_response, Rewritten};
-use crate::cache::{CachedResponse, DnsCache};
+use crate::cache::{CachedResponse, DnsCache, Outcome, ResponseVerdict};
 use crate::clients::{ClientMatcher, ResolvedClient};
 use crate::querylog::{QueryAction, QueryLog, QueryLogEntry};
 use crate::stats::Stats;
@@ -154,6 +154,20 @@ fn hint_block(svcb: &SVCB, filter: &FilterEngine, ci: &ClientInfo<'_>) -> Option
         }
     }
     None
+}
+
+/// Parse the answer records out of a cached response so the response-side filter
+/// can re-run on a hit whose verdict isn't trusted. Cold path only — trusted
+/// (or filtering-off) hits never call this. The wire bytes are our own prior
+/// encoding (and snapshot imports are validated to parse), so `from_vec`
+/// round-trips; an unreachable failure yields no answers, i.e. nothing to block.
+fn cached_answers(resp: &CachedResponse) -> Vec<Record> {
+    match resp {
+        CachedResponse::Wire { bytes, .. } => {
+            Message::from_vec(bytes).map(|m| m.answers).unwrap_or_default()
+        }
+        CachedResponse::Message(m) => m.answers.clone(),
+    }
 }
 
 /// The display label for a response code. Returns a borrowed `&'static str` for
@@ -345,14 +359,67 @@ impl Engine {
             checking_disabled,
         };
         if let Some(hit) = self.cache.get(&key, id) {
+            // Response-side gate. A cache hit holds the *raw* upstream answer, so
+            // before serving it to a filtering client we must establish the answer
+            // is clean — either from a trusted memoised verdict or by re-running
+            // the answer filter for this client. We never serve raw bytes to a
+            // filtering client without that proof (see `cache::ResponseVerdict`).
+            let filtering = state.filtering_enabled && client.filtering_enabled;
+            let block_info: Option<MatchInfo> = if filtering {
+                let client_dependent = state.filter.has_client_dependent_rules();
+                let live_gen = state.filter.content_hash();
+                match &hit.verdict {
+                    // Trusted memo: client-independent and computed under the live
+                    // filter. Reuse it without touching the cached bytes.
+                    Some(v) if !client_dependent && v.generation == live_gen => match &v.outcome {
+                        Outcome::Clean => None,
+                        Outcome::Block(info) => Some(info.clone()),
+                    },
+                    // Untrusted: stale generation, no memo, or client-dependent
+                    // rules in play. Recompute against the cached answer for this
+                    // client. This re-parses the cached wire — the cold path only;
+                    // the trusted-clean hit above stays a pure byte clone.
+                    _ => filter_answers(&state.filter, &client, &cached_answers(&hit.response)),
+                }
+            } else {
+                None
+            };
+
+            // A background refresh may memoise a global verdict only when filtering
+            // is on and no rule's outcome depends on the client.
+            let memoize = state.filtering_enabled && !state.filter.has_client_dependent_rules();
+
+            if let Some(info) = block_info {
+                // Blocked: synthesise a fresh block from the *current* config (not
+                // whatever the cached answer was), so a reload of blocking mode /
+                // TTL takes effect immediately rather than at entry expiry.
+                let Some(query) = lazy.into_message() else {
+                    return self.finalize(formerr(id), QueryAction::Error, log, start);
+                };
+                let resp = block_response(
+                    &query,
+                    state.blocking_mode,
+                    state.block_v4,
+                    state.block_v6,
+                    state.blocked_ttl,
+                );
+                if hit.stale {
+                    self.spawn_refresh(&state, memoize, query, key.clone());
+                }
+                let action = QueryAction::Blocked {
+                    rule: info.rule,
+                    list_id: info.list_id,
+                };
+                return self.finalize(resp, action, log, start);
+            }
+
+            // Clean (or filtering off for this client): serve the cached answer.
             if hit.stale {
-                // Optimistic: refresh in the background (single-flight in the
-                // pool ensures only one upstream request). This is the one cache
-                // hit that needs the full `Message` — to forward upstream. If it
-                // somehow won't re-parse, just skip the refresh and still serve
-                // the cached hit.
+                // Optimistic: refresh in the background (single-flight in the pool
+                // ensures only one upstream request). If the query somehow won't
+                // re-parse, skip the refresh and still serve the cached hit.
                 if let Some(refresh) = lazy.into_message() {
-                    self.spawn_refresh(state.pool.clone(), refresh, key.clone());
+                    self.spawn_refresh(&state, memoize, refresh, key.clone());
                 }
             }
             return match hit.response {
@@ -382,30 +449,68 @@ impl Engine {
 
                 // Response-side filtering: the query name passed the request-side
                 // check, but the answer may point at a blocked target (a cloaked
-                // CNAME, a blocklisted A/AAAA, or an HTTPS/SVCB IP hint). Decide
-                // *before* caching so the cached entry is the block, not the cloaked
-                // answer — otherwise every later cache hit leaks it.
-                if state.filtering_enabled && client.filtering_enabled {
-                    if let Some(info) =
-                        filter_answers(&state.filter, &client, &resolved.message.answers)
-                    {
-                        let resp = block_response(
-                            &query,
-                            state.blocking_mode,
-                            state.block_v4,
-                            state.block_v6,
-                            state.blocked_ttl,
-                        );
-                        self.cache.insert(key, &resp);
-                        let action = QueryAction::Blocked {
-                            rule: info.rule,
-                            list_id: info.list_id,
-                        };
-                        return self.finalize(resp, action, log, start);
+                // CNAME, a blocklisted A/AAAA, or an HTTPS/SVCB IP hint).
+                //
+                // We cache the *raw* upstream answer either way and attach the
+                // verdict as memoised metadata — never a synthetic block. That
+                // keeps a cloaked domain cacheable (no upstream re-fetch on every
+                // query) while letting the block be re-decided per client and
+                // re-synthesised from current config after a reload.
+                let client_filtered = state.filtering_enabled && client.filtering_enabled;
+                let memoize = state.filtering_enabled && !state.filter.has_client_dependent_rules();
+                let generation = state.filter.content_hash();
+
+                // The verdict for *this* client (only when this client is filtered).
+                let this_block = if client_filtered {
+                    filter_answers(&state.filter, &client, &resolved.message.answers)
+                } else {
+                    None
+                };
+
+                if let Some(info) = this_block {
+                    // Blocked for this client. Cache the raw answer — with a global
+                    // verdict when safe so other clients reuse it — then return a
+                    // fresh synthetic block.
+                    if memoize {
+                        let verdict = ResponseVerdict::block(info.clone(), generation);
+                        self.cache
+                            .insert_with_verdict(key, &resolved.message, Some(verdict));
+                    } else {
+                        self.cache.insert(key, &resolved.message);
                     }
+                    let resp = block_response(
+                        &query,
+                        state.blocking_mode,
+                        state.block_v4,
+                        state.block_v6,
+                        state.blocked_ttl,
+                    );
+                    let action = QueryAction::Blocked {
+                        rule: info.rule,
+                        list_id: info.list_id,
+                    };
+                    return self.finalize(resp, action, log, start);
                 }
 
-                self.cache.insert(key, &resolved.message);
+                // Not blocked for this client (or this client is unfiltered). Cache
+                // the raw answer. When a global verdict is memoisable, compute it
+                // even for an unfiltered requester so filtered clients get the fast
+                // path on their first hit rather than re-evaluating every time.
+                if memoize {
+                    let verdict = if client_filtered {
+                        // Already known clean for this — hence every — client.
+                        ResponseVerdict::clean(generation)
+                    } else {
+                        match filter_answers(&state.filter, &client, &resolved.message.answers) {
+                            Some(info) => ResponseVerdict::block(info, generation),
+                            None => ResponseVerdict::clean(generation),
+                        }
+                    };
+                    self.cache
+                        .insert_with_verdict(key, &resolved.message, Some(verdict));
+                } else {
+                    self.cache.insert(key, &resolved.message);
+                }
                 let action = QueryAction::Forwarded {
                     upstream: resolved.upstream,
                 };
@@ -439,12 +544,37 @@ impl Engine {
         }
     }
 
-    /// Spawn a background cache refresh for a stale entry.
-    fn spawn_refresh(&self, pool: Arc<UpstreamPool>, query: Message, key: QueryKey) {
+    /// Spawn a background cache refresh for a stale entry. Re-inserts the raw
+    /// upstream answer; when `memoize` (filtering on, no client-dependent rules)
+    /// it also recomputes the client-independent verdict so the refreshed entry
+    /// keeps its fast path. Otherwise it inserts without a verdict and the next
+    /// filtering hit re-evaluates.
+    fn spawn_refresh(&self, state: &EngineState, memoize: bool, query: Message, key: QueryKey) {
         let cache = self.cache.clone();
+        let pool = state.pool.clone();
+        let filter = state.filter.clone();
+        let generation = state.filter.content_hash();
         tokio::spawn(async move {
             if let Ok(resolved) = pool.resolve(&query).await {
-                cache.insert(key, &resolved.message);
+                if memoize {
+                    // No client context in the background, but `memoize` implies no
+                    // client-dependent rules, so the verdict is identical for every
+                    // client; a placeholder client yields the same result.
+                    let placeholder = ResolvedClient {
+                        ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                        name: None,
+                        tags: Vec::new(),
+                        filtering_enabled: true,
+                    };
+                    let verdict =
+                        match filter_answers(&filter, &placeholder, &resolved.message.answers) {
+                            Some(info) => ResponseVerdict::block(info, generation),
+                            None => ResponseVerdict::clean(generation),
+                        };
+                    cache.insert_with_verdict(key, &resolved.message, Some(verdict));
+                } else {
+                    cache.insert(key, &resolved.message);
+                }
             }
         });
     }

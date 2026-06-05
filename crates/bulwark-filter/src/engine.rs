@@ -85,6 +85,19 @@ pub struct FilterEngine {
     /// silent.
     fallback_sets: Vec<(regex::RegexSet, Vec<u32>)>,
     fallback_individual: Vec<u32>,
+    /// True if any rule carries a `$client=` or `$ctag=` modifier, i.e. its
+    /// verdict can depend on *which* client is asking. Consumers (the response
+    /// cache) use this to decide whether a per-domain verdict can be memoised
+    /// globally or must be recomputed per client. See [`Self::content_hash`].
+    has_client_dependent_rules: bool,
+    /// A stable hash of the rule set's *content* (each rule's source line, list,
+    /// and action). Two engines built from the same rules — in the same process
+    /// or across a no-op reload — produce the same value; any rule add/remove/edit
+    /// changes it. The response cache stamps memoised verdicts with this value and
+    /// treats a mismatch as "recompute", so a filter change transparently
+    /// invalidates stale verdicts. Deterministic (fixed-key hasher), so it is not
+    /// perturbed by per-process hash randomisation.
+    content_hash: u64,
 }
 
 /// Fallback rules are grouped into `RegexSet` chunks of at most this many
@@ -181,6 +194,28 @@ impl FilterEngine {
             }
         }
 
+        // Whether any rule's outcome can vary by client. Computed before we drop
+        // build-time fields (it reads only `mods`, which is retained).
+        let has_client_dependent_rules = rules.iter().any(|r| {
+            r.mods
+                .as_ref()
+                .is_some_and(|m| m.client.is_some() || m.ctag.is_some())
+        });
+
+        // A deterministic content hash over the retained rule fields. `DefaultHasher`
+        // has fixed keys, so the same rules always hash the same — even across a
+        // reload that rebuilds the engine — while any rule change shifts it.
+        let content_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for r in &rules {
+                r.raw.hash(&mut h);
+                r.list_id.hash(&mut h);
+                (r.action as u8).hash(&mut h);
+            }
+            h.finish()
+        };
+
         // The signature strings and index tokens are only needed during
         // compilation; drop them to save memory on large rule sets.
         for rule in rules.iter_mut() {
@@ -196,7 +231,23 @@ impl FilterEngine {
             scan_index,
             fallback_sets,
             fallback_individual,
+            has_client_dependent_rules,
+            content_hash,
         }
+    }
+
+    /// Whether any rule's verdict can depend on the querying client (`$client=`
+    /// or `$ctag=`). When false, a response-side verdict is identical for every
+    /// client and may be memoised globally; when true it must be recomputed per
+    /// client. See the field docs on [`FilterEngine`].
+    pub fn has_client_dependent_rules(&self) -> bool {
+        self.has_client_dependent_rules
+    }
+
+    /// A stable hash of the rule set's content, used as a generation stamp for
+    /// memoised response verdicts. See the field docs on [`FilterEngine`].
+    pub fn content_hash(&self) -> u64 {
+        self.content_hash
     }
 
     /// Number of active rules.

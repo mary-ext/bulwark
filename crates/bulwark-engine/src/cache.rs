@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bulwark_filter::MatchInfo;
 use bulwark_upstream::QueryKey;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use lru::LruCache;
@@ -57,11 +58,62 @@ enum Stored {
     Message(Arc<Message>),
 }
 
+/// A memoised response-side filtering verdict for a cached *raw* upstream answer,
+/// stamped with the filter generation it was computed under.
+///
+/// The cache stores the answer the upstream actually returned (never a synthetic
+/// block), plus — when it can be trusted globally — the verdict the response-side
+/// filter reached for it. This lets the engine re-decide blocking per client and
+/// per config without re-fetching upstream: a clean answer is served as-is, a
+/// blocked one is re-synthesised fresh from the *current* blocking config. The
+/// generation pins the verdict to the filter that produced it, so a config change
+/// transparently invalidates it (the engine recomputes on mismatch).
+#[derive(Clone)]
+pub struct ResponseVerdict {
+    /// The filter [`content_hash`](bulwark_filter::FilterEngine::content_hash)
+    /// this verdict was computed under. A mismatch against the live filter means
+    /// it's stale and must be recomputed.
+    pub generation: u64,
+    pub outcome: Outcome,
+}
+
+/// Whether a cached answer is blocked by the response-side filter.
+#[derive(Clone)]
+pub enum Outcome {
+    /// The answer chain matched no blocklist rule.
+    Clean,
+    /// The answer is blocked; carries the matching rule for logging/attribution.
+    Block(MatchInfo),
+}
+
+impl ResponseVerdict {
+    /// A clean verdict stamped with `generation`.
+    pub fn clean(generation: u64) -> Self {
+        Self {
+            generation,
+            outcome: Outcome::Clean,
+        }
+    }
+
+    /// A block verdict (carrying the matched rule) stamped with `generation`.
+    pub fn block(info: MatchInfo, generation: u64) -> Self {
+        Self {
+            generation,
+            outcome: Outcome::Block(info),
+        }
+    }
+}
+
 struct Entry {
     stored: Stored,
     stored_at: Instant,
     /// Effective (clamped) TTL in seconds.
     ttl: u32,
+    /// Memoised response-side verdict (with its generation), or `None` when it
+    /// must be (re)computed on the next hit: snapshot-restored entries, refreshes
+    /// or inserts made while client-dependent rules are active, or answers cached
+    /// by an unfiltered client. `None` is always safe — it forces re-evaluation.
+    verdict: Option<ResponseVerdict>,
 }
 
 impl Entry {
@@ -101,6 +153,11 @@ pub struct CacheHit {
     /// True when this is a stale (expired) answer served optimistically; the
     /// caller should trigger a background refresh.
     pub stale: bool,
+    /// The memoised response-side verdict for this entry, if any. The engine
+    /// gates on this before serving raw bytes to a filtering client (see
+    /// [`ResponseVerdict`]); `None`, or a stale generation, forces a per-client
+    /// recompute against the cached answer.
+    pub verdict: Option<ResponseVerdict>,
 }
 
 /// Summarise an answer record as e.g. `"A 1.2.3.4"` for the query log.
@@ -251,7 +308,7 @@ impl DnsCache {
         // (pointer-only) handle to the stored form; the actual byte clone + TTL
         // patch (or message clone) is deferred until after the guard is dropped
         // so concurrent hits don't serialize on it.
-        let (stored, ttl, stale) = {
+        let (stored, ttl, stale, verdict) = {
             let mut map = self.shard(key).lock();
             let Some(entry) = map.get(key) else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -261,11 +318,14 @@ impl DnsCache {
             let age = entry.age_secs();
             let entry_ttl = entry.ttl;
             // Cloning `stored` (Arc bumps) ends the borrow of `entry`, freeing
-            // `map` for the `pop` below.
+            // `map` for the `pop` below. The verdict comes along so the engine can
+            // gate on it without re-locking; `Clean`/`None` are alloc-free clones,
+            // and a `Block` clone (rarer) is just the matched rule.
             let stored = entry.stored.clone();
+            let verdict = entry.verdict.clone();
 
             if age < entry_ttl {
-                (stored, (entry_ttl - age).max(1), false)
+                (stored, (entry_ttl - age).max(1), false, verdict)
             } else {
                 // Expired. Optionally serve stale within the configured window
                 // (serve-stale is on iff `stale_max_age > 0`). The window is
@@ -273,7 +333,7 @@ impl DnsCache {
                 // lifetime of a stale-servable entry.
                 let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
                 if age.saturating_sub(entry_ttl) < stale_max_age {
-                    (stored, STALE_SERVE_TTL, true)
+                    (stored, STALE_SERVE_TTL, true, verdict)
                 } else {
                     // Too old / not optimistic: drop it and report a miss.
                     map.pop(key);
@@ -305,11 +365,35 @@ impl DnsCache {
                 CachedResponse::Message(m)
             }
         };
-        Some(CacheHit { response, stale })
+        Some(CacheHit {
+            response,
+            stale,
+            verdict,
+        })
     }
 
-    /// Insert a response. No-op if the response isn't cacheable.
+    /// Insert a raw upstream response with no memoised verdict. The next
+    /// filtering hit will (re)compute one. Used by background refreshes, by
+    /// inserts made while client-dependent rules are active, and by tests.
+    /// No-op if the response isn't cacheable.
     pub fn insert(&self, key: QueryKey, message: &Message) {
+        self.insert_inner(key, message, None);
+    }
+
+    /// Insert a raw upstream response together with a memoised response-side
+    /// verdict (which carries its filter generation). Only safe when the verdict
+    /// is client-independent (the filter has no `$client`/`$ctag` rules); the
+    /// engine enforces that. No-op if the response isn't cacheable.
+    pub fn insert_with_verdict(
+        &self,
+        key: QueryKey,
+        message: &Message,
+        verdict: Option<ResponseVerdict>,
+    ) {
+        self.insert_inner(key, message, verdict);
+    }
+
+    fn insert_inner(&self, key: QueryKey, message: &Message, verdict: Option<ResponseVerdict>) {
         if !self.is_enabled() {
             return;
         }
@@ -335,6 +419,7 @@ impl DnsCache {
             stored,
             stored_at: Instant::now(),
             ttl,
+            verdict,
         };
         self.shard(&key).lock().put(key, entry);
     }
@@ -461,6 +546,10 @@ impl DnsCache {
                 stored: parsed.stored,
                 stored_at,
                 ttl: parsed.ttl,
+                // Snapshots persist only the raw answer, never a verdict: the
+                // filter config may have changed across the restart, so the first
+                // filtering hit recomputes (see `verdict` field docs).
+                verdict: None,
             };
             self.shard(&parsed.key).lock().put(parsed.key, entry);
             restored += 1;
