@@ -84,6 +84,21 @@ fn norm_domain(d: &str) -> String {
     d.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// If `s` is an IP literal — bare (`1.2.3.4`, `1234::cdef`) or bracketed
+/// (`[1234::cdef]`) — return its canonical [`IpAddr`] string. IP rules are
+/// stored under this canonical key so they match the resolved addresses the
+/// response-side filter checks (also via `IpAddr::to_string()`). A bare v6
+/// literal is the *only* way to block a v6 address — [`is_dns_hostname`] rejects
+/// the colons — matching AdGuard Home, which accepts bare-IP blocklist lines for
+/// both families.
+fn ip_literal(s: &str) -> Option<String> {
+    let bare = s
+        .strip_prefix('[')
+        .and_then(|r| r.strip_suffix(']'))
+        .unwrap_or(s);
+    bare.parse::<IpAddr>().ok().map(|ip| ip.to_string())
+}
+
 /// Does `line` carry an AdGuard/ABP **cosmetic** marker — element hiding (`##`,
 /// `#@#`), extended-CSS (`#?#`), CSS injection (`#$#`), scriptlets (`#%#`), their
 /// `@`-exception variants, or HTML filtering (`$$`, `$@$`)? Such rules act on
@@ -379,6 +394,13 @@ fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
         let re = build_wildcard_regex(s, subdomain_anchor, start_anchor, end_anchor)?;
         let tokens = crate::token::tokenize_pattern_safe(&s.to_ascii_lowercase());
         return Ok((Pattern::Wildcard(re), tokens));
+    }
+
+    // An IP literal (v4 or v6, bare or bracketed) is an exact-host rule, not a
+    // domain — block by resolved address, with anchors ignored as meaningless.
+    // This must come before `is_dns_hostname`, which rejects the v6 colons.
+    if let Some(ip) = ip_literal(s) {
+        return Ok((Pattern::Exact(ip), Vec::new()));
     }
 
     let domain = norm_domain(s);

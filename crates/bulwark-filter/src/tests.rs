@@ -74,6 +74,34 @@ fn hosts_noise_and_localhost_skipped() {
 }
 
 #[test]
+fn bare_ip_literals_block_exactly() {
+    // Bare IP lines (v4 and v6) compile to exact-address blocks — the rule form
+    // AdGuard Home uses for response-side IP blocking. The v6 line is only
+    // possible because IP literals bypass the DNS-hostname check.
+    let e = compile_one("1.2.3.4\n1234::cdef\n");
+    assert!(e.check("1.2.3.4", "A", &ci()).is_blocked());
+    assert!(e.check("1234::cdef", "AAAA", &ci()).is_blocked());
+    // Exact match only: a different address in the same family is not blocked.
+    assert!(!e.check("1.2.3.5", "A", &ci()).is_blocked());
+    assert!(!e.check("1234::cdee", "AAAA", &ci()).is_blocked());
+}
+
+#[test]
+fn v6_literal_is_canonicalized() {
+    // The rule's non-canonical v6 form must still match the canonical string the
+    // resolver produces via `Ipv6Addr::to_string()` (compressed, lowercase).
+    let e = compile_one("2001:0DB8:0000:0000:0000:0000:0000:0001");
+    assert!(e.check("2001:db8::1", "AAAA", &ci()).is_blocked());
+}
+
+#[test]
+fn bracketed_and_anchored_v6_rule() {
+    // `||[v6]^` (bracketed, anchored) is accepted and matches the bare address.
+    let e = compile_one("||[2606:4700::1111]^");
+    assert!(e.check("2606:4700::1111", "AAAA", &ci()).is_blocked());
+}
+
+#[test]
 fn hosts_rewrite_to_ip() {
     let e = compile_one("192.168.1.5 router.lan");
     match e.check("router.lan", "A", &ci()) {

@@ -380,6 +380,26 @@ async fn aaaa_answer_is_forwarded_untouched() {
 }
 
 #[tokio::test]
+async fn blocks_response_by_resolved_ipv6() {
+    // Symmetry with the v4 path (and parity with AdGuard Home, which blocks on a
+    // bare `1234::cdef` line): an AAAA answer resolving to a blocklisted v6
+    // address is blocked just like a blocklisted A.
+    let v6 = Ipv6Addr::new(0x1234, 0, 0, 0, 0, 0, 0, 0xcdef);
+    let up = mock_upstream_aaaa(v6).await;
+    let engine = make_engine("1234::cdef", up).await;
+
+    let r = engine
+        .handle(ingest(query("sneaky6.com.", RecordType::AAAA)), local())
+        .await
+        .into_message();
+    assert_eq!(
+        r.metadata.response_code,
+        ResponseCode::NXDomain,
+        "an answer resolving to a blocked v6 address should be blocked"
+    );
+}
+
+#[tokio::test]
 async fn clean_https_hint_is_forwarded() {
     // An HTTPS record whose hints are all clean must pass through untouched.
     let up = mock_upstream_https(vec![Ipv4Addr::new(1, 1, 1, 1)]).await;
