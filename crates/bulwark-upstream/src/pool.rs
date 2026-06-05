@@ -88,6 +88,32 @@ fn jitter(delay: Duration) -> Duration {
     delay.mul_f64(factor)
 }
 
+/// How long to wait before re-probing a *healthy idle* upstream, from its own
+/// smoothed latency and the lowest among its healthy peers.
+///
+/// With several upstreams configured, some are simply always slower and will
+/// never be picked. There's no point polling them as often as the contenders —
+/// so an upstream competitive with the leader keeps the base cadence, while one
+/// that sits progressively further behind gets a progressively longer interval
+/// (up to 8×). The leader itself is kept fresh; we only back off the also-rans,
+/// and only by latency margin, so a backup that's *close* still stays warm for
+/// failover. Unknown latency (just came up) counts as competitive so we sample
+/// it properly first.
+fn idle_probe_window(self_ewma: Option<f64>, best_ewma: Option<f64>) -> Duration {
+    let mult = match (self_ewma, best_ewma) {
+        (Some(mine), Some(best)) => match mine / best.max(1.0) {
+            // Floor `best` at 1ms so a near-zero leader (e.g. a LAN resolver)
+            // can't blow the ratio up to infinity.
+            r if r <= 1.5 => 1,
+            r if r <= 3.0 => 2,
+            r if r <= 6.0 => 4,
+            _ => 8,
+        },
+        _ => 1,
+    };
+    HEALTHY_PROBE_WINDOW * mult
+}
+
 #[derive(Debug, Clone)]
 struct Health {
     ewma_ms: f64,
@@ -166,6 +192,29 @@ impl Upstream {
         // Failing: retry with exponential backoff + jitter so a dead upstream is
         // probed often at first, then ever less aggressively.
         h.next_probe_at = Some(Instant::now() + jitter(retry_backoff(h.consecutive_failures)));
+    }
+
+    /// This upstream's smoothed latency, but only if it's currently a viable
+    /// pick — healthy and actually sampled. `None` for a down or never-sampled
+    /// upstream (which shouldn't count toward "the fastest peer").
+    fn healthy_ewma(&self) -> Option<f64> {
+        let h = self.health.lock();
+        (h.up && h.samples > 0).then_some(h.ewma_ms)
+    }
+
+    /// After a probe, stretch this upstream's next-probe deadline if it's clearly
+    /// outclassed by a faster peer — a perennial loser needn't be polled as often
+    /// (see [`idle_probe_window`]). Only adjusts a healthy upstream; a down one
+    /// keeps the failure backoff that `record_failure` just set.
+    fn defer_if_outclassed(&self, peers: &[Arc<Upstream>]) {
+        let Some(mine) = self.healthy_ewma() else {
+            return;
+        };
+        // Fastest healthy peer (starting from `mine`, so an upstream that is the
+        // best — or the only one up — compares against itself and stays at base).
+        let best = peers.iter().filter_map(|u| u.healthy_ewma()).fold(mine, f64::min);
+        let window = idle_probe_window(Some(mine), Some(best));
+        self.health.lock().next_probe_at = Some(Instant::now() + jitter(window));
     }
 
     /// Remaining time until this upstream is next due for a probe, or `None` if
@@ -400,8 +449,12 @@ impl UpstreamPool {
     pub fn start_probing(&mut self) {
         for up in &self.upstreams {
             let up = up.clone();
+            // Each task can see all upstreams so it can rank itself against the
+            // fastest and back off if it's clearly outclassed.
+            let peers = self.upstreams.clone();
             let settings = self.settings.clone();
-            self.probe_tasks.push(tokio::spawn(probe_loop(up, settings)));
+            self.probe_tasks
+                .push(tokio::spawn(probe_loop(up, peers, settings)));
         }
     }
 }
@@ -409,12 +462,16 @@ impl UpstreamPool {
 /// A single upstream's probe loop: wait until it's due, probe it, repeat. Reads
 /// the deadline fresh each pass, so a live query that refreshes health while we
 /// sleep simply pushes the next probe out instead of us probing needlessly.
-async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings) {
+/// After a probe, a healthy-but-outclassed upstream stretches its own interval.
+async fn probe_loop(up: Arc<Upstream>, peers: Vec<Arc<Upstream>>, settings: PoolSettings) {
     let query = probe_query();
     loop {
         match up.probe_due_in(Instant::now()) {
             Some(remaining) => tokio::time::sleep(remaining).await,
-            None => probe_once(&up, &query, &settings).await,
+            None => {
+                probe_once(&up, &query, &settings).await;
+                up.defer_if_outclassed(&peers);
+            }
         }
     }
 }
@@ -553,5 +610,21 @@ mod backoff_tests {
             let j = jitter(base);
             assert!(j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25), "{j:?}");
         }
+    }
+
+    #[test]
+    fn idle_window_stretches_for_perennial_losers() {
+        let base = HEALTHY_PROBE_WINDOW;
+        // The leader (or anyone within 1.5×) keeps the base cadence.
+        assert_eq!(idle_probe_window(Some(20.0), Some(20.0)), base);
+        assert_eq!(idle_probe_window(Some(28.0), Some(20.0)), base); // 1.4×
+        // The further behind, the longer the interval...
+        assert_eq!(idle_probe_window(Some(50.0), Some(20.0)), base * 2); // 2.5×
+        assert_eq!(idle_probe_window(Some(100.0), Some(20.0)), base * 4); // 5×
+        assert_eq!(idle_probe_window(Some(400.0), Some(20.0)), base * 8); // 20×
+        // A just-came-up upstream with no estimate yet is probed at base cadence.
+        assert_eq!(idle_probe_window(None, Some(20.0)), base);
+        // A near-zero leader can't blow the ratio up to infinity.
+        assert_eq!(idle_probe_window(Some(5.0), Some(0.0)), base * 4);
     }
 }
