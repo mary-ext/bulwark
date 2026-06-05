@@ -88,6 +88,17 @@ fn jitter(delay: Duration) -> Duration {
     delay.mul_f64(factor)
 }
 
+/// Spread for the *first* probe of each upstream after a pool is built. That
+/// probe is scheduled at a uniform-random point in `[0, this)`, so a pool of N
+/// upstreams — at cold start *or* on every config reload — doesn't fire N probes
+/// at the same instant.
+const STARTUP_PROBE_SPREAD: Duration = Duration::from_secs(2);
+
+/// A uniform-random delay in `[0, max)`.
+fn startup_delay(max: Duration) -> Duration {
+    max.mul_f64(rand::random::<f64>())
+}
+
 /// How long to wait before re-probing a *healthy idle* upstream, from its own
 /// smoothed latency and the lowest among its healthy peers.
 ///
@@ -215,6 +226,17 @@ impl Upstream {
         let best = peers.iter().filter_map(|u| u.healthy_ewma()).fold(mine, f64::min);
         let window = idle_probe_window(Some(mine), Some(best));
         self.health.lock().next_probe_at = Some(Instant::now() + jitter(window));
+    }
+
+    /// Give a not-yet-scheduled upstream its first probe at a random point within
+    /// the startup spread, so a freshly built pool of N doesn't probe all at
+    /// once. A no-op when the schedule was carried over from a prior pool (on
+    /// config reload) — we don't want a reload to re-probe upstreams we know.
+    fn schedule_initial_probe(&self) {
+        let mut h = self.health.lock();
+        if h.next_probe_at.is_none() {
+            h.next_probe_at = Some(Instant::now() + startup_delay(STARTUP_PROBE_SPREAD));
+        }
     }
 
     /// Remaining time until this upstream is next due for a probe, or `None` if
@@ -448,6 +470,9 @@ impl UpstreamPool {
     /// Call once after building. The tasks are aborted when the pool is dropped.
     pub fn start_probing(&mut self) {
         for up in &self.upstreams {
+            // Spread the first probe across the startup window (no-op for an
+            // upstream whose schedule was carried over by `adopt_health_from`).
+            up.schedule_initial_probe();
             let up = up.clone();
             // Each task can see all upstreams so it can rank itself against the
             // fastest and back off if it's clearly outclassed.
@@ -455,6 +480,28 @@ impl UpstreamPool {
             let settings = self.settings.clone();
             self.probe_tasks
                 .push(tokio::spawn(probe_loop(up, peers, settings)));
+        }
+    }
+
+    /// Carry accumulated health — latency, success/failure tallies, up/down
+    /// state, last error, and the probe schedule — from a previous pool for every
+    /// upstream whose spec is unchanged. Used on config reload so a settings
+    /// tweak doesn't reset the per-upstream stats or trigger a probe storm.
+    /// Upstreams new in this pool keep their blank health and get a fresh
+    /// (jittered) first probe via [`start_probing`].
+    ///
+    /// Call after [`build`](Self::build) and before [`start_probing`](Self::start_probing).
+    pub fn adopt_health_from(&self, old: &UpstreamPool) {
+        let prior: HashMap<&str, &Arc<Upstream>> = old
+            .upstreams
+            .iter()
+            .map(|u| (u.spec.display.as_str(), u))
+            .collect();
+        for up in &self.upstreams {
+            if let Some(old_up) = prior.get(up.spec.display.as_str()) {
+                let carried = old_up.health.lock().clone();
+                *up.health.lock() = carried;
+            }
         }
     }
 }

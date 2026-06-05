@@ -100,8 +100,10 @@ pub fn compile_filters(
     (engine, counts)
 }
 
-/// Build the upstream pool from the enabled configured upstreams.
-pub async fn build_pool(cfg: &Config) -> anyhow::Result<UpstreamPool> {
+/// Build the upstream pool from the enabled configured upstreams. On a config
+/// reload, pass the outgoing pool as `prev` so per-upstream health/stats are
+/// carried over for upstreams whose spec is unchanged.
+pub async fn build_pool(cfg: &Config, prev: Option<&UpstreamPool>) -> anyhow::Result<UpstreamPool> {
     let entries: Vec<PoolEntry> = cfg
         .upstreams
         .active_specs()
@@ -118,16 +120,27 @@ pub async fn build_pool(cfg: &Config) -> anyhow::Result<UpstreamPool> {
     let mut pool = UpstreamPool::build(&entries, settings)
         .await
         .context("building upstream pool")?;
+    // Inherit stats + probe schedule from the previous pool (unchanged upstreams)
+    // before probing starts, so a reload neither wipes the UI's per-upstream
+    // numbers nor re-probes servers we already know.
+    if let Some(prev) = prev {
+        pool.adopt_health_from(prev);
+    }
     // Each upstream drives its own probe schedule; the tasks stop when this pool
     // is dropped (e.g. replaced on the next config reload).
     pool.start_probing();
     Ok(pool)
 }
 
-/// Build a fresh [`EngineState`] from the current config.
-pub async fn build_engine_state(cfg: &Config, paths: &Paths) -> anyhow::Result<EngineState> {
+/// Build a fresh [`EngineState`] from the current config. On reload, `prev` is
+/// the outgoing pool whose health is carried forward (see [`build_pool`]).
+pub async fn build_engine_state(
+    cfg: &Config,
+    paths: &Paths,
+    prev: Option<&UpstreamPool>,
+) -> anyhow::Result<EngineState> {
     let (filter, _counts) = compile_filters(cfg, paths);
-    let pool = Arc::new(build_pool(cfg).await?);
+    let pool = Arc::new(build_pool(cfg, prev).await?);
     let clients = Arc::new(ClientMatcher::build(&cfg.clients));
     Ok(EngineState {
         filter: Arc::new(filter),
@@ -143,7 +156,7 @@ pub async fn build_engine_state(cfg: &Config, paths: &Paths) -> anyhow::Result<E
 
 /// Build the engine + cache/log/stats at startup from config.
 pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Engine>> {
-    let state = build_engine_state(cfg, paths).await?;
+    let state = build_engine_state(cfg, paths, None).await?;
     let cache = Arc::new(DnsCache::new(
         cfg.cache.size,
         cfg.cache.min_ttl_secs,
@@ -187,7 +200,12 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
     // return the error with the running engine and stored config untouched, so a
     // disk problem can't leave the engine running a config the API reported as
     // failed (and that isn't on disk for the next restart).
-    let engine_state = build_engine_state(&new_cfg, &state.paths).await?;
+    let engine_state = {
+        // Hold the outgoing pool just long enough to inherit its health; it's
+        // still the live one until `swap_state` below.
+        let prev_pool = state.engine.pool();
+        build_engine_state(&new_cfg, &state.paths, Some(prev_pool.as_ref())).await?
+    };
     new_cfg.save(&state.paths.config).context("saving config")?;
     state.engine.swap_state(engine_state);
 

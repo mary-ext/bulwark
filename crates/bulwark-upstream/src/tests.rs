@@ -209,11 +209,20 @@ async fn prefers_fastest_upstream_after_probing() {
     assert!(fast_stat.avg_rtt_ms.unwrap() < 50.0);
 }
 
+/// Poll `cond` until it's true or `timeout` elapses (panicking on timeout).
+async fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while !cond() {
+        assert!(start.elapsed() < timeout, "condition not met within {timeout:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn per_upstream_probe_fires_once_then_defers() {
     // The pool spawns one probe task per upstream. A never-sampled upstream is
-    // due immediately, so the task probes it once on start — then, now healthy,
-    // it's deferred a full (jittered) window and isn't re-probed right away.
+    // due within the (jittered) startup spread, so the task probes it once —
+    // then, now healthy, it's deferred a full window and isn't re-probed soon.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
     let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -222,7 +231,11 @@ async fn per_upstream_probe_fires_once_then_defers() {
     assert_eq!(mock.received.load(Ordering::SeqCst), 0);
     pool.start_probing();
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for(
+        || mock.received.load(Ordering::SeqCst) >= 1,
+        Duration::from_secs(4),
+    )
+    .await;
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
         1,
@@ -235,6 +248,45 @@ async fn per_upstream_probe_fires_once_then_defers() {
         mock.received.load(Ordering::SeqCst),
         1,
         "a freshly-probed (healthy) upstream is not re-probed within the window"
+    );
+}
+
+#[tokio::test]
+async fn reload_carries_upstream_stats() {
+    // Simulate a config reload: build a pool, accumulate some stats, then build a
+    // replacement and have it adopt the old pool's health. The unchanged upstream
+    // keeps its tallies; a brand-new upstream starts blank.
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(6, 6, 6, 6), 0)).await;
+    let old = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+    old.resolve(&make_query("stats.test.")).await.unwrap();
+    let old_stat = old.stats().into_iter().next().unwrap();
+    assert_eq!(old_stat.total_queries, 1);
+
+    // New pool: same upstream plus an added one (a different mock address).
+    let added = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
+    let new = UpstreamPool::build(&[entry(mock.addr), entry(added.addr)], settings())
+        .await
+        .unwrap();
+    new.adopt_health_from(&old);
+
+    let stats = new.stats();
+    let carried = stats
+        .iter()
+        .find(|s| s.spec.contains(&mock.addr.to_string()))
+        .unwrap();
+    assert_eq!(
+        carried.total_queries, 1,
+        "an unchanged upstream keeps its stats across reload"
+    );
+    let fresh = stats
+        .iter()
+        .find(|s| s.spec.contains(&added.addr.to_string()))
+        .unwrap();
+    assert_eq!(
+        fresh.total_queries, 0,
+        "a newly added upstream starts with blank stats"
     );
 }
 
