@@ -291,6 +291,30 @@ async fn reload_carries_upstream_stats() {
 }
 
 #[tokio::test]
+async fn reload_matches_upstreams_by_endpoint_not_spelling() {
+    // `entry()` spells the upstream `udp://127.0.0.1:PORT`; re-spell it bare on
+    // "reload" as `127.0.0.1:PORT`. It's the same endpoint, so stats carry over.
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(3, 3, 3, 3), 0)).await;
+    let old = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+    old.resolve(&make_query("respell.test.")).await.unwrap();
+
+    let bare = PoolEntry {
+        spec: mock.addr.to_string(), // no `udp://` scheme
+        name: None,
+    };
+    let new = UpstreamPool::build(&[bare], settings()).await.unwrap();
+    new.adopt_health_from(&old);
+
+    assert_eq!(
+        new.stats().into_iter().next().unwrap().total_queries,
+        1,
+        "a re-spelled upstream is recognized as the same and keeps its stats"
+    );
+}
+
+#[tokio::test]
 async fn live_query_defers_the_probe() {
     // A live query refreshes the same health a probe would, so an upstream that
     // just answered a real query has its probe deferred — this is what lets a

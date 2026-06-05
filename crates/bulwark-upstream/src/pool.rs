@@ -492,13 +492,16 @@ impl UpstreamPool {
     ///
     /// Call after [`build`](Self::build) and before [`start_probing`](Self::start_probing).
     pub fn adopt_health_from(&self, old: &UpstreamPool) {
-        let prior: HashMap<&str, &Arc<Upstream>> = old
+        // Key on the canonical endpoint identity, not the raw spec text, so a
+        // cosmetic rewrite (`8.8.8.8` → `udp://8.8.8.8`) still counts as the same
+        // upstream and keeps its stats.
+        let prior: HashMap<String, &Arc<Upstream>> = old
             .upstreams
             .iter()
-            .map(|u| (u.spec.display.as_str(), u))
+            .map(|u| (u.spec.identity(), u))
             .collect();
         for up in &self.upstreams {
-            if let Some(old_up) = prior.get(up.spec.display.as_str()) {
+            if let Some(old_up) = prior.get(&up.spec.identity()) {
                 let carried = old_up.health.lock().clone();
                 *up.health.lock() = carried;
             }

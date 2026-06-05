@@ -139,6 +139,21 @@ impl UpstreamSpec {
     pub fn server_name(&self) -> String {
         self.host.to_string()
     }
+
+    /// A canonical identity for the endpoint this spec resolves to, independent
+    /// of cosmetic spelling — `8.8.8.8`, `udp://8.8.8.8`, and `8.8.8.8:53` all
+    /// share one identity. Used to match the same upstream across config reloads
+    /// so its accumulated health/stats carry over even if the line was retyped.
+    pub fn identity(&self) -> String {
+        let host = match &self.host {
+            // Bracket IPv6 so its colons can't blur the host/port boundary.
+            Host::Ip(ip @ IpAddr::V6(_)) => format!("[{ip}]"),
+            // Hostnames are case-insensitive; IPv4 is unaffected by lowercasing.
+            h => h.to_string().to_lowercase(),
+        };
+        let h3 = if self.force_http3 { "+h3" } else { "" };
+        format!("{}://{host}:{}{}{h3}", self.kind.as_str(), self.port, self.path)
+    }
 }
 
 impl fmt::Display for UpstreamSpec {
@@ -255,5 +270,27 @@ mod tests {
         let s = UpstreamSpec::parse("2606:4700:4700::1111").unwrap();
         assert_eq!(s.host, Host::Ip("2606:4700:4700::1111".parse().unwrap()));
         assert_eq!(s.port, 53);
+    }
+
+    #[test]
+    fn identity_ignores_cosmetic_spelling() {
+        let id = |s: &str| UpstreamSpec::parse(s).unwrap().identity();
+        // Same endpoint, three spellings → one identity.
+        assert_eq!(id("8.8.8.8"), id("udp://8.8.8.8"));
+        assert_eq!(id("8.8.8.8"), id("udp://8.8.8.8:53"));
+        // Hostnames compare case-insensitively.
+        assert_eq!(id("tls://Dns.Google"), id("tls://dns.google"));
+        // DoH default path is implied.
+        assert_eq!(id("https://dns.google"), id("https://dns.google/dns-query"));
+    }
+
+    #[test]
+    fn identity_distinguishes_real_differences() {
+        let id = |s: &str| UpstreamSpec::parse(s).unwrap().identity();
+        // Transport, port, path, and HTTP/3 pinning are all part of identity.
+        assert_ne!(id("udp://8.8.8.8"), id("tcp://8.8.8.8"));
+        assert_ne!(id("8.8.8.8"), id("8.8.8.8:5353"));
+        assert_ne!(id("https://dns.google/a"), id("https://dns.google/b"));
+        assert_ne!(id("https://dns.google"), id("h3://dns.google"));
     }
 }
