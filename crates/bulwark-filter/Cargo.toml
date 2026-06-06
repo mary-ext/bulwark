@@ -19,3 +19,5 @@ serde_json.workspace = true
 # (the server runs under jemalloc; glibc malloc retains freed build memory
 # very differently, which would make the per-rule figure misleading).
 tikv-jemallocator = "0.6"
+# fstprobe experiment only: evaluate an FST domain index vs the hashmap.
+fst = "0.4"
