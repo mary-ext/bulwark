@@ -24,6 +24,49 @@ fn bare_domain_treated_as_subdomain_block() {
 }
 
 #[test]
+fn redundant_child_pruned_verdict_preserved() {
+    // The child block is subsumed by the broader parent subdomain block and is
+    // removed, but every query it covered is still blocked — by the parent.
+    let e = compile_one("||doubleclick.net^\n||ads.doubleclick.net^");
+    assert_eq!(e.len(), 1, "redundant child should be pruned");
+    assert!(e.check("doubleclick.net", "A", &ci()).is_blocked());
+    assert!(e.check("ads.doubleclick.net", "A", &ci()).is_blocked());
+    assert!(e.check("x.ads.doubleclick.net", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn exact_host_under_subdomain_pruned() {
+    // A hosts (exact) entry for a host already covered by a subdomain block is
+    // redundant and pruned; the host stays blocked via the subdomain rule.
+    let e = compile_one("||example.com^\n0.0.0.0 ads.example.com");
+    assert_eq!(e.len(), 1);
+    assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn unrelated_and_exact_only_rules_not_pruned() {
+    // No subsuming subdomain ancestor -> nothing is pruned.
+    assert_eq!(compile_one("||a.com^\n||b.com^").len(), 2);
+    // Two exact hosts: an exact rule never subsumes, so both survive.
+    assert_eq!(compile_one("0.0.0.0 example.com\n0.0.0.0 ads.example.com").len(), 2);
+}
+
+#[test]
+fn special_children_kept_despite_blocked_parent() {
+    // A blocked parent must NOT prune children that can behave differently:
+    // an exception, an $important block, or a type/client-narrowed rule.
+    let e = compile_one(
+        "||example.com^\n\
+         @@||ok.example.com^\n\
+         ||imp.example.com^$important\n\
+         ||typed.example.com^$dnstype=AAAA",
+    );
+    assert_eq!(e.len(), 4, "exception/important/modified children are kept");
+    assert!(!e.check("ok.example.com", "A", &ci()).is_blocked());
+    assert!(e.check("imp.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
 fn exception_unblocks() {
     let e = compile_one("||example.com^\n@@||good.example.com^");
     assert!(e.check("bad.example.com", "A", &ci()).is_blocked());

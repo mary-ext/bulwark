@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::FilterEngine;
 use crate::parser::{parse_line, Parsed};
-use crate::rule::BuildRule;
+use crate::rule::{Action, BuildRule, Pattern};
 
 /// Per-list statistics gathered while compiling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -79,13 +79,81 @@ impl Compiler {
             stats,
         } = self;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let active: Vec<BuildRule> = rules
+        let mut active: Vec<BuildRule> = rules
             .into_iter()
             .filter(|r| !badfilter_sigs.contains(&r.signature))
             .filter(|r| seen.insert(r.signature.clone()))
             .collect();
+        prune_redundant(&mut active);
         (FilterEngine::from_rules(active), stats)
     }
+}
+
+/// Drop plain block rules already covered by a broader plain `||ancestor^`
+/// subdomain block — e.g. `||ads.doubleclick.net^` (or a hosts entry for the
+/// same host) when `||doubleclick.net^` is also blocked. Real merged blocklists
+/// carry a meaningful fraction of these.
+///
+/// Soundness: a rule is removed only when it is a **plain** (unmodified) `Block`
+/// *and* a plain **subdomain** `Block` exists for a strict ancestor (for an
+/// exact/hosts rule, also the same domain). The surviving subdomain rule matches
+/// the removed rule's domain and every subdomain of it, with the same action and
+/// no client/type narrowing, so the verdict is identical for every query and
+/// client. Anything that could differ — exceptions (`@@`), `$important`,
+/// rewrites, `$client`/`$ctag`/`$dnstype`/`$denyallow`, and the subsuming
+/// subdomain rules themselves — is never removed. The only observable change is
+/// that a removed rule's query-log attribution shifts to the broader survivor.
+fn prune_redundant(active: &mut Vec<BuildRule>) {
+    // Subsumers: the domains of plain subdomain Block rules.
+    let subsumers: HashSet<&str> = active
+        .iter()
+        .filter_map(|br| {
+            if br.rule.action == Action::Block && br.rule.mods.is_none() {
+                if let Pattern::Subdomain(d) = &br.rule.pattern {
+                    return Some(d.as_str());
+                }
+            }
+            None
+        })
+        .collect();
+    if subsumers.is_empty() {
+        return;
+    }
+    // Mask first (borrows `active` immutably via `subsumers`), then prune.
+    let keep: Vec<bool> = active.iter().map(|br| !is_redundant(br, &subsumers)).collect();
+    drop(subsumers);
+    let mut i = 0;
+    active.retain(|_| {
+        let k = keep[i];
+        i += 1;
+        k
+    });
+}
+
+/// Is this a plain Block rule whose domain is already covered by a subsuming
+/// subdomain block in `subsumers`? Exact rules also test their own domain (a
+/// subdomain block of `d` covers the exact host `d`); subdomain rules test only
+/// strict ancestors (an equal-domain duplicate would already be deduped).
+fn is_redundant(br: &BuildRule, subsumers: &HashSet<&str>) -> bool {
+    if br.rule.action != Action::Block || br.rule.mods.is_some() {
+        return false;
+    }
+    let (d, include_self) = match &br.rule.pattern {
+        Pattern::Subdomain(d) => (d.as_str(), false),
+        Pattern::Exact(d) => (d.as_str(), true),
+        _ => return false,
+    };
+    if include_self && subsumers.contains(d) {
+        return true;
+    }
+    let mut rest = d;
+    while let Some(idx) = rest.find('.') {
+        rest = &rest[idx + 1..];
+        if subsumers.contains(rest) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Convenience: compile a single list's text into an engine.
