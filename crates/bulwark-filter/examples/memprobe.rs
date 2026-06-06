@@ -13,6 +13,10 @@ use bulwark_filter::engine::FilterEngine;
 use bulwark_filter::list::Compiler;
 use bulwark_filter::rule::{ClientInfo, Rule};
 
+// Match the server's allocator (see server/src/main.rs) so RSS reflects prod.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 fn rss_kb() -> u64 {
     let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in s.lines() {

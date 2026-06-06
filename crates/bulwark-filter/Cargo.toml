@@ -15,3 +15,7 @@ ipnet.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# Match the server's global allocator so memprobe's RSS reflects production
+# (the server runs under jemalloc; glibc malloc retains freed build memory
+# very differently, which would make the per-rule figure misleading).
+tikv-jemallocator = "0.6"
