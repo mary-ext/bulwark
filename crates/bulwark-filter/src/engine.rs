@@ -63,21 +63,27 @@ mod kind {
 
 /// A compiled rule, as a fixed-size record of offsets into the engine's arenas.
 /// No heap allocation of its own; the common plain-block rule is fully described
-/// by this ~28-byte record plus its slices of the shared text arenas.
+/// by this ~20-byte record plus its slices of the shared text arenas. Field
+/// widths are sized to their domains: arena offsets and the (potentially large)
+/// mods index stay `u32`, but a source line fits `u16`, a domain ≤253 bytes fits
+/// `u8`, and list ids fit `u16`.
 #[derive(Debug, Clone)]
 struct RuleRecord {
-    /// Span of the original source line in `raw_arena` (for display / logging).
+    /// Span start of the original source line in `raw_arena` (display / logging).
     raw_start: u32,
-    raw_len: u32,
     /// For exact/subdomain rules: span start of the normalised domain in
     /// `domain_arena`. For wildcard/regex rules: index into `regexes`.
     dom_or_re: u32,
-    /// For exact/subdomain rules: domain byte length. Zero for wildcard/regex.
-    dom_len: u32,
-    /// Which loaded list this rule came from.
-    list_id: u32,
     /// Index into `mods`, or [`NO_MODS`].
     mods_idx: u32,
+    /// Length of the source line span. Saturated at `u16::MAX` — only a
+    /// pathological (>64 KiB) line would clip, and only its log display.
+    raw_len: u16,
+    /// Which loaded list this rule came from.
+    list_id: u16,
+    /// For exact/subdomain rules: domain byte length (DNS names are ≤253). Zero
+    /// for wildcard/regex.
+    dom_len: u8,
     action: Action,
     /// One of the [`kind`] tags.
     kind: u8,
@@ -255,7 +261,7 @@ impl FilterEngine {
             (action as u8).hash(&mut ch);
 
             let raw_start = raw_arena.len() as u32;
-            let raw_len = raw.len() as u32;
+            let raw_len = raw.len().min(u16::MAX as usize) as u16;
             raw_arena.push_str(&raw);
 
             let mods_idx = match rule_mods {
@@ -272,15 +278,17 @@ impl FilterEngine {
 
             let (kind, dom_or_re, dom_len) = match pattern {
                 Pattern::Exact(d) => {
+                    debug_assert!(d.len() <= u8::MAX as usize, "DNS name exceeds 255 bytes");
                     let start = domain_arena.len() as u32;
-                    let len = d.len() as u32;
+                    let len = d.len() as u8;
                     exact_pairs.push((dhash.hash_one(d.as_str()), id));
                     domain_arena.push_str(&d);
                     (kind::EXACT, start, len)
                 }
                 Pattern::Subdomain(d) => {
+                    debug_assert!(d.len() <= u8::MAX as usize, "DNS name exceeds 255 bytes");
                     let start = domain_arena.len() as u32;
-                    let len = d.len() as u32;
+                    let len = d.len() as u8;
                     sub_pairs.push((dhash.hash_one(d.as_str()), id));
                     domain_arena.push_str(&d);
                     (kind::SUBDOMAIN, start, len)
@@ -304,7 +312,7 @@ impl FilterEngine {
                 raw_len,
                 dom_or_re,
                 dom_len,
-                list_id,
+                list_id: list_id as u16,
                 mods_idx,
                 action,
                 kind,
@@ -393,13 +401,13 @@ impl FilterEngine {
     /// The original source line of a record (for `MatchInfo` / display).
     #[inline]
     fn raw(&self, r: &RuleRecord) -> &str {
-        &self.raw_arena[r.raw_start as usize..(r.raw_start + r.raw_len) as usize]
+        &self.raw_arena[r.raw_start as usize..r.raw_start as usize + r.raw_len as usize]
     }
 
     /// The normalised domain of an exact/subdomain record.
     #[inline]
     fn domain(&self, r: &RuleRecord) -> &str {
-        &self.domain_arena[r.dom_or_re as usize..(r.dom_or_re + r.dom_len) as usize]
+        &self.domain_arena[r.dom_or_re as usize..r.dom_or_re as usize + r.dom_len as usize]
     }
 
     /// The modifier cluster of a record, if any.
@@ -608,7 +616,7 @@ impl FilterEngine {
                 let r = &self.rules[id as usize];
                 let info = MatchInfo {
                     rule: self.raw(r).to_string(),
-                    list_id: r.list_id,
+                    list_id: r.list_id as u32,
                     rule_id: id,
                 };
                 match r.action {
