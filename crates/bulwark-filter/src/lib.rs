@@ -27,7 +27,8 @@ pub use engine::{FilterEngine, MatchInfo, Verdict};
 pub use list::{compile_one, Compiler, ListStats};
 pub use parser::{parse_line, ParseError, Parsed};
 pub use rule::{
-    Action, ClientInfo, ClientMatch, DnsTypeFilter, Pattern, RewriteData, RewriteRcode, Rule,
+    Action, BuildRule, ClientInfo, ClientMatch, DnsTypeFilter, Pattern, RewriteData, RewriteRcode,
+    Rule,
 };
 
 #[cfg(test)]

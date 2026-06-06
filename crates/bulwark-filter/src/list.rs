@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::FilterEngine;
 use crate::parser::{parse_line, Parsed};
-use crate::rule::Rule;
+use crate::rule::BuildRule;
 
 /// Per-list statistics gathered while compiling.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,7 +25,7 @@ pub struct ListStats {
 /// [`FilterEngine`].
 #[derive(Default)]
 pub struct Compiler {
-    rules: Vec<Rule>,
+    rules: Vec<BuildRule>,
     badfilter_sigs: HashSet<String>,
     stats: Vec<ListStats>,
 }
@@ -46,7 +46,7 @@ impl Compiler {
             match parse_line(line) {
                 Ok(Parsed::Rules(rules)) => {
                     for mut rule in rules {
-                        rule.list_id = list_id;
+                        rule.rule.list_id = list_id;
                         if rule.badfilter {
                             self.badfilter_sigs.insert(rule.signature.clone());
                             // A badfilter rule only disables others; it is not
@@ -79,7 +79,7 @@ impl Compiler {
             stats,
         } = self;
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let active: Vec<Rule> = rules
+        let active: Vec<BuildRule> = rules
             .into_iter()
             .filter(|r| !badfilter_sigs.contains(&r.signature))
             .filter(|r| seen.insert(r.signature.clone()))

@@ -187,7 +187,10 @@ impl RuleMods {
     }
 }
 
-/// A fully-parsed filtering rule.
+/// A fully-parsed filtering rule, as **retained** by the compiled engine. This
+/// holds only what matching and attribution need; the build-time-only fields
+/// (`signature`, `index_tokens`, `badfilter`) live on [`BuildRule`] instead, so
+/// they don't tax every retained element of the engine's rule vector.
 #[derive(Debug, Clone)]
 pub struct Rule {
     /// Stable id (index into the engine's rule vector).
@@ -198,17 +201,27 @@ pub struct Rule {
     pub pattern: Pattern,
     /// Optional DNS modifiers; `None` for the common plain-block rule.
     pub mods: Option<Box<RuleMods>>,
-    /// `$badfilter` — this rule disables a matching rule rather than acting.
-    /// (Build-time only; retained rules always have this `false`.)
-    pub badfilter: bool,
     /// Which loaded list this rule came from.
     pub list_id: u32,
+}
+
+/// A rule as produced by the parser and manipulated by the [`Compiler`]: the
+/// retained [`Rule`] plus the fields needed only during compilation
+/// (`$badfilter` pairing, de-duplication, and wildcard token indexing). These
+/// are dropped wholesale once [`FilterEngine::from_rules`] has consumed them, so
+/// they never occupy space in the running engine.
+///
+/// [`Compiler`]: crate::list::Compiler
+/// [`FilterEngine::from_rules`]: crate::engine::FilterEngine::from_rules
+#[derive(Debug, Clone)]
+pub struct BuildRule {
+    pub rule: Rule,
+    /// `$badfilter` — this rule disables a matching rule rather than acting.
+    pub badfilter: bool,
     /// Canonical signature (pattern + sorted modifiers minus badfilter), used to
-    /// pair `$badfilter` rules and de-duplicate. **Build-time only** — cleared
-    /// after the engine is built to save memory.
+    /// pair `$badfilter` rules and de-duplicate.
     pub signature: String,
-    /// Safe interior token hashes for the wildcard reverse index. **Build-time
-    /// only** — cleared after build.
+    /// Safe interior token hashes for the wildcard reverse index.
     pub index_tokens: Vec<u32>,
 }
 

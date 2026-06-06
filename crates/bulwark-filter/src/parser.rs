@@ -40,7 +40,7 @@ fn compile_regex(src: &str) -> Result<Regex, ParseError> {
 #[derive(Debug)]
 pub enum Parsed {
     /// One or more rules (hosts lines can yield several).
-    Rules(Vec<Rule>),
+    Rules(Vec<BuildRule>),
     /// A comment, blank line, or list header — nothing to do.
     Ignored,
     /// A syntactically valid line we intentionally skip (e.g. it carries only
@@ -179,7 +179,7 @@ pub fn parse_line(line: &str) -> Result<Parsed, ParseError> {
 }
 
 /// Attempt to parse a hosts-file line. Returns `None` if it is not one.
-fn try_parse_hosts(line: &str) -> Option<Vec<Rule>> {
+fn try_parse_hosts(line: &str) -> Option<Vec<BuildRule>> {
     let mut parts = line.split_whitespace();
     let first = parts.next()?;
     let ip: IpAddr = first.parse().ok()?;
@@ -217,14 +217,16 @@ fn try_parse_hosts(line: &str) -> Option<Vec<Rule>> {
                 })),
             )
         };
-        rules.push(Rule {
-            id: 0,
-            raw: format!("{first} {host}"),
-            action,
-            pattern: Pattern::Exact(domain.clone()),
-            mods,
+        rules.push(BuildRule {
+            rule: Rule {
+                id: 0,
+                raw: format!("{first} {host}"),
+                action,
+                pattern: Pattern::Exact(domain.clone()),
+                mods,
+                list_id: 0,
+            },
             badfilter: false,
-            list_id: 0,
             signature: format!("hosts|{domain}|{}", if block { "block" } else { "rewrite" }),
             index_tokens: Vec::new(),
         });
@@ -313,18 +315,20 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
         }
     }
 
-    let rule = Rule {
-        id: 0,
-        raw: line.to_string(),
-        action,
-        pattern,
-        mods: if m.is_empty() {
-            None
-        } else {
-            Some(Box::new(m))
+    let rule = BuildRule {
+        rule: Rule {
+            id: 0,
+            raw: line.to_string(),
+            action,
+            pattern,
+            mods: if m.is_empty() {
+                None
+            } else {
+                Some(Box::new(m))
+            },
+            list_id: 0,
         },
         badfilter,
-        list_id: 0,
         signature,
         index_tokens,
     };
