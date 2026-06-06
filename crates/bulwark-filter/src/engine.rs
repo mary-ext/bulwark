@@ -456,6 +456,29 @@ impl FilterEngine {
         self.rules.is_empty()
     }
 
+    /// Approximate retained-heap breakdown, in bytes, for tuning. Counts the
+    /// large flat allocations (records, arenas, index tables + hit vectors); the
+    /// long tail (mods/regex heap, scan index) is lumped under `other`. Intended
+    /// for the `memprobe` example, not production use.
+    #[doc(hidden)]
+    pub fn mem_report(&self) -> [(&'static str, usize); 5] {
+        let rec = self.rules.capacity() * std::mem::size_of::<RuleRecord>();
+        let raw = self.raw_arena.len();
+        let dom = self.domain_arena.len();
+        let entry = std::mem::size_of::<(u64, (u32, u32))>();
+        let index = (self.exact.map.capacity() + self.subdomain.map.capacity()) * entry
+            + (self.exact.hits.capacity() + self.subdomain.hits.capacity()) * 4;
+        let other = self.mods.capacity() * std::mem::size_of::<RuleMods>()
+            + self.regexes.capacity() * std::mem::size_of::<regex::Regex>();
+        [
+            ("records", rec),
+            ("raw_arena", raw),
+            ("domain_arena", dom),
+            ("index", index),
+            ("other", other),
+        ]
+    }
+
     fn collect_candidates(&self, domain: &str, out: &mut Vec<u32>) {
         // Exact and subdomain rules are gathered by domain hash. We push the raw
         // bucket hits *without* verifying the span here — verification (which

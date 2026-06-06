@@ -57,6 +57,10 @@ fn main() {
         "retained / rule      = {:.0} bytes",
         (after.saturating_sub(before)) as f64 * 1024.0 / n as f64
     );
+    println!("---- composition (B/rule) ----");
+    for (label, bytes) in engine.mem_report() {
+        println!("  {label:14} = {:.1}", bytes as f64 / n as f64);
+    }
 
     // Pre-generate a query pool (half guaranteed hits — a subdomain of a real
     // blocked domain — half guaranteed misses) so the timed loop measures
