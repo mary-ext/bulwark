@@ -133,6 +133,10 @@ fn main() {
     for (label, bytes) in engine.mem_report() {
         println!("  {label:14} = {:.1}", bytes as f64 / n as f64);
     }
+    println!("---- scan structure (rule counts) ----");
+    for (label, count) in engine.scan_report() {
+        println!("  {label:20} = {count}");
+    }
 
     // Query pool: interleave real blocked domains (hits) with synthetic misses.
     // Falls back to synthetic hits if no domains were sampled.

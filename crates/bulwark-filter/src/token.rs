@@ -71,6 +71,34 @@ fn push_run(tokens: &mut Vec<u32>, run: &[u8]) {
     }
 }
 
+/// Stream the query-name token hashes to `f`, allocation-free and without the
+/// sort/dedup [`tokenize_query_into`] does. Used on the hot match path: each
+/// token is hashed and handed straight to the caller (which probes the wildcard
+/// index), so there is no intermediate `Vec`. A duplicated token (rare in a
+/// domain) just yields a redundant — harmless — callback rather than being
+/// deduplicated; the caller's candidate set tolerates duplicate ids.
+#[inline]
+pub fn for_each_query_token(name: &str, mut f: impl FnMut(u32)) {
+    let bytes = name.as_bytes();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if is_token_char(b) {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            if i - s >= MIN_TOKEN_LEN {
+                f(fast_hash(&bytes[s..i]));
+            }
+        }
+    }
+    if let Some(s) = start {
+        if bytes.len() - s >= MIN_TOKEN_LEN {
+            f(fast_hash(&bytes[s..]));
+        }
+    }
+}
+
 /// Tokenize a wildcard pattern body, returning only **safe interior** token
 /// hashes (see module docs). `body` is the pattern with `*` wildcards and `^`
 /// separators still present (anchors already stripped).

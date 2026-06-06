@@ -487,6 +487,24 @@ impl FilterEngine {
         ]
     }
 
+    /// Wildcard/regex scan-structure sizes, for tuning the regex hot path.
+    /// `scan_index` rules are only checked when a query shares their token;
+    /// `fallback_set` patterns + `fallback_individual` rules are scanned on
+    /// *every* query, so they dominate regex-path latency. Returns
+    /// (token-indexed rules, fallback_set chunks, fallback_set patterns,
+    /// always-scanned-individual rules).
+    #[doc(hidden)]
+    pub fn scan_report(&self) -> [(&'static str, usize); 4] {
+        let indexed: usize = self.scan_index.values().map(|v| v.len()).sum();
+        let set_pats: usize = self.fallback_sets.iter().map(|(_, ids)| ids.len()).sum();
+        [
+            ("token_indexed", indexed),
+            ("fallback_chunks", self.fallback_sets.len()),
+            ("fallback_patterns", set_pats),
+            ("fallback_individual", self.fallback_individual.len()),
+        ]
+    }
+
     fn collect_candidates(&self, domain: &str, out: &mut Vec<u32>) {
         // Exact and subdomain rules are gathered by domain hash. We push the raw
         // bucket hits *without* verifying the span here — verification (which
@@ -526,17 +544,12 @@ impl FilterEngine {
             check(id, out);
         }
         if !self.scan_index.is_empty() {
-            thread_local! {
-                static TOKENS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            TOKENS.with(|cell| {
-                let mut tokens = cell.borrow_mut();
-                crate::token::tokenize_query_into(domain, &mut tokens);
-                for &tok in tokens.iter() {
-                    if let Some(ids) = self.scan_index.get(&tok) {
-                        for &id in ids {
-                            check(id, out);
-                        }
+            // Stream the query's token hashes straight into index probes — no
+            // intermediate Vec, no sort/dedup (see `for_each_query_token`).
+            crate::token::for_each_query_token(domain, |tok| {
+                if let Some(ids) = self.scan_index.get(&tok) {
+                    for &id in ids {
+                        check(id, out);
                     }
                 }
             });
