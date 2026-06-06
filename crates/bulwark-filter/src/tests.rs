@@ -52,6 +52,32 @@ fn unrelated_and_exact_only_rules_not_pruned() {
 }
 
 #[test]
+fn allow_wildcard_overrides_domain_block() {
+    // An allow regex is in the override scan group, evaluated even when a domain
+    // block already matched — so it still un-blocks its target.
+    let e = compile_one("||example.com^\n@@/^sub\\.example\\.com$/");
+    assert!(e.check("other.example.com", "A", &ci()).is_blocked());
+    assert!(!e.check("sub.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn important_wildcard_overrides_domain_allow() {
+    // An $important block regex (override group) beats a domain allow.
+    let e = compile_one("@@||example.com^\n/tracker\\.example\\.com/$important");
+    assert!(e.check("tracker.example.com", "A", &ci()).is_blocked());
+    assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
+}
+
+#[test]
+fn block_only_wildcard_matches_without_domain_rule() {
+    // A plain block regex is in the block-only group, scanned only when nothing
+    // else matched — it must still block when it is the sole match.
+    let e = compile_one("/^ads[0-9]+\\.example\\.net$/");
+    assert!(e.check("ads123.example.net", "A", &ci()).is_blocked());
+    assert!(!e.check("safe.example.net", "A", &ci()).is_blocked());
+}
+
+#[test]
 fn special_children_kept_despite_blocked_parent() {
     // A blocked parent must NOT prune children that can behave differently:
     // an exception, an $important block, or a type/client-narrowed rule.
