@@ -1,12 +1,17 @@
 //! Combined memory + match-throughput harness for the filter engine.
 //!
-//! Builds a synthetic AdGuard-style blocklist and reports both the retained
-//! heap per rule and the match latency for a hit/miss query mix, so a memory
-//! refactor can be gated on *measured* throughput, not just bytes saved.
+//! Reports retained heap per rule (broken down by component) and match latency
+//! for a hit/miss query mix, so an engine change is gated on *measured* bytes
+//! and queries/sec, not estimates.
 //!
-//! Usage: `cargo run --release --example memprobe -p bulwark-filter [N] [ITERS]`
+//! Synthetic list (default): `cargo run --release --example memprobe -p bulwark-filter [N] [ITERS]`
+//! Real lists:               `LISTS=a.txt,b.txt cargo run --release --example memprobe -p bulwark-filter [ITERS]`
+//!
+//! Run under the same allocator + decay as prod for a true-retained figure:
+//! `_RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0`.
 
 use std::hint::black_box;
+use std::net::IpAddr;
 use std::time::Instant;
 
 use bulwark_filter::engine::FilterEngine;
@@ -27,28 +32,95 @@ fn rss_kb() -> u64 {
     0
 }
 
+/// Best-effort domain extraction from a list line, for building the hit
+/// workload. Returns `None` for comments, exceptions, and anything that isn't a
+/// plain `||domain^` / bare-domain / hosts entry.
+fn sample_domain(line: &str) -> Option<String> {
+    let l = line.trim();
+    if l.is_empty() || l.starts_with('!') || l.starts_with('#') || l.starts_with('[') {
+        return None;
+    }
+    // hosts: "ip domain ..."
+    if let Some((first, rest)) = l.split_once(char::is_whitespace) {
+        if first.parse::<IpAddr>().is_ok() {
+            let host = rest.split_whitespace().next()?;
+            if host.starts_with('#') {
+                return None;
+            }
+            return clean(host);
+        }
+    }
+    // adblock ||domain^ / bare domain (skip exceptions and modified rules)
+    if l.starts_with("@@") {
+        return None;
+    }
+    let mut s = l.strip_prefix("||").unwrap_or(l);
+    if let Some(i) = s.find('$') {
+        s = &s[..i];
+    }
+    let s = s.trim_end_matches('^').trim_end_matches('|');
+    clean(s)
+}
+
+fn clean(s: &str) -> Option<String> {
+    let s = s.trim_end_matches('.');
+    if s.is_empty() || s.contains('/') || s.contains('*') || s.contains(':') || !s.contains('.') {
+        return None;
+    }
+    Some(s.to_ascii_lowercase())
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
-    let n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
-    let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+
+    // Real-list mode if LISTS is set; otherwise a synthetic list of N rules.
+    let (texts, iters): (Vec<(String, String)>, usize) = match std::env::var("LISTS") {
+        Ok(paths) => {
+            let iters = args.next().and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+            let v = paths
+                .split(',')
+                .map(|p| (p.to_string(), std::fs::read_to_string(p).expect("read list")))
+                .collect();
+            (v, iters)
+        }
+        Err(_) => {
+            let n: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+            let iters: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(5_000_000);
+            let mut text = String::with_capacity(n * 46);
+            for i in 0..n {
+                text.push_str(&format!("||tracker{i:07}.ads-cdn-segment.example.com^\n"));
+            }
+            (vec![("synthetic".to_string(), text)], iters)
+        }
+    };
 
     println!("size_of::<Rule>()    = {} bytes", std::mem::size_of::<Rule>());
-
-    // Synthetic blocklist of plain ||domain^ rules with realistic ~30-char
-    // domains (the overwhelmingly common blocklist shape).
-    let mut text = String::new();
-    for i in 0..n {
-        text.push_str(&format!("||tracker{i:07}.ads-cdn-segment.example.com^\n"));
-    }
-    let text_bytes = text.len();
+    let text_bytes: usize = texts.iter().map(|(_, t)| t.len()).sum();
 
     let before = rss_kb();
     let mut c = Compiler::new();
-    c.add_list(0, "synthetic", &text);
+    for (i, (name, t)) in texts.iter().enumerate() {
+        c.add_list(i as u32, name, t);
+    }
     let (engine, _stats): (FilterEngine, _) = c.build();
-    drop(text);
+
+    // Sample real blocked domains for the hit workload before dropping the text.
+    const POOL: usize = 4096;
+    let mut samples: Vec<String> = Vec::new();
+    'outer: for (_, t) in &texts {
+        for line in t.lines() {
+            if let Some(d) = sample_domain(line) {
+                samples.push(d);
+                if samples.len() >= POOL / 2 {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    drop(texts);
     let after = rss_kb();
 
+    let n = engine.len().max(1);
     println!("rules                = {}", engine.len());
     println!("source text          = {:.1} MiB", text_bytes as f64 / 1048576.0);
     println!("RSS before build     = {:.1} MiB", before as f64 / 1024.0);
@@ -62,18 +134,16 @@ fn main() {
         println!("  {label:14} = {:.1}", bytes as f64 / n as f64);
     }
 
-    // Pre-generate a query pool (half guaranteed hits — a subdomain of a real
-    // blocked domain — half guaranteed misses) so the timed loop measures
-    // matching, not `format!` allocation. Built after the RSS snapshot so it
-    // doesn't pollute the per-rule figure.
-    const POOL: usize = 4096;
+    // Query pool: interleave real blocked domains (hits) with synthetic misses.
+    // Falls back to synthetic hits if no domains were sampled.
     let queries: Vec<String> = (0..POOL)
         .map(|j| {
-            let idx = (j * 7919) % n;
-            if j & 1 == 0 {
-                format!("sub.tracker{idx:07}.ads-cdn-segment.example.com")
+            if j & 1 == 0 && !samples.is_empty() {
+                samples[(j / 2) % samples.len()].clone()
+            } else if j & 1 == 0 {
+                format!("sub.tracker{:07}.ads-cdn-segment.example.com", j % n)
             } else {
-                format!("host{idx:07}.legit-service.example.org")
+                format!("host{j:07}.legit-service-{j}.example.org")
             }
         })
         .collect();
