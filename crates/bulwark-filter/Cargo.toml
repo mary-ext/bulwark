@@ -21,3 +21,5 @@ serde_json.workspace = true
 tikv-jemallocator = "0.6"
 # fstprobe experiment only: evaluate an FST domain index vs the hashmap.
 fst = "0.4"
+# memprobe only: verify the runtime background_thread ctl the server uses.
+tikv-jemalloc-ctl = "0.6"

@@ -21,6 +21,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
+    enable_jemalloc_background_purge();
 
     let data_dir = std::env::var("BULWARK_DATA_DIR")
         .map(PathBuf::from)
@@ -134,6 +135,20 @@ fn init_tracing() {
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
+}
+
+/// Turn on jemalloc's background purge thread. By default it is off, so dirty
+/// pages freed by a big transient allocation — notably building/reloading the
+/// filter engine, which churns hundreds of MiB — are only returned to the OS
+/// when later allocations happen to drive decay. An idle resolver therefore sits
+/// at a much higher RSS than its live heap. Enabling the background thread purges
+/// them within the decay window regardless of allocation activity, roughly
+/// halving steady-state RSS on large blocklists. Best-effort: log and continue if
+/// the build doesn't support it.
+fn enable_jemalloc_background_purge() {
+    if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
+        tracing::warn!(error = %e, "could not enable jemalloc background_thread");
+    }
 }
 
 async fn shutdown_signal() {

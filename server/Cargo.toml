@@ -47,6 +47,10 @@ mime_guess = "2"
 # default. jemalloc won a four-way bake-off (vs mimalloc/snmalloc/system),
 # especially on the alloc-diverse blocked path, with the best steady-state RSS.
 tikv-jemallocator = "0.6"
+# Enable jemalloc's background purge thread at runtime (see main.rs): without it,
+# the dirty pages freed when the filter is built/reloaded are not returned to the
+# OS while the process is idle, roughly doubling steady-state RSS.
+tikv-jemalloc-ctl = "0.6"
 
 [dev-dependencies]
 # Enables the additive trust-root hook only for examples/tests/benches — NOT the

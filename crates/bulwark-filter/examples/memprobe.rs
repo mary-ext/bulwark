@@ -71,6 +71,10 @@ fn clean(s: &str) -> Option<String> {
 }
 
 fn main() {
+    // BGTHREAD=1 verifies the exact runtime ctl the server uses to purge.
+    if std::env::var("BGTHREAD").is_ok() {
+        tikv_jemalloc_ctl::background_thread::write(true).expect("enable background_thread");
+    }
     let mut args = std::env::args().skip(1);
 
     // Real-list mode if LISTS is set; otherwise a synthetic list of N rules.
@@ -120,11 +124,25 @@ fn main() {
     drop(texts);
     let after = rss_kb();
 
+    // Optional settle: sleep so jemalloc's decay / background_thread can return
+    // the dirty pages left by the build, exposing how much of `after` is
+    // allocator retention vs true live heap. `SETTLE_SECS=N` to enable.
+    let settled = match std::env::var("SETTLE_SECS").ok().and_then(|s| s.parse().ok()) {
+        Some(secs) if secs > 0 => {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            Some(rss_kb())
+        }
+        _ => None,
+    };
+
     let n = engine.len().max(1);
     println!("rules                = {}", engine.len());
     println!("source text          = {:.1} MiB", text_bytes as f64 / 1048576.0);
     println!("RSS before build     = {:.1} MiB", before as f64 / 1024.0);
     println!("RSS after build      = {:.1} MiB", after as f64 / 1024.0);
+    if let Some(s) = settled {
+        println!("RSS settled          = {:.1} MiB", s as f64 / 1024.0);
+    }
     println!(
         "retained / rule      = {:.0} bytes",
         (after.saturating_sub(before)) as f64 * 1024.0 / n as f64
