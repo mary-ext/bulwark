@@ -1948,7 +1948,7 @@
           "rewritten",
           "errors",
           "block_rate",
-          "avg_processing_ms",
+          "p95_processing_ms",
           "top_resolved_domains",
           "top_blocked_domains",
           "top_clients",
@@ -1959,10 +1959,6 @@
           "cache_size"
         ],
         "properties": {
-          "avg_processing_ms": {
-            "type": "number",
-            "format": "double"
-          },
           "block_rate": {
             "type": "number",
             "format": "double"
@@ -1985,6 +1981,10 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "p95_processing_ms": {
+            "type": "number",
+            "format": "double"
           },
           "rewritten": {
             "type": "integer",
@@ -2200,12 +2200,6 @@
               "type": "string"
             },
             "description": "Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames."
-          },
-          "probe_interval_secs": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Interval between background latency probes (seconds); 0 disables probing.",
-            "minimum": 0
           },
           "servers": {
             "type": "string",

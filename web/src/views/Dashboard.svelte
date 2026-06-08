@@ -103,8 +103,8 @@
       tone="good"
     />
     <StatCard
-      label="Avg processing"
-      value={duration(stats.avg_processing_ms)}
+      label="Processing time (p95)"
+      value={duration(stats.p95_processing_ms)}
       sub="{num(stats.rewritten)} rewritten"
     />
   </div>

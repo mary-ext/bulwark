@@ -54,8 +54,13 @@ struct StatsInner {
     rewritten: u64,
     errors: u64,
 
-    proc_time_sum_ms: f64,
-    proc_time_count: u64,
+    /// Global whole-query latency histogram (bucketed by `LATENCY_BUCKETS_MS`),
+    /// kept so the snapshot can derive a tail percentile that a raw mean can't.
+    /// Errored queries are excluded — a timeout is a failure, not slow work, and
+    /// folding multi-second failures into a latency number just tracks the tail
+    /// of the network, not how fast we answer.
+    #[serde(default)]
+    proc_time_hist: Vec<u64>,
 
     #[serde(default)]
     resolved_domains: HashMap<String, u64>,
@@ -81,8 +86,13 @@ impl StatsInner {
         self.cached += other.cached;
         self.rewritten += other.rewritten;
         self.errors += other.errors;
-        self.proc_time_sum_ms += other.proc_time_sum_ms;
-        self.proc_time_count += other.proc_time_count;
+        if !other.proc_time_hist.is_empty() {
+            self.proc_time_hist
+                .resize(LATENCY_BUCKETS_MS.len() + 1, 0);
+            for (a, b) in self.proc_time_hist.iter_mut().zip(&other.proc_time_hist) {
+                *a += b;
+            }
+        }
 
         merge_counts(&mut self.resolved_domains, &other.resolved_domains);
         merge_counts(&mut self.blocked_domains, &other.blocked_domains);
@@ -246,9 +256,16 @@ impl Stats {
             s.blocked += 1;
         }
 
-        // Latency.
-        s.proc_time_sum_ms += entry.elapsed_ms;
-        s.proc_time_count += 1;
+        // Latency. Errored queries are excluded: a query that timed out before
+        // failing carries multi-second wall-clock, and folding that into the
+        // latency stat measures the network's failures, not how fast we answer.
+        // Failures are tracked separately as the error count / rate above.
+        if !matches!(entry.action, QueryAction::Error) {
+            if s.proc_time_hist.is_empty() {
+                s.proc_time_hist = vec![0; LATENCY_BUCKETS_MS.len() + 1];
+            }
+            s.proc_time_hist[hist_index(entry.elapsed_ms)] += 1;
+        }
 
         // Top-N counters. A query name lands in exactly one of the two domain
         // lists — resolved or blocked.
@@ -342,11 +359,12 @@ impl Stats {
     /// used to resolve the IP-keyed client counts to friendly names at read time.
     pub fn snapshot(&self, top_n: usize, clients: &ClientMatcher) -> StatsSummary {
         let s = self.merged();
-        let avg_proc = if s.proc_time_count > 0 {
-            s.proc_time_sum_ms / s.proc_time_count as f64
-        } else {
-            0.0
-        };
+        // Surface the p95 of successful-query latency rather than a raw mean. The
+        // mean is dragged around by a handful of slow tail queries (failovers,
+        // congested upstreams); p95 ignores the top 5% so it tracks the real
+        // "are answers fast?" signal without being yanked by transient blips.
+        let proc_total: u64 = s.proc_time_hist.iter().sum();
+        let p95_proc = quantile(&s.proc_time_hist, proc_total, 0.95);
         let upstream_rtt = s
             .upstream_rtt_count
             .iter()
@@ -372,7 +390,7 @@ impl Stats {
             } else {
                 0.0
             },
-            avg_processing_ms: avg_proc,
+            p95_processing_ms: p95_proc,
             top_resolved_domains: top_n_of(&s.resolved_domains, top_n),
             top_blocked_domains: top_n_of(&s.blocked_domains, top_n),
             top_clients: top_clients_resolved(&s.clients, clients, top_n),
@@ -527,7 +545,9 @@ pub struct StatsSummary {
     pub rewritten: u64,
     pub errors: u64,
     pub block_rate: f64,
-    pub avg_processing_ms: f64,
+    /// p95 of successful-query processing latency (ms). Excludes errored queries
+    /// and ignores the top 5% tail, so transient upstream failures don't skew it.
+    pub p95_processing_ms: f64,
     /// Most-resolved (non-blocked) query names.
     pub top_resolved_domains: Vec<TopEntry>,
     pub top_blocked_domains: Vec<TopEntry>,
@@ -712,11 +732,33 @@ mod tests {
             "avg = {}",
             snap.upstream_avg_rtt_ms["fast"]
         );
-        // The global processing-time histogram still sees the real 1010ms total.
+        // The global processing stat is whole-query, so when every query really
+        // did take 1010ms wall-clock, p95 reflects that (pinned to the top bucket).
         assert!(
-            snap.avg_processing_ms > 1000.0,
-            "avg_proc = {}",
-            snap.avg_processing_ms
+            snap.p95_processing_ms >= 1000.0,
+            "p95_proc = {}",
+            snap.p95_processing_ms
+        );
+    }
+
+    #[test]
+    fn errored_queries_excluded_from_processing_latency() {
+        // A burst of slow timeouts must not drag the latency stat: errors are a
+        // failure signal, not slow work. 100 fast successes + 10 multi-second
+        // errors should still report a fast p95.
+        let s = Stats::new(true, 30, false);
+        for _ in 0..100 {
+            s.record(&entry("ok.com.", forwarded("1.1.1.1"), 3.0), Some(3.0));
+        }
+        for _ in 0..10 {
+            s.record(&entry("dead.com.", QueryAction::Error, 5000.0), None);
+        }
+        let snap = s.snapshot(10, &ClientMatcher::default());
+        assert_eq!(snap.errors, 10);
+        assert!(
+            snap.p95_processing_ms <= 5.0,
+            "p95 should ignore errored timeouts, got {}",
+            snap.p95_processing_ms
         );
     }
 

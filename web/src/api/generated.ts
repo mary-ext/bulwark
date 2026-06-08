@@ -249,12 +249,12 @@ export type LatencyPercentilesDto = {
     p99: number;
 };
 export type StatsResponse = {
-    avg_processing_ms: number;
     block_rate: number;
     blocked: number;
     cache_size: number;
     cached: number;
     errors: number;
+    p95_processing_ms: number;
     rewritten: number;
     series: SeriesPointDto[];
     top_blocked_domains: TopEntryDto[];
