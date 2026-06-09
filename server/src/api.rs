@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::app::{apply_config, write_list_text, AppState};
-use crate::auth::{hash_password, verify_password, SESSION_COOKIE};
+use crate::auth::{hash_password, verify_password, SessionVerdict, SESSION_COOKIE};
 use crate::dto::{LogEntryView, QueryLogResponse, StatsResponse, UpstreamStatDto};
 
 /// API error type that renders as a JSON `{ "error": ... }` body.
@@ -174,13 +174,21 @@ async fn require_auth(
     request: axum::extract::Request,
     next: middleware::Next,
 ) -> Response {
-    let ok = cookie_token(&headers)
-        .map(|t| state.sessions.verify(&t))
-        .unwrap_or(false);
-    if ok {
-        next.run(request).await
-    } else {
-        ApiError::Unauthorized.into_response()
+    let verdict = cookie_token(&headers)
+        .map(|t| state.sessions.check(&t))
+        .unwrap_or(SessionVerdict::Invalid);
+    match verdict {
+        SessionVerdict::Invalid => ApiError::Unauthorized.into_response(),
+        SessionVerdict::Valid => next.run(request).await,
+        // Slide the session: run the request, then attach a freshly issued
+        // cookie so an active user's token never lapses.
+        SessionVerdict::Refresh => {
+            let mut resp = next.run(request).await;
+            let cookie = session_cookie(&state.sessions.issue(), is_https(&headers));
+            resp.headers_mut()
+                .insert(header::SET_COOKIE, cookie.parse().unwrap());
+            resp
+        }
     }
 }
 
@@ -223,7 +231,10 @@ pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<S
 }
 
 fn session_cookie(token: &str, secure: bool) -> String {
-    let mut c = format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=604800");
+    let mut c = format!(
+        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        crate::auth::SESSION_TTL_SECS
+    );
     if secure {
         c.push_str("; Secure");
     }

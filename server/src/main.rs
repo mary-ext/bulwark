@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
             .session_secret
             .as_deref()
             .expect("session secret set above"),
-        Duration::from_secs(7 * 24 * 3600),
+        Duration::from_secs(auth::SESSION_TTL_SECS),
     ));
 
     tracing::info!(data_dir = %paths.data_dir.display(), "starting bulwark");

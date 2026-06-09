@@ -40,6 +40,11 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 /// Cookie name for the session token.
 pub const SESSION_COOKIE: &str = "bw_session";
 
+/// Session lifetime. Sessions slide (see [`SessionSigner::check`]), so an active
+/// user is re-issued a fresh token well before this elapses; it only bites after
+/// two weeks of inactivity.
+pub const SESSION_TTL_SECS: u64 = 14 * 24 * 3600;
+
 /// Generate a fresh signing secret: 32 random bytes, base64url-encoded for
 /// storage in the config YAML. Called once on first run.
 pub fn generate_secret() -> String {
@@ -103,10 +108,29 @@ impl SessionSigner {
 
     /// Verify a token's signature, header, and expiry. Returns true if valid.
     pub fn verify(&self, token: &str) -> bool {
-        self.verify_inner(token).is_some()
+        !matches!(self.check(token), SessionVerdict::Invalid)
     }
 
-    fn verify_inner(&self, token: &str) -> Option<()> {
+    /// Verify a token and report whether the caller should slide the session by
+    /// re-issuing the cookie. We refresh once the token is past the halfway
+    /// point of its lifetime, so an active user never has to log back in.
+    pub fn check(&self, token: &str) -> SessionVerdict {
+        let Some(claims) = self.verify_inner(token) else {
+            return SessionVerdict::Invalid;
+        };
+        let now = now_unix();
+        if now >= claims.exp {
+            SessionVerdict::Invalid
+        } else if now >= claims.iat + self.ttl.as_secs() / 2 {
+            SessionVerdict::Refresh
+        } else {
+            SessionVerdict::Valid
+        }
+    }
+
+    /// Verify signature and header, returning the decoded claims (expiry not yet
+    /// checked — that's the caller's job via [`Self::check`]).
+    fn verify_inner(&self, token: &str) -> Option<Claims> {
         let mut parts = token.splitn(4, '.');
         let header = parts.next()?;
         let payload = parts.next()?;
@@ -120,9 +144,19 @@ impl SessionSigner {
         mac.update(format!("{header}.{payload}").as_bytes());
         mac.verify_slice(&expected).ok()?;
 
-        let claims: Claims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
-        (now_unix() < claims.exp).then_some(())
+        serde_json::from_slice(&B64.decode(payload).ok()?).ok()
     }
+}
+
+/// Outcome of verifying a session token.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionVerdict {
+    /// Missing, malformed, mis-signed, or expired.
+    Invalid,
+    /// Valid and still fresh — no action needed.
+    Valid,
+    /// Valid but past half its lifetime — caller should re-issue the cookie.
+    Refresh,
 }
 
 fn now_unix() -> u64 {
@@ -144,19 +178,27 @@ mod tests {
     }
 
     #[test]
-    fn issued_token_verifies() {
-        let s = SessionSigner::new(&generate_secret(), Duration::from_secs(60));
-        let t = s.issue();
-        assert!(s.verify(&t));
-        assert!(!s.verify("bogus"));
-        assert!(!s.verify("a.b.c"));
+    fn fresh_token_is_valid() {
+        let s = SessionSigner::new(&generate_secret(), Duration::from_secs(3600));
+        // Well within the first half of its life → valid, no refresh.
+        assert_eq!(s.check(&s.issue()), SessionVerdict::Valid);
+        assert!(s.verify(&s.issue()));
+        assert_eq!(s.check("bogus"), SessionVerdict::Invalid);
+        assert_eq!(s.check("a.b.c"), SessionVerdict::Invalid);
+    }
+
+    #[test]
+    fn past_half_life_asks_to_refresh() {
+        // ttl/2 == 0, so a just-issued token is already past its halfway mark.
+        let s = SessionSigner::new(&generate_secret(), Duration::from_secs(1));
+        assert_eq!(s.check(&s.issue()), SessionVerdict::Refresh);
     }
 
     #[test]
     fn expired_token_rejected() {
         let s = SessionSigner::new(&generate_secret(), Duration::from_secs(0));
         // exp == iat == now, and verification requires now < exp.
-        assert!(!s.verify(&s.issue()));
+        assert_eq!(s.check(&s.issue()), SessionVerdict::Invalid);
     }
 
     #[test]
