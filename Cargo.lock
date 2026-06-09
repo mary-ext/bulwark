@@ -366,6 +366,7 @@ dependencies = [
  "h3",
  "h3-quinn",
  "hickory-proto",
+ "hmac",
  "http",
  "http-body-util",
  "humantime",
@@ -384,6 +385,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "thiserror 2.0.18",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -1225,6 +1227,15 @@ dependencies = [
  "tinyvec",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
 ]
 
 [[package]]

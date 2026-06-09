@@ -32,11 +32,24 @@ async fn main() -> anyhow::Result<()> {
     // Load (or create) config, applying any env overrides for binds.
     let mut config = Config::load_or_default(&paths.config).context("loading config")?;
     app::apply_env_overrides(&mut config);
-    if !paths.config.exists() {
-        config
-            .save(&paths.config)
-            .context("writing initial config")?;
+    // Ensure a session-signing secret exists; generate one on first run. Persist
+    // it (along with a freshly created config) so tokens survive restarts.
+    let mut needs_save = !paths.config.exists();
+    if config.auth.session_secret.is_none() {
+        config.auth.session_secret = Some(auth::generate_secret());
+        needs_save = true;
     }
+    if needs_save {
+        config.save(&paths.config).context("writing config")?;
+    }
+    let sessions = Arc::new(auth::SessionSigner::new(
+        config
+            .auth
+            .session_secret
+            .as_deref()
+            .expect("session secret set above"),
+        Duration::from_secs(7 * 24 * 3600),
+    ));
 
     tracing::info!(data_dir = %paths.data_dir.display(), "starting bulwark");
 
@@ -75,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         engine: engine.clone(),
         config: config.clone(),
         paths: paths.clone(),
-        sessions: Arc::new(auth::Sessions::new(Duration::from_secs(7 * 24 * 3600))),
+        sessions,
         store: store.clone(),
         update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };

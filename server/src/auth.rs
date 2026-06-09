@@ -1,12 +1,17 @@
-//! Password hashing (Argon2) and in-memory session management.
+//! Password hashing (Argon2) and stateless session tokens (signed JWTs).
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use parking_lot::Mutex;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Hash a plaintext password with Argon2id.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
@@ -35,53 +40,96 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 /// Cookie name for the session token.
 pub const SESSION_COOKIE: &str = "bw_session";
 
-/// In-memory session store. Tokens expire after a TTL.
-pub struct Sessions {
-    inner: Mutex<HashMap<String, Instant>>,
+/// Generate a fresh signing secret: 32 random bytes, base64url-encoded for
+/// storage in the config YAML. Called once on first run.
+pub fn generate_secret() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    B64.encode(bytes)
+}
+
+/// Fixed JWT header for HS256. Pre-encoded so verification can pin it with a
+/// byte compare — we never read `alg` from an incoming token, which sidesteps
+/// the classic `alg: none` / algorithm-confusion downgrade.
+const JWT_HEADER_B64: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"; // {"alg":"HS256","typ":"JWT"}
+
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    /// Issued-at (unix seconds).
+    iat: u64,
+    /// Expiry (unix seconds).
+    exp: u64,
+}
+
+/// Stateless session authority. Issues and verifies signed JWTs using an HMAC
+/// secret persisted in the config — no server-side store, so nothing grows
+/// unbounded and tokens survive restarts. Logout clears the cookie but cannot
+/// revoke an outstanding token before its `exp`; rotating the secret (deleting
+/// it from config) invalidates every token at once.
+pub struct SessionSigner {
+    secret: Vec<u8>,
     ttl: Duration,
 }
 
-impl Sessions {
-    pub fn new(ttl: Duration) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            ttl,
+impl SessionSigner {
+    /// Build from the base64url secret stored in config. A non-decodable value
+    /// (hand-edited config) falls back to using its raw bytes as the key, so
+    /// auth still works deterministically rather than panicking at startup.
+    pub fn new(secret_b64: &str, ttl: Duration) -> Self {
+        let secret = B64
+            .decode(secret_b64)
+            .unwrap_or_else(|_| secret_b64.as_bytes().to_vec());
+        Self { secret, ttl }
+    }
+
+    fn sign(&self, signing_input: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        mac.update(signing_input.as_bytes());
+        B64.encode(mac.finalize().into_bytes())
+    }
+
+    /// Issue a new session token valid for `ttl`.
+    pub fn issue(&self) -> String {
+        let now = now_unix();
+        let claims = Claims {
+            iat: now,
+            exp: now + self.ttl.as_secs(),
+        };
+        let payload = B64.encode(serde_json::to_vec(&claims).expect("claims serialize"));
+        let signing_input = format!("{JWT_HEADER_B64}.{payload}");
+        let sig = self.sign(&signing_input);
+        format!("{signing_input}.{sig}")
+    }
+
+    /// Verify a token's signature, header, and expiry. Returns true if valid.
+    pub fn verify(&self, token: &str) -> bool {
+        self.verify_inner(token).is_some()
+    }
+
+    fn verify_inner(&self, token: &str) -> Option<()> {
+        let mut parts = token.splitn(4, '.');
+        let header = parts.next()?;
+        let payload = parts.next()?;
+        let sig = parts.next()?;
+        if parts.next().is_some() || header != JWT_HEADER_B64 {
+            return None;
         }
-    }
+        // Recompute the MAC and compare in constant time.
+        let expected = B64.decode(sig).ok()?;
+        let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
+        mac.update(format!("{header}.{payload}").as_bytes());
+        mac.verify_slice(&expected).ok()?;
 
-    fn random_token() -> String {
-        let mut bytes = [0u8; 32];
-        rand::rng().fill_bytes(&mut bytes);
-        use base64::Engine;
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+        let claims: Claims = serde_json::from_slice(&B64.decode(payload).ok()?).ok()?;
+        (now_unix() < claims.exp).then_some(())
     }
+}
 
-    /// Create a new session and return its token.
-    pub fn create(&self) -> String {
-        let token = Self::random_token();
-        self.inner.lock().insert(token.clone(), Instant::now());
-        token
-    }
-
-    /// Validate a token, refreshing its expiry. Returns true if valid.
-    pub fn validate(&self, token: &str) -> bool {
-        let mut map = self.inner.lock();
-        match map.get(token) {
-            Some(created) if created.elapsed() < self.ttl => {
-                map.insert(token.to_string(), Instant::now());
-                true
-            }
-            Some(_) => {
-                map.remove(token);
-                false
-            }
-            None => false,
-        }
-    }
-
-    pub fn remove(&self, token: &str) {
-        self.inner.lock().remove(token);
-    }
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -96,12 +144,35 @@ mod tests {
     }
 
     #[test]
-    fn sessions_validate_and_expire() {
-        let s = Sessions::new(Duration::from_secs(60));
-        let t = s.create();
-        assert!(s.validate(&t));
-        s.remove(&t);
-        assert!(!s.validate(&t));
-        assert!(!s.validate("bogus"));
+    fn issued_token_verifies() {
+        let s = SessionSigner::new(&generate_secret(), Duration::from_secs(60));
+        let t = s.issue();
+        assert!(s.verify(&t));
+        assert!(!s.verify("bogus"));
+        assert!(!s.verify("a.b.c"));
+    }
+
+    #[test]
+    fn expired_token_rejected() {
+        let s = SessionSigner::new(&generate_secret(), Duration::from_secs(0));
+        // exp == iat == now, and verification requires now < exp.
+        assert!(!s.verify(&s.issue()));
+    }
+
+    #[test]
+    fn tampered_or_foreign_token_rejected() {
+        let secret = generate_secret();
+        let s = SessionSigner::new(&secret, Duration::from_secs(60));
+        let t = s.issue();
+
+        // A token minted under a different secret must not verify.
+        let other = SessionSigner::new(&generate_secret(), Duration::from_secs(60));
+        assert!(!s.verify(&other.issue()));
+
+        // Flipping a character in the payload breaks the signature.
+        let mut bytes = t.into_bytes();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 1;
+        assert!(!s.verify(&String::from_utf8(bytes).unwrap()));
     }
 }

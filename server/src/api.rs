@@ -175,7 +175,7 @@ async fn require_auth(
     next: middleware::Next,
 ) -> Response {
     let ok = cookie_token(&headers)
-        .map(|t| state.sessions.validate(&t))
+        .map(|t| state.sessions.verify(&t))
         .unwrap_or(false);
     if ok {
         next.run(request).await
@@ -212,7 +212,7 @@ pub struct StatusResponse {
 pub async fn status(State(state): State<AppState>, headers: HeaderMap) -> Json<StatusResponse> {
     let cfg = state.config.read().await;
     let authed = cookie_token(&headers)
-        .map(|t| state.sessions.validate(&t))
+        .map(|t| state.sessions.verify(&t))
         .unwrap_or(false);
     Json(StatusResponse {
         setup_needed: cfg.auth.needs_setup(),
@@ -274,7 +274,7 @@ pub async fn setup(
     apply_config(&state, cfg).await.map_err(internal)?;
 
     let secure = is_https(&headers);
-    let token = state.sessions.create();
+    let token = state.sessions.issue();
     let mut out = HeaderMap::new();
     out.insert(
         header::SET_COOKIE,
@@ -310,7 +310,7 @@ pub async fn login(
         return Err(ApiError::Unauthorized);
     }
     let secure = is_https(&headers);
-    let token = state.sessions.create();
+    let token = state.sessions.issue();
     let mut out = HeaderMap::new();
     out.insert(
         header::SET_COOKIE,
@@ -325,10 +325,10 @@ pub async fn login(
     tag = "auth",
     responses((status = 200, body = OkResponse, description = "Session cleared"))
 )]
-pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(t) = cookie_token(&headers) {
-        state.sessions.remove(&t);
-    }
+pub async fn logout() -> Response {
+    // Tokens are stateless signed JWTs, so there's nothing server-side to drop:
+    // clearing the cookie ends the session for this client. An already-issued
+    // token stays valid until its `exp`; rotate the config secret to revoke all.
     let mut out = HeaderMap::new();
     out.insert(
         header::SET_COOKIE,
@@ -355,6 +355,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Respon
 pub async fn get_config(State(state): State<AppState>) -> Json<Config> {
     let (mut cfg, _update) = state.begin_update().await;
     cfg.auth.password_hash = None;
+    cfg.auth.session_secret = None;
     Json(cfg)
 }
 

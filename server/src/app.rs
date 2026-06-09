@@ -15,7 +15,7 @@ use bulwark_filter::Compiler;
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
 use tokio::sync::RwLock;
 
-use crate::auth::Sessions;
+use crate::auth::SessionSigner;
 
 /// Filesystem layout under the data directory.
 #[derive(Debug, Clone)]
@@ -54,7 +54,7 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub config: Arc<RwLock<Config>>,
     pub paths: Arc<Paths>,
-    pub sessions: Arc<Sessions>,
+    pub sessions: Arc<SessionSigner>,
     /// Disk-backed query-log store, read by the API and written by the
     /// background writer task.
     pub store: Arc<crate::store::QueryStore>,

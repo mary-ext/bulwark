@@ -366,6 +366,11 @@ pub struct AuthConfig {
     /// rides the wire, and the YAML stays clean before setup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
+    /// HMAC secret (base64url) for signing session JWTs. Generated on first run
+    /// if absent. Redacted from the config API like `password_hash`; deleting it
+    /// from the YAML rotates the secret and invalidates all outstanding tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_secret: Option<String>,
 }
 
 impl AuthConfig {

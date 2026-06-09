@@ -70,6 +70,9 @@ humantime = "2"
 ipnet = { version = "2", features = ["serde"] }
 argon2 = "0.5"
 base64 = "0.22"
+# HS256 signing for stateless session JWTs (see server/src/auth.rs).
+hmac = "0.12"
+sha2 = "0.10"
 # Embedded SQLite-compatible store for the query log. Pure-Rust, tokio-native.
 # default-features disabled to avoid the bundled mimalloc global allocator (we
 # keep control of the server allocator) and FTS (not needed yet — LIKE search).
