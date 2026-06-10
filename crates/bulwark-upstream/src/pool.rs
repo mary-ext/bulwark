@@ -246,19 +246,25 @@ impl Upstream {
         (at > now).then(|| at - now)
     }
 
-    /// Sort key: healthy upstreams first, then by latency (unknown latency
-    /// sorts as "fast" so a fresh upstream gets a chance). An upstream that has
-    /// crossed the failure threshold sorts last regardless of whether it ever
-    /// succeeded (`up` is presumed-true until then).
-    fn sort_key(&self) -> (bool, u64) {
+    /// Sort key for live selection, ascending: healthy-and-sampled upstreams
+    /// first (ordered by latency), then healthy-but-unsampled, then down ones.
+    ///
+    /// An unsampled upstream sorts *after* every proven-healthy one rather than
+    /// as "fastest": we don't yet know its latency, so it must not preempt a
+    /// known-good leader for live traffic — a new upstream that accepts the
+    /// connection but black-holes the query would otherwise cost a full timeout
+    /// on real queries before being demoted. It stays eligible (ahead of down
+    /// upstreams), and the background probe warms its latency estimate without
+    /// risking live queries on it. `up` is presumed-true until the failure
+    /// threshold is crossed, so a never-sampled upstream still outranks a downed
+    /// one. At cold start every upstream is unsampled and ties here, so the
+    /// stable sort preserves configured order.
+    fn sort_key(&self) -> (bool, bool, u64) {
         let h = self.health.lock();
         let down = !h.up;
-        let lat = if h.samples == 0 {
-            0
-        } else {
-            h.ewma_ms.round() as u64
-        };
-        (down, lat)
+        let unsampled = h.samples == 0;
+        let lat = h.ewma_ms.round() as u64;
+        (down, unsampled, lat)
     }
 
     /// A snapshot of this upstream's stats for the UI.

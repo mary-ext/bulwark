@@ -209,6 +209,44 @@ async fn prefers_fastest_upstream_after_probing() {
     assert!(fast_stat.avg_rtt_ms.unwrap() < 50.0);
 }
 
+#[tokio::test]
+async fn known_leader_preferred_over_freshly_added_unknown() {
+    // A proven, sampled upstream must keep live traffic when a brand-new,
+    // never-sampled upstream is added ahead of it on reload. Previously the new
+    // upstream sorted as latency 0 ("fastest") and stole the next query — costing
+    // a full timeout if it happened to be a black hole.
+    let known = spawn_mock(Behaviour::Answer(Ipv4Addr::new(5, 5, 5, 5), 0)).await;
+    let old = UpstreamPool::build(&[entry(known.addr)], settings())
+        .await
+        .unwrap();
+    old.resolve(&make_query("warm.test.")).await.unwrap();
+    let known_after_warmup = known.received.load(Ordering::SeqCst);
+
+    // Reload: a new upstream is listed FIRST, the known one second. The new pool
+    // adopts the known upstream's sampled health; the added one stays unsampled.
+    let added = spawn_mock(Behaviour::Answer(Ipv4Addr::new(9, 9, 9, 9), 0)).await;
+    let new = UpstreamPool::build(&[entry(added.addr), entry(known.addr)], settings())
+        .await
+        .unwrap();
+    new.adopt_health_from(&old);
+
+    let resp = new.resolve(&make_query("live.test.")).await.unwrap();
+    assert_eq!(
+        resp.upstream,
+        format!("udp://{}", known.addr),
+        "a sampled leader must be preferred over an unsampled newcomer"
+    );
+    assert_eq!(
+        added.received.load(Ordering::SeqCst),
+        0,
+        "the unsampled newcomer must not receive the live query"
+    );
+    assert_eq!(
+        known.received.load(Ordering::SeqCst),
+        known_after_warmup + 1
+    );
+}
+
 /// Poll `cond` until it's true or `timeout` elapses (panicking on timeout).
 async fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = std::time::Instant::now();
