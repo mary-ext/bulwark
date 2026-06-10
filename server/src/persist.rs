@@ -17,7 +17,15 @@ use crate::store::QueryStore;
 /// ahead of the background writer before the DNS hot path sheds them (see
 /// [`bulwark_engine::querylog::QueryLog::push`]), so a stalled or slow writer
 /// can't grow memory without limit.
-pub const QUERYLOG_CHANNEL_CAP: usize = 16_384;
+///
+/// The writer drains up to 512 entries per SQLite transaction (see
+/// [`spawn_querylog_writer`]) and keeps up with any realistic query rate by a
+/// wide margin, so in steady state the channel sits near-empty — the cap is
+/// reached only while the writer is stalled (slow fsync, disk contention, the
+/// pruner holding the write lock). At ~400 B per [`QueryLogEntry`] all-in, this
+/// bounds that worst-case spike to ~1.5 MB while still buffering eight full
+/// drain batches before shedding — ample for a transient stall.
+pub const QUERYLOG_CHANNEL_CAP: usize = 4_096;
 
 fn now_ms() -> i64 {
     SystemTime::now()
