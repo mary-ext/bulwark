@@ -95,8 +95,11 @@ fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
 /// pool decoded them), and the per-record `filter.check` only fires for the
 /// record types we inspect, so this rides along the cache-miss path that is
 /// already network-bound.
-/// Stack buffer for an IP literal, sized for the longest IPv6 textual form
-/// (`ffff:…:255.255.255.255`, 45 chars). Lets the per-answer filter stringify
+/// Stack buffer for an IP literal. 48 bytes clears the longest text `Display`
+/// emits for an address — 39 chars for an all-hextet IPv6 like
+/// `ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff` (Rust only uses the shorter
+/// IPv4-embedded form for mapped/compatible addresses), and well under the
+/// 45-char `INET6_ADDRSTRLEN` upper bound. Lets the per-answer filter stringify
 /// `A`/`AAAA`/hint addresses without a heap allocation per record.
 struct IpBuf {
     buf: [u8; 48],
