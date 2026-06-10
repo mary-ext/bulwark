@@ -159,7 +159,9 @@ async fn serve_tcp_conn(
             _ => return Ok(()), // body error or stall: close.
         }
 
-        let Some(ingress) = Ingress::parse(&msg_buf) else {
+        // Move the exactly-sized body buffer into the parser: the fast path keeps
+        // it without a second copy, and it isn't reused after this.
+        let Some(ingress) = Ingress::parse_owned(msg_buf) else {
             return Ok(());
         };
         let resp = engine.handle(ingress, peer.ip()).await;

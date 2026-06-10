@@ -763,6 +763,17 @@ impl Ingress {
         }
     }
 
+    /// Like [`parse`](Self::parse) but takes ownership of the query bytes, so the
+    /// fast path keeps them without a second copy. Used by the TCP listener, whose
+    /// per-query body buffer is exactly sized and used only here — unlike the UDP
+    /// recv buffer, which is reused across datagrams and must stay borrowed.
+    pub fn parse_owned(bytes: Vec<u8>) -> Option<Self> {
+        match wire::parse_query(&bytes) {
+            Some(parsed) => Some(Ingress::Fast { bytes, parsed }),
+            None => Message::from_vec(&bytes).ok().map(Ingress::Full),
+        }
+    }
+
     /// The client's maximum acceptable UDP payload (EDNS advertised size, clamped
     /// to 512..=4096) — identical to what the full-parse path computed from `edns`.
     pub fn udp_max_payload(&self) -> usize {
