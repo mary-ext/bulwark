@@ -3,67 +3,83 @@
 //! Maps a source IP to a configured client (name + tags + per-client filtering
 //! toggle), matching by exact IP or CIDR range.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use bulwark_config::ClientConfig;
 use ipnet::IpNet;
 
 struct ClientEntry {
-    name: String,
+    name: Arc<str>,
+    /// CIDR ranges only; exact-host ids live in [`ClientMatcher::hosts`].
     nets: Vec<IpNet>,
-    tags: Vec<String>,
+    tags: Arc<[String]>,
     filtering_enabled: bool,
 }
 
-/// A resolved client for a request.
+/// A resolved client for a request. Name and tags are shared (`Arc`) with the
+/// matcher, so identifying a client is refcount bumps rather than allocations.
 #[derive(Debug, Clone)]
 pub struct ResolvedClient {
     pub ip: IpAddr,
     /// Friendly name, if the IP matched a configured client.
-    pub name: Option<String>,
-    pub tags: Vec<String>,
+    pub name: Option<Arc<str>>,
+    pub tags: Arc<[String]>,
     pub filtering_enabled: bool,
 }
 
 impl ResolvedClient {
     /// Display label: the configured name, else the IP string.
     pub fn label(&self) -> String {
-        self.name.clone().unwrap_or_else(|| self.ip.to_string())
+        match &self.name {
+            Some(name) => name.to_string(),
+            None => self.ip.to_string(),
+        }
     }
 }
 
 /// Matches source IPs to configured clients.
 #[derive(Default)]
 pub struct ClientMatcher {
+    /// Exact-host ids (`/32`, `/128`) indexed for O(1) lookup. A host match is
+    /// always the longest possible prefix, so it wins outright without scanning
+    /// the CIDR entries. Earliest-configured entry wins on duplicate hosts.
+    hosts: HashMap<IpAddr, usize>,
     entries: Vec<ClientEntry>,
+    /// Shared empty tag list returned for unknown clients, so the per-query miss
+    /// path clones an `Arc` instead of allocating.
+    empty_tags: Arc<[String]>,
 }
 
 impl ClientMatcher {
     /// Build from configured clients. Invalid id strings are skipped.
     pub fn build(clients: &[ClientConfig]) -> Self {
         let mut entries = Vec::new();
+        let mut hosts: HashMap<IpAddr, usize> = HashMap::new();
         for c in clients {
+            let idx = entries.len();
             let mut nets = Vec::new();
             for id in &c.ids {
-                if let Ok(net) = id.parse::<IpNet>() {
-                    nets.push(net);
-                } else if let Ok(ip) = id.parse::<IpAddr>() {
-                    // Single IP -> host route.
-                    let net = match ip {
-                        IpAddr::V4(v4) => IpNet::V4(ipnet::Ipv4Net::new(v4, 32).unwrap()),
-                        IpAddr::V6(v6) => IpNet::V6(ipnet::Ipv6Net::new(v6, 128).unwrap()),
-                    };
+                if let Ok(ip) = id.parse::<IpAddr>() {
+                    // Bare IP -> exact host. First entry to claim it keeps it.
+                    hosts.entry(ip).or_insert(idx);
+                } else if let Ok(net) = id.parse::<IpNet>() {
                     nets.push(net);
                 }
             }
             entries.push(ClientEntry {
-                name: c.name.clone(),
+                name: Arc::from(c.name.as_str()),
                 nets,
-                tags: c.tags.clone(),
+                tags: Arc::from(c.tags.as_slice()),
                 filtering_enabled: c.filtering_enabled,
             });
         }
-        Self { entries }
+        Self {
+            hosts,
+            entries,
+            empty_tags: Arc::from(Vec::new()),
+        }
     }
 
     /// The entry whose most-specific (longest-prefix) net contains `ip`, if any.
@@ -71,6 +87,11 @@ impl ClientMatcher {
     /// regardless of config order (e.g. a `/32` beats a `10.0.0.0/8` listed
     /// first). Ties on prefix length go to the earlier-configured entry.
     fn best_match(&self, ip: IpAddr) -> Option<&ClientEntry> {
+        // An exact-host id is a /32 (or /128): the longest prefix possible, so a
+        // hit short-circuits the CIDR scan entirely.
+        if let Some(&idx) = self.hosts.get(&ip) {
+            return Some(&self.entries[idx]);
+        }
         let mut best: Option<(u8, &ClientEntry)> = None;
         for e in &self.entries {
             if let Some(plen) = e
@@ -101,7 +122,7 @@ impl ClientMatcher {
             None => ResolvedClient {
                 ip,
                 name: None,
-                tags: Vec::new(),
+                tags: self.empty_tags.clone(),
                 filtering_enabled: true,
             },
         }
@@ -111,7 +132,7 @@ impl ClientMatcher {
     /// matcher (no allocation). Used to resolve display names at read time so a
     /// rename or removal in the client config applies retroactively.
     pub fn name_for(&self, ip: IpAddr) -> Option<&str> {
-        self.best_match(ip).map(|e| e.name.as_str())
+        self.best_match(ip).map(|e| e.name.as_ref())
     }
 
     /// Resolve a stored client-IP string to its current configured name, if any.

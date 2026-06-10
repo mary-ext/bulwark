@@ -575,7 +575,7 @@ impl Engine {
                 let placeholder = ResolvedClient {
                     ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                     name: None,
-                    tags: Vec::new(),
+                    tags: Arc::from(Vec::new()),
                     filtering_enabled: true,
                 };
                 let verdict =
