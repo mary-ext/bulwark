@@ -11,6 +11,8 @@ pub enum UpstreamError {
     Io(String),
     #[error("dns protocol error: {0}")]
     Proto(String),
+    #[error("upstream returned {0}")]
+    Rcode(String),
     #[error("tls error: {0}")]
     Tls(String),
     #[error("quic error: {0}")]

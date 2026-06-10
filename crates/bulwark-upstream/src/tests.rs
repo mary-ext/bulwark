@@ -27,6 +27,8 @@ struct Mock {
 enum Behaviour {
     /// Answer with the given A record after an optional delay (ms).
     Answer(Ipv4Addr, u64),
+    /// Reply immediately with the given response code and no answer records.
+    Code(ResponseCode),
     /// Receive but never respond (forces the client to time out).
     Drop,
 }
@@ -47,6 +49,14 @@ async fn spawn_mock(behaviour: Behaviour) -> Mock {
             let query = decode(&buf[..n]).unwrap();
             match behaviour {
                 Behaviour::Drop => continue,
+                Behaviour::Code(rcode) => {
+                    let mut resp = query.clone();
+                    resp.metadata.message_type = MessageType::Response;
+                    resp.metadata.response_code = rcode;
+                    resp.metadata.recursion_available = true;
+                    let bytes = encode(&resp).unwrap();
+                    let _ = sock.send_to(&bytes, peer).await;
+                }
                 Behaviour::Answer(ip, delay) => {
                     if delay > 0 {
                         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -382,6 +392,73 @@ async fn all_upstreams_down_errors() {
         .unwrap();
     let err = pool.resolve(&make_query("nope.test.")).await;
     assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn fails_over_past_a_fast_servfail() {
+    // A fast SERVFAIL must not satisfy the query: the pool has to fail over to a
+    // resolver that actually answers, and the SERVFAIL upstream must not be
+    // recorded as a (fast) success that would make it the leader.
+    let servfail = spawn_mock(Behaviour::Code(ResponseCode::ServFail)).await;
+    let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(7, 7, 7, 7), 0)).await;
+    // SERVFAIL listed first; both unsampled so it's tried first.
+    let pool = UpstreamPool::build(&[entry(servfail.addr), entry(good.addr)], settings())
+        .await
+        .unwrap();
+
+    let resp = pool.resolve(&make_query("sf.test.")).await.unwrap();
+    assert_eq!(resp.message.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(resp.message.answers.len(), 1);
+    assert_eq!(resp.upstream, format!("udp://{}", good.addr));
+    assert!(servfail.received.load(Ordering::SeqCst) >= 1);
+
+    // The SERVFAIL upstream stays up (a SERVFAIL is plausibly the query's fault)
+    // but never recorded a latency, so it can't have become the leader.
+    let sf_stat = pool
+        .stats()
+        .into_iter()
+        .find(|s| s.spec.contains(&servfail.addr.to_string()))
+        .unwrap();
+    assert!(sf_stat.up, "a SERVFAIL must not mark the upstream down");
+    assert!(
+        sf_stat.avg_rtt_ms.is_none(),
+        "a SERVFAIL must not be recorded as a latency sample"
+    );
+}
+
+#[tokio::test]
+async fn refused_upstream_is_marked_down() {
+    // REFUSED is an upstream-level rejection, so unlike SERVFAIL it counts
+    // against health (failure_threshold is 1 here) and the pool fails over.
+    let refused = spawn_mock(Behaviour::Code(ResponseCode::Refused)).await;
+    let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
+    let pool = UpstreamPool::build(&[entry(refused.addr), entry(good.addr)], settings())
+        .await
+        .unwrap();
+
+    let resp = pool.resolve(&make_query("ref.test.")).await.unwrap();
+    assert_eq!(resp.upstream, format!("udp://{}", good.addr));
+
+    let stat = pool
+        .stats()
+        .into_iter()
+        .find(|s| s.spec.contains(&refused.addr.to_string()))
+        .unwrap();
+    assert!(!stat.up, "a REFUSED upstream must be marked down");
+}
+
+#[tokio::test]
+async fn all_servfail_returns_the_servfail() {
+    // If every upstream SERVFAILs, the client should get that real response
+    // rather than an opaque "all upstreams failed" error.
+    let servfail = spawn_mock(Behaviour::Code(ResponseCode::ServFail)).await;
+    let pool = UpstreamPool::build(&[entry(servfail.addr)], settings())
+        .await
+        .unwrap();
+
+    let resp = pool.resolve(&make_query("allsf.test.")).await.unwrap();
+    assert_eq!(resp.message.metadata.response_code, ResponseCode::ServFail);
+    assert_eq!(resp.message.metadata.id, 0x4242, "caller id is restored");
 }
 
 #[test]

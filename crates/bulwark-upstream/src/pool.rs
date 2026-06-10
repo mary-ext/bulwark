@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use futures::future::{BoxFuture, Shared};
 use futures::FutureExt;
-use hickory_proto::op::{Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::{DNSClass, Name, RecordType};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -203,6 +203,20 @@ impl Upstream {
         // Failing: retry with exponential backoff + jitter so a dead upstream is
         // probed often at first, then ever less aggressively.
         h.next_probe_at = Some(Instant::now() + jitter(retry_backoff(h.consecutive_failures)));
+    }
+
+    /// Record an attempt that didn't usefully answer but doesn't indict the
+    /// upstream's health — a SERVFAIL/FORMERR that's plausibly the *query's*
+    /// fault (a DNSSEC-bogus or malformed name), not the resolver's. It shows up
+    /// in the totals so the UI reflects the miss, but it leaves `up`,
+    /// `consecutive_failures`, the latency EWMA, and the probe schedule alone:
+    /// otherwise one repeatedly-queried bogus domain could mark every upstream
+    /// down, and a fast SERVFAIL could capture the latency lead.
+    fn record_soft_failure(&self, err: &UpstreamError) {
+        let mut h = self.health.lock();
+        h.total_queries += 1;
+        h.total_failures += 1;
+        h.last_error = Some(err.to_string());
     }
 
     /// This upstream's smoothed latency, but only if it's currently a viable
@@ -536,10 +550,49 @@ async fn probe_loop(up: Arc<Upstream>, peers: Vec<Arc<Upstream>>, settings: Pool
 async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings) {
     let start = Instant::now();
     match tokio::time::timeout(settings.query_timeout, up.transport.query(query)).await {
-        Ok(Ok(_)) => up.record_success(start.elapsed(), settings.ewma_alpha),
+        // The probe is a fixed, universally-answerable query (`NS .`), so unlike
+        // an arbitrary live query, *any* non-answer to it (SERVFAIL as much as
+        // REFUSED) genuinely indicts the resolver — treat it as a failed probe.
+        Ok(Ok(resp)) => match classify(&resp) {
+            Verdict::Answer => up.record_success(start.elapsed(), settings.ewma_alpha),
+            _ => up.record_failure(&rcode_err(&resp), settings.failure_threshold),
+        },
         Ok(Err(e)) => up.record_failure(&e, settings.failure_threshold),
         Err(_) => up.record_failure(&UpstreamError::Timeout, settings.failure_threshold),
     }
+}
+
+/// What a protocol-valid DNS response means for selection and health.
+enum Verdict {
+    /// A usable answer — NOERROR (incl. NODATA), NXDOMAIN, and other valid
+    /// results. Counts as a latency success and is returned to the client. A
+    /// negative answer like NXDOMAIN is a real answer: we must NOT fail over.
+    Answer,
+    /// The upstream is reachable but won't serve this query (REFUSED/NOTIMP).
+    /// That's an upstream-level problem: fail over and count it against health.
+    Reject,
+    /// A failure that's plausibly the query's fault rather than the upstream's
+    /// (SERVFAIL/FORMERR — e.g. a DNSSEC-bogus or malformed name). Fail over to
+    /// give another resolver a shot, but don't penalise the upstream's health.
+    SoftFail,
+}
+
+/// Classify a response code for failover and health accounting. The point is
+/// that a *fast* SERVFAIL/REFUSED must not look like a success: otherwise such
+/// an upstream becomes the latency leader and blocks failover to one that would
+/// actually answer.
+fn classify(resp: &Message) -> Verdict {
+    match resp.metadata.response_code {
+        ResponseCode::Refused | ResponseCode::NotImp => Verdict::Reject,
+        ResponseCode::ServFail | ResponseCode::FormErr => Verdict::SoftFail,
+        _ => Verdict::Answer,
+    }
+}
+
+/// The error carrying an upstream's non-answer response code, for `last_error`
+/// reporting and the "all failed" fallthrough.
+fn rcode_err(resp: &Message) -> UpstreamError {
+    UpstreamError::Rcode(format!("{:?}", resp.metadata.response_code))
 }
 
 /// Try each upstream in order until one answers. Never queries more than one
@@ -552,17 +605,49 @@ async fn resolve_sequential(
     threshold: u32,
 ) -> SharedResult<Resolved> {
     let mut last = UpstreamError::NoUpstreams;
+    // A non-answer response (SERVFAIL/REFUSED/…) to hand back if no upstream
+    // produces a real answer. Returning the upstream's own SERVFAIL is the
+    // correct DNS behaviour — and more useful to the client than an opaque
+    // "all failed". Holds the first one seen, i.e. from the most-preferred
+    // upstream.
+    let mut fallback: Option<Resolved> = None;
     for up in ordered {
         let start = Instant::now();
         match tokio::time::timeout(timeout, up.transport.query(&query)).await {
             Ok(Ok(resp)) => {
                 let rtt = start.elapsed();
-                up.record_success(rtt, alpha);
-                return Ok(Resolved {
-                    message: resp,
-                    upstream: up.name.clone(),
-                    rtt_ms: rtt.as_secs_f64() * 1000.0,
-                });
+                let rtt_ms = rtt.as_secs_f64() * 1000.0;
+                match classify(&resp) {
+                    Verdict::Answer => {
+                        up.record_success(rtt, alpha);
+                        return Ok(Resolved {
+                            message: resp,
+                            upstream: up.name.clone(),
+                            rtt_ms,
+                        });
+                    }
+                    // A rejection/soft-failure must not become the latency
+                    // leader, so neither path calls `record_success`. Reject
+                    // counts against health; SoftFail is logged but health-
+                    // neutral (see `record_soft_failure`). Either way we keep the
+                    // response and try the next upstream.
+                    verdict => {
+                        let err = rcode_err(&resp);
+                        match verdict {
+                            Verdict::Reject => up.record_failure(&err, threshold),
+                            _ => up.record_soft_failure(&err),
+                        }
+                        // Keep the first (most-preferred) non-answer as fallback.
+                        if fallback.is_none() {
+                            fallback = Some(Resolved {
+                                message: resp,
+                                upstream: up.name.clone(),
+                                rtt_ms,
+                            });
+                        }
+                        last = err;
+                    }
+                }
             }
             Ok(Err(e)) => {
                 up.record_failure(&e, threshold);
@@ -573,6 +658,11 @@ async fn resolve_sequential(
                 last = UpstreamError::Timeout;
             }
         }
+    }
+    // Every upstream failed. Prefer returning a real upstream response (e.g. a
+    // SERVFAIL) over the synthetic "all failed" error.
+    if let Some(resolved) = fallback {
+        return Ok(resolved);
     }
     Err(Arc::new(UpstreamError::AllFailed(Box::new(last))))
 }
