@@ -1,10 +1,44 @@
 //! The [`Transport`] trait and shared query-key / wire helpers.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use futures::future::BoxFuture;
 use hickory_proto::op::{Edns, Message};
 use hickory_proto::rr::{DNSClass, RecordType};
+use parking_lot::Mutex as SyncMutex;
+use tokio::sync::oneshot;
 
 use crate::error::{Result, UpstreamError};
+
+/// Waiters for in-flight queries on a pipelined connection, keyed by
+/// connection-local id, plus a `dead` flag. The flag and the map are guarded
+/// together so registering a new waiter and tearing the connection down are
+/// mutually exclusive: a registration either wins (its sender ends up in the map
+/// and is dropped by teardown, waking the waiter) or loses (it sees `dead` and
+/// errors at once). Shared by the DoT and connected-UDP transports, which both
+/// multiplex many queries over one socket and demux replies by id.
+#[derive(Default)]
+pub(crate) struct PendingState {
+    pub(crate) map: HashMap<u16, oneshot::Sender<Message>>,
+    pub(crate) dead: bool,
+}
+
+pub(crate) type Pending = Arc<SyncMutex<PendingState>>;
+
+/// Deregisters an in-flight query if its future is dropped (cancelled or errored)
+/// before the reader delivers a response — so a cancelled query can't leak a
+/// pending slot. A no-op once the reader has already removed the id.
+pub(crate) struct PendingGuard {
+    pub(crate) pending: Pending,
+    pub(crate) id: u16,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending.lock().map.remove(&self.id);
+    }
+}
 
 /// A single upstream transport (UDP, TCP, DoT, DoH, or DoQ).
 ///

@@ -9,7 +9,6 @@
 //! at a time, so under load a query could wait out the pool timeout before ever
 //! reaching the wire and be wrongly counted as an upstream failure.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -31,34 +30,7 @@ use crate::error::{Result, UpstreamError};
 use crate::plain::{read_tcp_message, write_tcp_message};
 use crate::spec::UpstreamSpec;
 use crate::tlsconf::dot_config;
-use crate::transport::{matches_query, Transport};
-
-/// Waiters for in-flight queries on a connection, keyed by connection-local id,
-/// plus a `dead` flag. The flag and the map are guarded together so registering
-/// a new waiter and tearing the connection down are mutually exclusive: a
-/// registration either wins (its sender ends up in the map and is dropped by
-/// teardown, waking the waiter) or loses (it sees `dead` and errors at once).
-#[derive(Default)]
-struct PendingState {
-    map: HashMap<u16, oneshot::Sender<Message>>,
-    dead: bool,
-}
-
-type Pending = Arc<SyncMutex<PendingState>>;
-
-/// Deregisters an in-flight query if its future is dropped (cancelled or errored)
-/// before the reader delivers a response — so a cancelled query can't leak a
-/// pending slot. A no-op once the reader has already removed the id.
-struct PendingGuard {
-    pending: Pending,
-    id: u16,
-}
-
-impl Drop for PendingGuard {
-    fn drop(&mut self) {
-        self.pending.lock().map.remove(&self.id);
-    }
-}
+use crate::transport::{matches_query, Pending, PendingGuard, PendingState, Transport};
 
 /// One pipelined connection: a serialized write half, the pending-waiter table,
 /// the id allocator, and the reader task draining the read half.
