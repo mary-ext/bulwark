@@ -491,11 +491,19 @@ impl UpstreamPool {
         // this `resolve` is cancelled mid-await — a dropped leader can no longer
         // leak a completed entry that later callers would inherit forever.
         // Followers get no guard: they don't own the entry.
+        //
+        // The inflight mutex guards only the map get/insert. Building the resolve
+        // future — ranking the upstreams (which locks each upstream's health) and
+        // cloning/normalizing the query — is done *outside* the lock so unrelated
+        // misses don't serialize behind that work. The slow path double-checks the
+        // map after re-locking in case an identical miss raced us; the loser drops
+        // its freshly-built (never-polled) future, which has no side effects.
         let (fut, _guard) = {
-            let mut map = self.inflight.lock();
+            let map = self.inflight.lock();
             if let Some(existing) = map.get(&key) {
                 (existing.clone(), None)
             } else {
+                drop(map);
                 let ordered = self.ordered();
                 let timeout = self.settings.query_timeout;
                 let alpha = self.settings.ewma_alpha;
@@ -510,12 +518,17 @@ impl UpstreamPool {
                     async move { resolve_sequential(ordered, q, timeout, alpha, threshold).await }
                         .boxed()
                         .shared();
-                map.insert(key.clone(), fut.clone());
-                let guard = InflightGuard {
-                    map: &self.inflight,
-                    key: key.clone(),
-                };
-                (fut, Some(guard))
+                let mut map = self.inflight.lock();
+                if let Some(existing) = map.get(&key) {
+                    (existing.clone(), None)
+                } else {
+                    map.insert(key.clone(), fut.clone());
+                    let guard = InflightGuard {
+                        map: &self.inflight,
+                        key: key.clone(),
+                    };
+                    (fut, Some(guard))
+                }
             }
         };
 
