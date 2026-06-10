@@ -207,17 +207,18 @@ impl DohTransport {
     }
 
     async fn query_inner(&self, query: &Message) -> Result<Message> {
-        // RFC 8484 recommends id 0 for cacheability; restore the caller's id.
+        // RFC 8484 recommends id 0 on the wire for cacheability; restore the
+        // caller's id on the response. Patch the id directly into the encoded
+        // header rather than cloning the whole `Message` to zero it.
         let original_id = query.metadata.id;
-        let mut q = query.clone();
-        q.metadata.id = 0;
-        let body = encode(&q)?;
+        let mut body = encode(query)?;
+        body[..2].copy_from_slice(&[0, 0]);
 
         // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
             let client = self.h3().await?;
             return self
-                .exchange(&client, &body, &q, original_id, false, true)
+                .exchange(&client, &body, query, original_id, false, true)
                 .await;
         }
 
@@ -226,7 +227,7 @@ impl DohTransport {
         if self.h3_fresh() {
             let client = self.h3().await?;
             match self
-                .exchange(&client, &body, &q, original_id, false, true)
+                .exchange(&client, &body, query, original_id, false, true)
                 .await
             {
                 Ok(msg) => return Ok(msg),
@@ -239,7 +240,7 @@ impl DohTransport {
 
         // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
         let client = self.h12().await?;
-        self.exchange(&client, &body, &q, original_id, true, false)
+        self.exchange(&client, &body, query, original_id, true, false)
             .await
     }
 
@@ -308,15 +309,15 @@ impl DohTransport {
             body.extend_from_slice(&chunk);
         }
         let mut msg = decode(&body)?;
-        // `expect` and the response both carry id 0 (RFC 8484), so verify the
-        // response answers our question before trusting it — otherwise a buggy
-        // or hostile server could get its answer cached under our key.
+        // The response carries id 0 (RFC 8484); restore the caller's id, then
+        // verify the response answers our question before trusting it — otherwise
+        // a buggy or hostile server could get its answer cached under our key.
+        msg.metadata.id = original_id;
         if !matches_query(expect, &msg) {
             return Err(UpstreamError::Http(
                 "DoH response does not match query".into(),
             ));
         }
-        msg.metadata.id = original_id;
         Ok(msg)
     }
 }

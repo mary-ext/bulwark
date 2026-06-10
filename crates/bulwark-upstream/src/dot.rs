@@ -27,10 +27,10 @@ use tokio_rustls::TlsConnector;
 
 use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
-use crate::plain::{read_tcp_message, write_tcp_message};
+use crate::plain::{read_tcp_message, write_tcp_bytes};
 use crate::spec::UpstreamSpec;
 use crate::tlsconf::dot_config;
-use crate::transport::{matches_query, Pending, PendingGuard, PendingState, Transport};
+use crate::transport::{encode, matches_query, Pending, PendingGuard, PendingState, Transport};
 
 /// One pipelined connection: a serialized write half, the pending-waiter table,
 /// the id allocator, and the reader task draining the read half.
@@ -76,8 +76,10 @@ where
     async fn exchange(&self, query: &Message) -> Result<Message> {
         let original_id = query.metadata.id;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut sent = query.clone();
-        sent.metadata.id = id;
+        // Patch the demux id directly into the wire header (first two bytes) rather
+        // than cloning the whole `Message` just to change it.
+        let mut buf = encode(query)?;
+        buf[..2].copy_from_slice(&id.to_be_bytes());
 
         let (tx, rx) = oneshot::channel();
         {
@@ -94,7 +96,7 @@ where
 
         {
             let mut w = self.write.lock().await;
-            write_tcp_message(&mut *w, &sent).await?;
+            write_tcp_bytes(&mut *w, &buf).await?;
         }
 
         // The reader removed our id from the map before sending; if the
@@ -103,12 +105,15 @@ where
         let mut resp = rx
             .await
             .map_err(|_| UpstreamError::Io("DoT connection closed".into()))?;
-        if !matches_query(&sent, &resp) {
+        // The reader already demuxed this response to us by its (connection-local)
+        // id, so restore the caller's id and validate the question against the
+        // original query — the id echo is guaranteed by the routing.
+        resp.metadata.id = original_id;
+        if !matches_query(query, &resp) {
             return Err(UpstreamError::Proto(
                 "DoT response does not match query".into(),
             ));
         }
-        resp.metadata.id = original_id;
         Ok(resp)
     }
 }
@@ -226,6 +231,7 @@ impl Transport for DotTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plain::write_tcp_message;
     use hickory_proto::op::{MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{DNSClass, Name, RecordType};
     use std::str::FromStr;

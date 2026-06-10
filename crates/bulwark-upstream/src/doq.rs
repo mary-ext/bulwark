@@ -86,13 +86,15 @@ impl DoqTransport {
     }
 
     async fn query_inner(&self, query: &Message) -> Result<Message> {
+        // RFC 9250 carries id 0 on the wire; restore the caller's id on the
+        // response. Patch the id directly into the encoded header rather than
+        // cloning the whole `Message` to zero it.
         let original_id = query.metadata.id;
-        let mut q = query.clone();
-        q.metadata.id = 0;
-        let body = encode(&q)?;
+        let mut body = encode(query)?;
         if body.len() > u16::MAX as usize {
             return Err(UpstreamError::Proto("message too large".into()));
         }
+        body[..2].copy_from_slice(&[0, 0]);
 
         let conn = self.connection().await?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(quic)?;
@@ -107,16 +109,16 @@ impl DoqTransport {
             return Err(UpstreamError::Proto("short DoQ response".into()));
         }
         let mut msg = decode(&data[2..])?;
-        // Both `q` and the response carry id 0 on the wire (RFC 9250), so verify
-        // the response actually answers our question (name/type/class) before
-        // trusting it — a hostile or buggy upstream must not get its answer
-        // cached under our key.
-        if !matches_query(&q, &msg) {
+        // The response carries id 0 on the wire (RFC 9250); restore the caller's
+        // id, then verify the response actually answers our question
+        // (name/type/class) before trusting it — a hostile or buggy upstream must
+        // not get its answer cached under our key.
+        msg.metadata.id = original_id;
+        if !matches_query(query, &msg) {
             return Err(UpstreamError::Proto(
                 "DoQ response does not match query".into(),
             ));
         }
-        msg.metadata.id = original_id;
         Ok(msg)
     }
 }

@@ -39,12 +39,22 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let bytes = encode(msg)?;
+    write_tcp_bytes(stream, &bytes).await
+}
+
+/// Frame and write an already-encoded DNS message over TCP (2-byte length prefix).
+/// Lets callers that patch the wire id in place (e.g. DoT's per-query demux id)
+/// avoid re-encoding through [`write_tcp_message`].
+pub(crate) async fn write_tcp_bytes<W>(stream: &mut W, bytes: &[u8]) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     if bytes.len() > u16::MAX as usize {
         return Err(UpstreamError::Proto("message too large for TCP".into()));
     }
     let len = (bytes.len() as u16).to_be_bytes();
     stream.write_all(&len).await.map_err(io)?;
-    stream.write_all(&bytes).await.map_err(io)?;
+    stream.write_all(bytes).await.map_err(io)?;
     stream.flush().await.map_err(io)?;
     Ok(())
 }
@@ -91,9 +101,10 @@ impl UdpConn {
     async fn exchange(&self, query: &Message) -> Result<Message> {
         let original_id = query.metadata.id;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut sent = query.clone();
-        sent.metadata.id = id;
-        let buf = encode(&sent)?;
+        // Patch the demux id directly into the wire header (first two bytes) rather
+        // than cloning the whole `Message` just to change it.
+        let mut buf = encode(query)?;
+        buf[..2].copy_from_slice(&id.to_be_bytes());
 
         let (tx, rx) = oneshot::channel();
         {
@@ -113,12 +124,15 @@ impl UdpConn {
         let mut resp = rx
             .await
             .map_err(|_| UpstreamError::Io("UDP socket closed".into()))?;
-        if !matches_query(&sent, &resp) {
+        // The reader already demuxed this datagram to us by its (socket-local) id,
+        // so restore the caller's id and validate the question against the original
+        // query — the id echo is guaranteed by the routing.
+        resp.metadata.id = original_id;
+        if !matches_query(query, &resp) {
             return Err(UpstreamError::Proto(
                 "UDP response does not match query".into(),
             ));
         }
-        resp.metadata.id = original_id;
         Ok(resp)
     }
 }
