@@ -11,7 +11,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use arc_swap::ArcSwapOption;
 use serde::{Deserialize, Serialize};
 
 /// What happened to a query, together with the data specific to that outcome.
@@ -154,7 +154,7 @@ pub struct QueryLog {
     /// (or when persistence is unwired), in which case pushes are dropped. The
     /// channel is **bounded** so a stalled or slow writer sheds load instead of
     /// growing memory without limit.
-    sink: Mutex<Option<tokio::sync::mpsc::Sender<QueryLogEntry>>>,
+    sink: ArcSwapOption<tokio::sync::mpsc::Sender<QueryLogEntry>>,
 }
 
 impl QueryLog {
@@ -163,13 +163,13 @@ impl QueryLog {
             enabled: std::sync::atomic::AtomicBool::new(enabled),
             anonymize: std::sync::atomic::AtomicBool::new(anonymize),
             dropped: AtomicU64::new(0),
-            sink: Mutex::new(None),
+            sink: ArcSwapOption::empty(),
         }
     }
 
     /// Attach the writer sink. Entries pushed afterwards are sent here.
     pub fn set_sink(&self, tx: tokio::sync::mpsc::Sender<QueryLogEntry>) {
-        *self.sink.lock() = Some(tx);
+        self.sink.store(Some(Arc::new(tx)));
     }
 
     pub fn reconfigure(&self, enabled: bool, anonymize: bool) {
@@ -198,7 +198,7 @@ impl QueryLog {
             // Drop the client IP entirely before it reaches the store/API.
             entry.client_ip.clear();
         }
-        if let Some(tx) = self.sink.lock().as_ref() {
+        if let Some(tx) = self.sink.load_full() {
             if tx.try_send(entry).is_err() {
                 let n = self.dropped.fetch_add(1, Ordering::Relaxed);
                 if n.is_multiple_of(4096) {
