@@ -23,9 +23,15 @@ use serde::{Deserialize, Serialize};
 use crate::clients::ClientMatcher;
 use crate::querylog::{QueryAction, QueryLogEntry};
 
-/// Upper bound on distinct keys tracked per top-N map, summed across shards
-/// (memory guard). Divided evenly between shards at construction.
-const MAX_KEYS: usize = 50_000;
+/// Upper bound on distinct keys retained per top-N estimator, summed across
+/// shards. The estimator (Space-Saving, see [`HeavyHitters`]) keeps only this
+/// many *live* keys regardless of how many distinct domains the stream actually
+/// contains, so memory is bounded by this cap — not by traffic cardinality.
+///
+/// Sized far above any realistic top-N (the UI surfaces tens), so a genuine
+/// heavy hitter is never at risk of eviction while one-off names churn through
+/// the floor slots. Divided evenly between shards at construction.
+const TOPK_KEYS: usize = 4_096;
 
 /// Latency histogram bucket upper-bounds in milliseconds (last bucket = +inf).
 const LATENCY_BUCKETS_MS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0];
@@ -62,10 +68,18 @@ struct StatsInner {
     #[serde(default)]
     proc_time_hist: Vec<u64>,
 
+    // Unbounded-cardinality keys (query names, client IPs) go through the
+    // Space-Saving estimator so their footprint is capped no matter how many
+    // distinct values the stream carries. `#[serde(transparent)]` keeps the
+    // on-disk shape identical to the old plain maps, so persisted state imports
+    // unchanged.
     #[serde(default)]
-    resolved_domains: HashMap<String, u64>,
-    blocked_domains: HashMap<String, u64>,
-    clients: HashMap<String, u64>,
+    resolved_domains: HeavyHitters,
+    blocked_domains: HeavyHitters,
+    clients: HeavyHitters,
+    // Upstreams stay an exact map: cardinality is the (tiny) number of
+    // configured upstreams, and the paired rtt_sum/rtt_count/latency_hist maps
+    // must share its exact key set — Space-Saving eviction would desync them.
     upstreams: HashMap<String, u64>,
     upstream_rtt_sum: HashMap<String, f64>,
     upstream_rtt_count: HashMap<String, u64>,
@@ -94,9 +108,9 @@ impl StatsInner {
             }
         }
 
-        merge_counts(&mut self.resolved_domains, &other.resolved_domains);
-        merge_counts(&mut self.blocked_domains, &other.blocked_domains);
-        merge_counts(&mut self.clients, &other.clients);
+        self.resolved_domains.merge_from(&other.resolved_domains);
+        self.blocked_domains.merge_from(&other.blocked_domains);
+        self.clients.merge_from(&other.clients);
         merge_counts(&mut self.upstreams, &other.upstreams);
         for (k, v) in &other.upstream_rtt_sum {
             *self.upstream_rtt_sum.entry(k.clone()).or_insert(0.0) += v;
@@ -143,6 +157,61 @@ fn bump(map: &mut HashMap<String, u64>, key: &str, by: u64, cap: usize) {
     }
 }
 
+/// A bounded top-K frequency estimator (the Space-Saving algorithm).
+///
+/// Tracks at most `cap` distinct keys regardless of how many distinct values
+/// the stream actually carries. While under `cap` it behaves as an exact
+/// counter. Once full, a never-seen key evicts the current *minimum*-count
+/// entry and inherits its count plus the increment — so a key that is genuinely
+/// frequent always climbs back in after an eviction, while transient one-off
+/// names churn through the floor slots and never accumulate. The reported count
+/// for a surviving key is an over-estimate bounded by the evicted minimum, which
+/// is exactly what keeps the true heavy hitters ranked correctly for top-N.
+///
+/// `#[serde(transparent)]` makes it serialize as a bare `{key: count}` map, so
+/// the persisted/exported shape is identical to the plain `HashMap` it replaced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct HeavyHitters {
+    counts: HashMap<String, u64>,
+}
+
+impl HeavyHitters {
+    /// Record `by` observations of `key`, holding the live key set at `cap`.
+    fn bump(&mut self, key: &str, by: u64, cap: usize) {
+        if let Some(v) = self.counts.get_mut(key) {
+            *v += by;
+            return;
+        }
+        if self.counts.len() < cap {
+            self.counts.insert(key.to_string(), by);
+            return;
+        }
+        // Full: evict the weakest entry and let the newcomer take its slot,
+        // inheriting `min + by`. The min-scan is O(cap) but only runs on the
+        // cold path — a never-seen key arriving into an already-full estimator.
+        if let Some((min_key, min_val)) = self
+            .counts
+            .iter()
+            .min_by_key(|&(_, &v)| v)
+            .map(|(k, &v)| (k.clone(), v))
+        {
+            self.counts.remove(&min_key);
+            self.counts.insert(key.to_string(), min_val + by);
+        }
+    }
+
+    /// Fold another estimator's counts in (used when merging shards for a
+    /// snapshot). The accumulator is transient and unbounded by design — it
+    /// exists only for the duration of a read and holds at most the union of the
+    /// shards' live keys.
+    fn merge_from(&mut self, other: &HeavyHitters) {
+        for (k, v) in &other.counts {
+            *self.counts.entry(k.clone()).or_insert(0) += v;
+        }
+    }
+}
+
 /// Number of shards: one per CPU, rounded up to a power of two so shard
 /// selection is a cheap mask, and clamped to a sane range.
 fn shard_count() -> usize {
@@ -185,7 +254,7 @@ impl Stats {
         Self {
             shards,
             mask: n - 1,
-            key_cap: (MAX_KEYS / n).max(1024),
+            key_cap: (TOPK_KEYS / n).max(256),
             enabled: AtomicBool::new(enabled),
             anonymize: AtomicBool::new(anonymize),
             max_buckets: AtomicUsize::new(((retention_days.max(1)) * 24) as usize),
@@ -270,15 +339,15 @@ impl Stats {
         // Top-N counters. A query name lands in exactly one of the two domain
         // lists — resolved or blocked.
         if blocked {
-            bump(&mut s.blocked_domains, domain, 1, cap);
+            s.blocked_domains.bump(domain, 1, cap);
         } else {
-            bump(&mut s.resolved_domains, domain, 1, cap);
+            s.resolved_domains.bump(domain, 1, cap);
         }
         // Skip per-client counts entirely when anonymizing, so "top clients" never
         // retains a client IP. Stats record before the query-log push that clears
         // the IP, so check the flag here rather than relying on an empty field.
         if !self.anonymize.load(Ordering::Relaxed) {
-            bump(&mut s.clients, client, 1, cap);
+            s.clients.bump(client, 1, cap);
         }
         if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
@@ -391,9 +460,9 @@ impl Stats {
                 0.0
             },
             p95_processing_ms: p95_proc,
-            top_resolved_domains: top_n_of(&s.resolved_domains, top_n),
-            top_blocked_domains: top_n_of(&s.blocked_domains, top_n),
-            top_clients: top_clients_resolved(&s.clients, clients, top_n),
+            top_resolved_domains: top_n_of(&s.resolved_domains.counts, top_n),
+            top_blocked_domains: top_n_of(&s.blocked_domains.counts, top_n),
+            top_clients: top_clients_resolved(&s.clients.counts, clients, top_n),
             top_upstreams: top_n_of(&s.upstreams, top_n),
             upstream_avg_rtt_ms: upstream_rtt,
             upstream_latency_pct,
@@ -771,6 +840,53 @@ mod tests {
         assert_eq!(snap.series.len(), 1);
         assert_eq!(snap.series[0].total, 2);
         assert_eq!(snap.series[0].blocked, 1);
+    }
+
+    #[test]
+    fn heavy_hitters_bound_memory_under_high_cardinality() {
+        // Feed far more distinct names than the cap and confirm every per-shard
+        // estimator stays at or below its key cap — memory is bounded by the cap,
+        // not by stream cardinality.
+        let s = Stats::new(true, 30, false);
+        for i in 0..200_000u32 {
+            let name = format!("h{i}.example.");
+            s.record(&entry(&name, forwarded("u"), 1.0), Some(1.0));
+        }
+        for shard in &s.shards {
+            let g = shard.lock();
+            assert!(
+                g.resolved_domains.counts.len() <= s.key_cap,
+                "shard held {} keys, cap is {}",
+                g.resolved_domains.counts.len(),
+                s.key_cap
+            );
+        }
+    }
+
+    #[test]
+    fn late_heavy_hitter_still_ranks() {
+        // The old hard cap dropped any name first seen after the cap filled, so a
+        // domain that becomes popular *late* was never counted. Space-Saving must
+        // surface it: flood the estimator with unique one-shot names to fill it,
+        // then hammer one late arrival and confirm it reaches the top list.
+        let s = Stats::new(true, 30, false);
+        // Pin everything to one shard's worth of cap by overflowing generously.
+        for i in 0..(TOPK_KEYS * 4) {
+            let name = format!("noise{i}.example.");
+            s.record(&entry(&name, forwarded("u"), 1.0), Some(1.0));
+        }
+        // A latecomer queried far more than any single noise name (each seen once).
+        for _ in 0..500 {
+            s.record(&entry("late-popular.example.", forwarded("u"), 1.0), Some(1.0));
+        }
+        let snap = s.snapshot(10, &ClientMatcher::default());
+        assert!(
+            snap.top_resolved_domains
+                .iter()
+                .any(|t| t.name == "late-popular.example"),
+            "late heavy hitter missing from top-N: {:?}",
+            snap.top_resolved_domains
+        );
     }
 
     #[test]

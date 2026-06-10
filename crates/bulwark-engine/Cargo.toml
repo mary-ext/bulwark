@@ -27,3 +27,7 @@ rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# statsprobe only: match the server's global allocator so the measured retained
+# heap reflects production (glibc malloc retains freed memory very differently).
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
