@@ -14,7 +14,7 @@
 //! (`snapshot`/`export`) merge the shards under their individual locks.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
@@ -186,36 +186,91 @@ fn bump(map: &mut HashMap<String, u64>, key: &str, by: u64, cap: usize) {
 /// for a surviving key is an over-estimate bounded by the evicted minimum, which
 /// is exactly what keeps the true heavy hitters ranked correctly for top-N.
 ///
-/// `#[serde(transparent)]` makes it serialize as a bare `{key: count}` map, so
-/// the persisted/exported shape is identical to the plain `HashMap` it replaced.
+/// The `from`/`into` conversions make it serialize as a bare `{key: count}` map
+/// (the inverted index is rebuilt on load), so the persisted/exported shape is
+/// identical to the plain `HashMap` it replaced.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(from = "HashMap<String, u64>", into = "HashMap<String, u64>")]
 struct HeavyHitters {
     counts: HashMap<String, u64>,
+    /// Inverted index: count → the keys currently at that count. Lets eviction
+    /// find and drop a minimum-count entry in O(log distinct-counts) rather than
+    /// scanning all of `counts` (O(cap)). Kept perfectly in step with `counts` by
+    /// the mutators below; derived from `counts` and never serialized.
+    by_count: BTreeMap<u64, HashSet<String>>,
+}
+
+impl From<HashMap<String, u64>> for HeavyHitters {
+    fn from(counts: HashMap<String, u64>) -> Self {
+        let mut by_count: BTreeMap<u64, HashSet<String>> = BTreeMap::new();
+        for (k, &v) in &counts {
+            by_count.entry(v).or_default().insert(k.clone());
+        }
+        Self { counts, by_count }
+    }
+}
+
+impl From<HeavyHitters> for HashMap<String, u64> {
+    fn from(h: HeavyHitters) -> Self {
+        h.counts
+    }
 }
 
 impl HeavyHitters {
+    /// Move `key` (currently at `prev`) up to `prev + by`, keeping the index in step.
+    fn raise(&mut self, key: &str, prev: u64, by: u64) {
+        let next = prev + by;
+        *self.counts.get_mut(key).expect("key present") = next;
+        if let Some(set) = self.by_count.get_mut(&prev) {
+            set.remove(key);
+            if set.is_empty() {
+                self.by_count.remove(&prev);
+            }
+        }
+        self.by_count.entry(next).or_default().insert(key.to_string());
+    }
+
+    /// Insert a brand-new `key` at `count`.
+    fn add_new(&mut self, key: &str, count: u64) {
+        self.counts.insert(key.to_string(), count);
+        self.by_count
+            .entry(count)
+            .or_default()
+            .insert(key.to_string());
+    }
+
     /// Record `by` observations of `key`, holding the live key set at `cap`.
     fn bump(&mut self, key: &str, by: u64, cap: usize) {
-        if let Some(v) = self.counts.get_mut(key) {
-            *v += by;
+        if let Some(&prev) = self.counts.get(key) {
+            self.raise(key, prev, by);
             return;
         }
         if self.counts.len() < cap {
-            self.counts.insert(key.to_string(), by);
+            self.add_new(key, by);
             return;
         }
-        // Full: evict the weakest entry and let the newcomer take its slot,
-        // inheriting `min + by`. The min-scan is O(cap) but only runs on the
-        // cold path — a never-seen key arriving into an already-full estimator.
-        if let Some((min_key, min_val)) = self
-            .counts
-            .iter()
-            .min_by_key(|&(_, &v)| v)
-            .map(|(k, &v)| (k.clone(), v))
-        {
-            self.counts.remove(&min_key);
-            self.counts.insert(key.to_string(), min_val + by);
+        // Full: evict a weakest entry (any key in the minimum-count bucket) and
+        // let the newcomer take its slot, inheriting `min + by`. Both the min
+        // lookup and removal are O(log distinct-counts) via the inverted index,
+        // so a flood of never-seen keys no longer triggers an O(cap) scan each.
+        let Some((&min_count, _)) = self.by_count.iter().next() else {
+            return;
+        };
+        let victim = self
+            .by_count
+            .get_mut(&min_count)
+            .and_then(|set| set.iter().next().cloned());
+        if let Some(victim) = victim {
+            let set = self
+                .by_count
+                .get_mut(&min_count)
+                .expect("min bucket present");
+            set.remove(&victim);
+            if set.is_empty() {
+                self.by_count.remove(&min_count);
+            }
+            self.counts.remove(&victim);
+            self.add_new(key, min_count + by);
         }
     }
 
@@ -224,8 +279,12 @@ impl HeavyHitters {
     /// exists only for the duration of a read and holds at most the union of the
     /// shards' live keys.
     fn merge_from(&mut self, other: &HeavyHitters) {
-        for (k, v) in &other.counts {
-            *self.counts.entry(k.clone()).or_insert(0) += v;
+        for (k, &v) in &other.counts {
+            if let Some(&prev) = self.counts.get(k) {
+                self.raise(k, prev, v);
+            } else {
+                self.add_new(k, v);
+            }
         }
     }
 }
@@ -961,6 +1020,42 @@ mod tests {
             "late heavy hitter missing from top-N: {:?}",
             snap.top_resolved_domains
         );
+    }
+
+    #[test]
+    fn heavy_hitters_rebuild_index_after_serde_round_trip() {
+        // The inverted index isn't serialized; it must be rebuilt from `counts`
+        // on load and still drive eviction correctly afterwards.
+        let cap = 4;
+        let mut h = HeavyHitters::default();
+        // Distinct counts so the minimum is unambiguous: b is the clear floor.
+        h.bump("a", 5, cap);
+        h.bump("b", 1, cap);
+        h.bump("c", 3, cap);
+        h.bump("hot", 10, cap); // estimator is now full
+
+        // Serializes as a bare {key: count} map (shape unchanged from the old impl).
+        let json = serde_json::to_string(&h).unwrap();
+        let bare: HashMap<String, u64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(bare.get("hot"), Some(&10));
+        assert_eq!(bare.len(), 4);
+
+        let mut reloaded: HeavyHitters = serde_json::from_str(&json).unwrap();
+        // The rebuilt index must agree exactly with the counts it came from.
+        let indexed: usize = reloaded.by_count.values().map(|s| s.len()).sum();
+        assert_eq!(indexed, reloaded.counts.len(), "index and counts must agree");
+
+        // A new key into the full estimator must evict the minimum (b), inheriting
+        // its count + 1; the higher-count keys are untouched. This only works if
+        // the index was rebuilt correctly.
+        reloaded.bump("new", 1, cap);
+        assert!(!reloaded.counts.contains_key("b"), "min entry must be evicted");
+        assert_eq!(reloaded.counts.get("new"), Some(&2), "newcomer inherits min + 1");
+        for (k, v) in [("a", 5), ("c", 3), ("hot", 10)] {
+            assert_eq!(reloaded.counts.get(k), Some(&v), "{k} must be untouched");
+        }
+        let indexed: usize = reloaded.by_count.values().map(|s| s.len()).sum();
+        assert_eq!(indexed, reloaded.counts.len(), "index stays in step after evict");
     }
 
     #[test]
