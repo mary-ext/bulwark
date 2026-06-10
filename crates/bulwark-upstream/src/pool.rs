@@ -125,10 +125,39 @@ fn idle_probe_window(self_ewma: Option<f64>, best_ewma: Option<f64>) -> Duration
     HEALTHY_PROBE_WINDOW * mult
 }
 
+/// Where a latency sample came from. Live and background-probe latencies are
+/// tracked in separate EWMAs because they measure different things: the probe is
+/// a tiny, cache-hot `NS .`, while live traffic is real A/AAAA/HTTPS lookups that
+/// may exercise slower resolver paths. Mixing them into one average lets the
+/// cheap probe flatter (or the real traffic distort) the other.
+#[derive(Clone, Copy)]
+enum Source {
+    Live,
+    Probe,
+}
+
+/// EWMA update: the first sample seeds the average, later ones blend in by
+/// `alpha`.
+fn ewma(samples: u64, prev_ms: f64, sample_ms: f64, alpha: f64) -> f64 {
+    if samples == 0 {
+        sample_ms
+    } else {
+        alpha * sample_ms + (1.0 - alpha) * prev_ms
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Health {
-    ewma_ms: f64,
-    samples: u64,
+    /// Smoothed latency of real user queries, with its sample count and the
+    /// instant of the most recent sample (used to decide which estimate is
+    /// fresher — see [`Health::estimate_ms`]).
+    live_ewma_ms: f64,
+    live_samples: u64,
+    live_at: Option<Instant>,
+    /// Smoothed latency of background probes, kept apart from the live figure.
+    probe_ewma_ms: f64,
+    probe_samples: u64,
+    probe_at: Option<Instant>,
     /// Presumed up until proven down. A fresh upstream starts up so it gets a
     /// chance; it's marked down only after crossing the failure threshold. (If
     /// this defaulted to false, a never-*successful* upstream couldn't be
@@ -151,8 +180,12 @@ struct Health {
 impl Default for Health {
     fn default() -> Self {
         Self {
-            ewma_ms: 0.0,
-            samples: 0,
+            live_ewma_ms: 0.0,
+            live_samples: 0,
+            live_at: None,
+            probe_ewma_ms: 0.0,
+            probe_samples: 0,
+            probe_at: None,
             up: true,
             consecutive_failures: 0,
             total_queries: 0,
@@ -160,6 +193,26 @@ impl Default for Health {
             last_rtt_ms: None,
             last_error: None,
             next_probe_at: None,
+        }
+    }
+}
+
+impl Health {
+    /// The latency estimate to rank by: the EWMA of whichever source sampled
+    /// most recently. A busy upstream's live samples dominate; an idle backup
+    /// falls back to its background probe; a former leader gone idle switches to
+    /// the probe once that's the fresher signal. `None` until either source has
+    /// a sample (a never-touched upstream has no latency knowledge at all).
+    fn estimate_ms(&self) -> Option<f64> {
+        match (self.live_at, self.probe_at) {
+            (Some(l), Some(p)) => Some(if l >= p {
+                self.live_ewma_ms
+            } else {
+                self.probe_ewma_ms
+            }),
+            (Some(_), None) => Some(self.live_ewma_ms),
+            (None, Some(_)) => Some(self.probe_ewma_ms),
+            (None, None) => None,
         }
     }
 }
@@ -173,22 +226,31 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    fn record_success(&self, rtt: Duration, alpha: f64) {
+    fn record_success(&self, rtt: Duration, alpha: f64, source: Source) {
         let mut h = self.health.lock();
         let ms = rtt.as_secs_f64() * 1000.0;
-        h.ewma_ms = if h.samples == 0 {
-            ms
-        } else {
-            alpha * ms + (1.0 - alpha) * h.ewma_ms
-        };
-        h.samples += 1;
+        let now = Instant::now();
+        // Fold the sample into the matching EWMA only, so live and probe
+        // latencies stay independent.
+        match source {
+            Source::Live => {
+                h.live_ewma_ms = ewma(h.live_samples, h.live_ewma_ms, ms, alpha);
+                h.live_samples += 1;
+                h.live_at = Some(now);
+            }
+            Source::Probe => {
+                h.probe_ewma_ms = ewma(h.probe_samples, h.probe_ewma_ms, ms, alpha);
+                h.probe_samples += 1;
+                h.probe_at = Some(now);
+            }
+        }
         h.total_queries += 1;
         h.last_rtt_ms = Some(ms);
         h.consecutive_failures = 0;
         h.up = true;
         h.last_error = None;
         // Healthy: defer the next probe a full window (jittered to de-sync).
-        h.next_probe_at = Some(Instant::now() + jitter(HEALTHY_PROBE_WINDOW));
+        h.next_probe_at = Some(now + jitter(HEALTHY_PROBE_WINDOW));
     }
 
     fn record_failure(&self, err: &UpstreamError, threshold: u32) {
@@ -224,7 +286,7 @@ impl Upstream {
     /// upstream (which shouldn't count toward "the fastest peer").
     fn healthy_ewma(&self) -> Option<f64> {
         let h = self.health.lock();
-        (h.up && h.samples > 0).then_some(h.ewma_ms)
+        h.up.then(|| h.estimate_ms()).flatten()
     }
 
     /// After a probe, stretch this upstream's next-probe deadline if it's clearly
@@ -276,8 +338,9 @@ impl Upstream {
     fn sort_key(&self) -> (bool, bool, u64) {
         let h = self.health.lock();
         let down = !h.up;
-        let unsampled = h.samples == 0;
-        let lat = h.ewma_ms.round() as u64;
+        let est = h.estimate_ms();
+        let unsampled = est.is_none();
+        let lat = est.unwrap_or(0.0).round() as u64;
         (down, unsampled, lat)
     }
 
@@ -289,11 +352,7 @@ impl Upstream {
             name: self.name.clone(),
             kind: self.spec.kind,
             up: h.up,
-            avg_rtt_ms: if h.samples == 0 {
-                None
-            } else {
-                Some(h.ewma_ms)
-            },
+            avg_rtt_ms: h.estimate_ms(),
             last_rtt_ms: h.last_rtt_ms,
             total_queries: h.total_queries,
             total_failures: h.total_failures,
@@ -554,7 +613,7 @@ async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings) {
         // an arbitrary live query, *any* non-answer to it (SERVFAIL as much as
         // REFUSED) genuinely indicts the resolver — treat it as a failed probe.
         Ok(Ok(resp)) => match classify(&resp) {
-            Verdict::Answer => up.record_success(start.elapsed(), settings.ewma_alpha),
+            Verdict::Answer => up.record_success(start.elapsed(), settings.ewma_alpha, Source::Probe),
             _ => up.record_failure(&rcode_err(&resp), settings.failure_threshold),
         },
         Ok(Err(e)) => up.record_failure(&e, settings.failure_threshold),
@@ -619,7 +678,7 @@ async fn resolve_sequential(
                 let rtt_ms = rtt.as_secs_f64() * 1000.0;
                 match classify(&resp) {
                     Verdict::Answer => {
-                        up.record_success(rtt, alpha);
+                        up.record_success(rtt, alpha, Source::Live);
                         return Ok(Resolved {
                             message: resp,
                             upstream: up.name.clone(),
@@ -756,6 +815,47 @@ mod backoff_tests {
             let j = jitter(base);
             assert!(j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25), "{j:?}");
         }
+    }
+
+    #[test]
+    fn estimate_uses_the_freshest_source() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(10);
+
+        // Both sampled, live more recently (a busy leader) → rank by live.
+        let h = Health {
+            live_ewma_ms: 10.0,
+            live_samples: 1,
+            live_at: Some(t1),
+            probe_ewma_ms: 99.0,
+            probe_samples: 1,
+            probe_at: Some(t0),
+            ..Health::default()
+        };
+        assert_eq!(h.estimate_ms(), Some(10.0));
+
+        // Probe sampled more recently (a former leader gone idle) → rank by probe,
+        // not the now-stale live figure.
+        let h = Health {
+            live_ewma_ms: 10.0,
+            live_samples: 1,
+            live_at: Some(t0),
+            probe_ewma_ms: 99.0,
+            probe_samples: 1,
+            probe_at: Some(t1),
+            ..Health::default()
+        };
+        assert_eq!(h.estimate_ms(), Some(99.0));
+
+        // Only one source sampled, and never-sampled.
+        let h = Health {
+            probe_ewma_ms: 42.0,
+            probe_samples: 1,
+            probe_at: Some(t0),
+            ..Health::default()
+        };
+        assert_eq!(h.estimate_ms(), Some(42.0));
+        assert_eq!(Health::default().estimate_ms(), None);
     }
 
     #[test]
