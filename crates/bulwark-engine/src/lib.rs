@@ -18,6 +18,7 @@ pub mod stats;
 pub mod wire;
 
 use std::borrow::Cow;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -94,6 +95,43 @@ fn summarize_answers(src: &[hickory_proto::rr::Record]) -> Arc<[String]> {
 /// pool decoded them), and the per-record `filter.check` only fires for the
 /// record types we inspect, so this rides along the cache-miss path that is
 /// already network-bound.
+/// Stack buffer for an IP literal, sized for the longest IPv6 textual form
+/// (`ffff:…:255.255.255.255`, 45 chars). Lets the per-answer filter stringify
+/// `A`/`AAAA`/hint addresses without a heap allocation per record.
+struct IpBuf {
+    buf: [u8; 48],
+    len: usize,
+}
+
+impl IpBuf {
+    fn new() -> Self {
+        Self {
+            buf: [0; 48],
+            len: 0,
+        }
+    }
+
+    /// Render `ip` into the buffer and return it as `&str`. Reused across records.
+    fn render(&mut self, ip: impl fmt::Display) -> &str {
+        use fmt::Write as _;
+        self.len = 0;
+        // The buffer holds the longest possible IP literal and `Display` for IP
+        // addresses only emits ASCII, so neither write nor utf8 validation fails.
+        let _ = write!(self, "{ip}");
+        std::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl fmt::Write for IpBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 fn filter_answers(
     filter: &FilterEngine,
     client: &ResolvedClient,
@@ -108,6 +146,7 @@ fn filter_answers(
         Verdict::Block(info) => Some(info),
         _ => None,
     };
+    let mut ipbuf = IpBuf::new();
     for rec in answers {
         // `Name::to_ascii` carries a trailing dot; `filter.check` normalises it,
         // but trim here so the comparison is unambiguous. IP literals stringify
@@ -116,10 +155,10 @@ fn filter_answers(
             RData::CNAME(cname) => {
                 block_of(filter.check(cname.0.to_ascii().trim_end_matches('.'), "CNAME", &ci))
             }
-            RData::A(ip) => block_of(filter.check(&ip.0.to_string(), "A", &ci)),
-            RData::AAAA(ip) => block_of(filter.check(&ip.0.to_string(), "AAAA", &ci)),
-            RData::HTTPS(https) => hint_block(&https.0, filter, &ci),
-            RData::SVCB(svcb) => hint_block(svcb, filter, &ci),
+            RData::A(ip) => block_of(filter.check(ipbuf.render(ip.0), "A", &ci)),
+            RData::AAAA(ip) => block_of(filter.check(ipbuf.render(ip.0), "AAAA", &ci)),
+            RData::HTTPS(https) => hint_block(&https.0, filter, &ci, &mut ipbuf),
+            RData::SVCB(svcb) => hint_block(svcb, filter, &ci, &mut ipbuf),
             _ => continue,
         };
         if hit.is_some() {
@@ -132,21 +171,22 @@ fn filter_answers(
 /// Return the matching rule if any `ipv4hint`/`ipv6hint` address in an
 /// HTTPS/SVCB record is blocklisted. The rtype mirrors AdGuard Home, which
 /// checks hint IPs as `HTTPS`.
-fn hint_block(svcb: &SVCB, filter: &FilterEngine, ci: &ClientInfo<'_>) -> Option<MatchInfo> {
+fn hint_block(
+    svcb: &SVCB,
+    filter: &FilterEngine,
+    ci: &ClientInfo<'_>,
+    ipbuf: &mut IpBuf,
+) -> Option<MatchInfo> {
+    let check = |ipbuf: &mut IpBuf, ip: &dyn fmt::Display| match filter
+        .check(ipbuf.render(ip), "HTTPS", ci)
+    {
+        Verdict::Block(info) => Some(info),
+        _ => None,
+    };
     for (_, value) in &svcb.svc_params {
         let blocked = match value {
-            SvcParamValue::Ipv4Hint(h) => h.0.iter().map(|a| a.0.to_string()).find_map(|ip| {
-                match filter.check(&ip, "HTTPS", ci) {
-                    Verdict::Block(info) => Some(info),
-                    _ => None,
-                }
-            }),
-            SvcParamValue::Ipv6Hint(h) => h.0.iter().map(|a| a.0.to_string()).find_map(|ip| {
-                match filter.check(&ip, "HTTPS", ci) {
-                    Verdict::Block(info) => Some(info),
-                    _ => None,
-                }
-            }),
+            SvcParamValue::Ipv4Hint(h) => h.0.iter().find_map(|a| check(ipbuf, &a.0)),
+            SvcParamValue::Ipv6Hint(h) => h.0.iter().find_map(|a| check(ipbuf, &a.0)),
             _ => None,
         };
         if blocked.is_some() {
