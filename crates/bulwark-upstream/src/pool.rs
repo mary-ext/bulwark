@@ -22,7 +22,7 @@ use crate::dot::DotTransport;
 use crate::error::{Result, SharedResult, UpstreamError};
 use crate::plain::{TcpTransport, UdpTransport};
 use crate::spec::{Host, TransportKind, UpstreamSpec};
-use crate::transport::{QueryKey, Transport};
+use crate::transport::{normalize_upstream_edns, QueryKey, Transport};
 
 /// One configured upstream as seen by the pool.
 #[derive(Debug, Clone)]
@@ -500,7 +500,12 @@ impl UpstreamPool {
                 let timeout = self.settings.query_timeout;
                 let alpha = self.settings.ewma_alpha;
                 let threshold = self.settings.failure_threshold;
-                let q = query.clone();
+                // Forward only the EDNS we honour/key on: strip client options
+                // (ECS, COOKIE, NSID, …) so a query differing only in such an
+                // option can't be cross-served from this shared single-flight
+                // (or cache) entry, and client identifiers don't leak upstream.
+                let mut q = query.clone();
+                normalize_upstream_edns(&mut q);
                 let fut: ResolveFuture =
                     async move { resolve_sequential(ordered, q, timeout, alpha, threshold).await }
                         .boxed()

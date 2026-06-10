@@ -1,7 +1,7 @@
 //! The [`Transport`] trait and shared query-key / wire helpers.
 
 use futures::future::BoxFuture;
-use hickory_proto::op::Message;
+use hickory_proto::op::{Edns, Message};
 use hickory_proto::rr::{DNSClass, RecordType};
 
 use crate::error::{Result, UpstreamError};
@@ -56,6 +56,31 @@ impl QueryKey {
 /// Whether the message's EDNS OPT record has the DNSSEC-OK (DO) bit set.
 pub fn dnssec_ok(msg: &Message) -> bool {
     msg.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok)
+}
+
+/// Strip EDNS options we neither honour nor key on before forwarding a query
+/// upstream, keeping only the DNSSEC-OK bit (which the cache / single-flight
+/// [`QueryKey`] *does* distinguish) and the advertised payload size.
+///
+/// The proxy forwards the client's message essentially verbatim, and two queries
+/// that differ only in an option like EDNS Client Subnet, COOKIE, or NSID share
+/// one cache / single-flight key. Without this, a client's subnet-tailored answer
+/// could be cross-served to another client, and client identifiers would leak to
+/// the upstream. Dropping those options makes the forwarded query — and thus the
+/// answer cached under that key — independent of them. A query with no OPT
+/// record, or one already carrying no options, is left untouched.
+pub fn normalize_upstream_edns(msg: &mut Message) {
+    let Some(edns) = msg.edns.as_ref() else {
+        return;
+    };
+    if edns.options().options.is_empty() {
+        return;
+    }
+    let mut clean = Edns::new();
+    clean.set_version(edns.version());
+    clean.set_max_payload(edns.max_payload());
+    clean.set_dnssec_ok(edns.flags().dnssec_ok);
+    msg.set_edns(clean);
 }
 
 /// Encode a DNS message to wire format.
@@ -156,6 +181,44 @@ mod tests {
         let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
         let resp = wire_roundtrip(&query(0x1234, "dns.google", true, RecordType::A));
         assert!(!matches_query(&q, &resp));
+    }
+
+    #[test]
+    fn normalize_strips_options_but_keeps_do_and_payload() {
+        use hickory_proto::op::Edns;
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsOption};
+        use std::net::Ipv4Addr;
+
+        let mut msg = query(1, "a.com", true, RecordType::A);
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(1232);
+        edns.set_dnssec_ok(true);
+        // A client-supplied ECS option and an opaque COOKIE-like option.
+        edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(
+            Ipv4Addr::new(192, 0, 2, 0).into(),
+            24,
+            0,
+        )));
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4, 5, 6, 7, 8]));
+        msg.set_edns(edns);
+        assert!(!msg.edns.as_ref().unwrap().options().options.is_empty());
+
+        normalize_upstream_edns(&mut msg);
+
+        let e = msg.edns.as_ref().expect("EDNS envelope is kept");
+        assert!(e.options().options.is_empty(), "client options must be stripped");
+        assert!(e.flags().dnssec_ok, "the DO bit must be preserved");
+        assert_eq!(e.max_payload(), 1232, "payload size must be preserved");
+    }
+
+    #[test]
+    fn normalize_is_a_noop_without_edns() {
+        let mut msg = query(1, "a.com", true, RecordType::A);
+        assert!(msg.edns.is_none());
+        normalize_upstream_edns(&mut msg);
+        assert!(msg.edns.is_none(), "a query with no OPT record is untouched");
     }
 
     #[test]
