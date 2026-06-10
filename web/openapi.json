@@ -1263,6 +1263,13 @@
             ],
             "description": "Argon2 password hash; `None` until the admin sets a password (setup flow).\nSkipped when absent so the redacted (`None`) value the API returns never\nrides the wire, and the YAML stays clean before setup."
           },
+          "session_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HMAC secret (base64url) for signing session JWTs. Generated on first run\nif absent. Redacted from the config API like `password_hash`; deleting it\nfrom the YAML rotates the secret and invalidates all outstanding tokens."
+          },
           "username": {
             "type": "string",
             "description": "Admin username."
@@ -1956,7 +1963,12 @@
           "upstream_avg_rtt_ms",
           "upstream_latency_pct",
           "series",
-          "cache_size"
+          "cache_size",
+          "cache_hits",
+          "cache_misses",
+          "cache_stale_hits",
+          "cache_refreshes",
+          "cache_refresh_failures"
         ],
         "properties": {
           "block_rate": {
@@ -1968,8 +1980,38 @@
             "format": "int64",
             "minimum": 0
           },
+          "cache_hits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total cache hits (fresh + stale) over the cache's lifetime (persisted in\n`stats.json`, so it accumulates across restarts).",
+            "minimum": 0
+          },
+          "cache_misses": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cache lookups that found nothing servable and went upstream.",
+            "minimum": 0
+          },
+          "cache_refresh_failures": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Background refreshes that failed to resolve upstream.",
+            "minimum": 0
+          },
+          "cache_refreshes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Background refreshes dispatched upstream (intent; the pool may\nsingle-flight concurrent identical ones). This is the upstream traffic the\nclient-facing hit rate hides.",
+            "minimum": 0
+          },
           "cache_size": {
             "type": "integer",
+            "minimum": 0
+          },
+          "cache_stale_hits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Subset of `cache_hits` served stale under optimistic caching. Each one is\na client-facing hit that also kicked off a background refresh, so the\nclient hit rate (`cache_hits/total`) overstates how little we touch\nupstream by exactly this much.",
             "minimum": 0
           },
           "cached": {

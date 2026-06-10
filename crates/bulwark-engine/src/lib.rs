@@ -554,27 +554,38 @@ impl Engine {
         let pool = state.pool.clone();
         let filter = state.filter.clone();
         let generation = state.filter.content_hash();
+        // Count the dispatch up front so the metric reflects intent even if the
+        // task is still in flight; the outcome is recorded when it completes.
+        cache.note_refresh_started();
         tokio::spawn(async move {
-            if let Ok(resolved) = pool.resolve(&query).await {
-                if memoize {
-                    // No client context in the background, but `memoize` implies no
-                    // client-dependent rules, so the verdict is identical for every
-                    // client; a placeholder client yields the same result.
-                    let placeholder = ResolvedClient {
-                        ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                        name: None,
-                        tags: Vec::new(),
-                        filtering_enabled: true,
-                    };
-                    let verdict =
-                        match filter_answers(&filter, &placeholder, &resolved.message.answers) {
-                            Some(info) => ResponseVerdict::block(info, generation),
-                            None => ResponseVerdict::clean(generation),
-                        };
-                    cache.insert_with_verdict(key, &resolved.message, Some(verdict));
-                } else {
-                    cache.insert(key, &resolved.message);
+            let resolved = match pool.resolve(&query).await {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    // Upstream didn't answer: keep serving stale and try again on
+                    // the next hit. Surfaced so a dead upstream behind a healthy
+                    // hit rate is visible.
+                    cache.note_refresh_failed();
+                    return;
                 }
+            };
+            if memoize {
+                // No client context in the background, but `memoize` implies no
+                // client-dependent rules, so the verdict is identical for every
+                // client; a placeholder client yields the same result.
+                let placeholder = ResolvedClient {
+                    ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    name: None,
+                    tags: Vec::new(),
+                    filtering_enabled: true,
+                };
+                let verdict =
+                    match filter_answers(&filter, &placeholder, &resolved.message.answers) {
+                        Some(info) => ResponseVerdict::block(info, generation),
+                        None => ResponseVerdict::clean(generation),
+                    };
+                cache.insert_with_verdict(key, &resolved.message, Some(verdict));
+            } else {
+                cache.insert(key, &resolved.message);
             }
         });
     }

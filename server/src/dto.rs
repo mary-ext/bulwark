@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use bulwark_engine::cache::CacheCounters;
 use bulwark_engine::querylog::{QueryAction, QueryLogEntry};
 use bulwark_engine::stats::{LatencyPercentiles, SeriesPoint, StatsSummary, TopEntry};
 use bulwark_upstream::pool::UpstreamStat;
@@ -91,6 +92,22 @@ pub struct StatsResponse {
     pub upstream_latency_pct: HashMap<String, LatencyPercentilesDto>,
     pub series: Vec<SeriesPointDto>,
     pub cache_size: usize,
+    /// Total cache hits (fresh + stale) over the cache's lifetime (persisted in
+    /// `stats.json`, so it accumulates across restarts).
+    pub cache_hits: u64,
+    /// Cache lookups that found nothing servable and went upstream.
+    pub cache_misses: u64,
+    /// Subset of `cache_hits` served stale under optimistic caching. Each one is
+    /// a client-facing hit that also kicked off a background refresh, so the
+    /// client hit rate (`cache_hits/total`) overstates how little we touch
+    /// upstream by exactly this much.
+    pub cache_stale_hits: u64,
+    /// Background refreshes dispatched upstream (intent; the pool may
+    /// single-flight concurrent identical ones). This is the upstream traffic the
+    /// client-facing hit rate hides.
+    pub cache_refreshes: u64,
+    /// Background refreshes that failed to resolve upstream.
+    pub cache_refresh_failures: u64,
 }
 
 fn top(entries: Vec<TopEntry>) -> Vec<TopEntryDto> {
@@ -98,7 +115,7 @@ fn top(entries: Vec<TopEntry>) -> Vec<TopEntryDto> {
 }
 
 impl StatsResponse {
-    pub fn new(s: StatsSummary, cache_size: usize) -> Self {
+    pub fn new(s: StatsSummary, cache_size: usize, cache: CacheCounters) -> Self {
         Self {
             total: s.total,
             blocked: s.blocked,
@@ -119,6 +136,11 @@ impl StatsResponse {
                 .collect(),
             series: s.series.into_iter().map(Into::into).collect(),
             cache_size,
+            cache_hits: cache.hits,
+            cache_misses: cache.misses,
+            cache_stale_hits: cache.stale_hits,
+            cache_refreshes: cache.refreshes,
+            cache_refresh_failures: cache.refresh_failures,
         }
     }
 }

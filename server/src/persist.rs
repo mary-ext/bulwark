@@ -84,10 +84,13 @@ pub fn spawn_querylog_pruner(
     })
 }
 
-/// Load a persisted stats snapshot into the engine, if present.
+/// Load a persisted stats snapshot into the engine, if present. The cache's own
+/// lifetime counters ride in the same blob but live on the cache, so seed them
+/// back so the optimistic-caching metrics accumulate across restarts.
 pub fn load_stats(path: &Path, engine: &Engine) {
     if let Ok(text) = std::fs::read_to_string(path) {
-        engine.stats().import(&text);
+        let cache_counters = engine.stats().import(&text);
+        engine.cache().seed_counters(cache_counters);
     }
 }
 
@@ -102,7 +105,7 @@ pub fn spawn_stats_snapshotter(
         loop {
             tick.tick().await;
             if config.read().await.stats.persist {
-                let json = engine.stats().export();
+                let json = engine.stats().export(engine.cache().counters());
                 let tmp = path.with_extension("json.tmp");
                 if std::fs::write(&tmp, json.as_bytes()).is_ok() {
                     let _ = std::fs::rename(&tmp, &path);
@@ -114,7 +117,7 @@ pub fn spawn_stats_snapshotter(
 
 /// Write the current stats snapshot synchronously (used on shutdown).
 pub fn snapshot_stats_now(engine: &Engine, path: &Path) {
-    let json = engine.stats().export();
+    let json = engine.stats().export(engine.cache().counters());
     let tmp = path.with_extension("json.tmp");
     if std::fs::write(&tmp, json.as_bytes()).is_ok() {
         let _ = std::fs::rename(&tmp, path);

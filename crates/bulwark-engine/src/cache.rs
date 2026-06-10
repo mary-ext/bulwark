@@ -205,6 +205,34 @@ pub struct DnsCache {
     capacity: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
+    /// Subset of `hits` that were served stale (expired but within the
+    /// optimistic-caching window). Each one is a client-facing hit that *also*
+    /// triggers a background refresh, so `hits - stale_hits` is the count of
+    /// truly fresh hits, and `stale_hits` is the optimistic-serve volume.
+    stale_hits: AtomicU64,
+    /// Background refreshes dispatched to the upstream pool (one per stale serve
+    /// that re-parsed; see [`Self::note_refresh_started`]). This is the
+    /// upstream-facing cost the client-side hit rate hides — every refresh is an
+    /// upstream call the client never waited on. The pool may single-flight
+    /// concurrent identical refreshes, so the number that actually reach the wire
+    /// can be lower; this counts intent (dispatch).
+    refreshes: AtomicU64,
+    /// Background refreshes whose upstream resolution failed. A high ratio means
+    /// the optimistic path is repeatedly serving stale while never landing a
+    /// fresh answer — a healthy-looking hit rate masking a dead upstream.
+    refresh_failures: AtomicU64,
+}
+
+/// A point-in-time snapshot of the cache's lifetime counters. Held as cheap
+/// atomics on the hot path; persisted in `stats.json` and seeded back on start
+/// (see [`DnsCache::seed_counters`]) so they accumulate across restarts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheCounters {
+    pub hits: u64,
+    pub misses: u64,
+    pub stale_hits: u64,
+    pub refreshes: u64,
+    pub refresh_failures: u64,
 }
 
 /// Per-shard capacity for a given total, never zero.
@@ -234,6 +262,9 @@ impl DnsCache {
             capacity: AtomicUsize::new(cap),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            stale_hits: AtomicU64::new(0),
+            refreshes: AtomicU64::new(0),
+            refresh_failures: AtomicU64::new(0),
         }
     }
 
@@ -296,6 +327,58 @@ impl DnsCache {
         self.misses.load(Ordering::Relaxed)
     }
 
+    pub fn stale_hit_count(&self) -> u64 {
+        self.stale_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn refresh_count(&self) -> u64 {
+        self.refreshes.load(Ordering::Relaxed)
+    }
+
+    pub fn refresh_failure_count(&self) -> u64 {
+        self.refresh_failures.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot every lifetime counter at once for the stats API.
+    pub fn counters(&self) -> CacheCounters {
+        CacheCounters {
+            hits: self.hit_count(),
+            misses: self.miss_count(),
+            stale_hits: self.stale_hit_count(),
+            refreshes: self.refresh_count(),
+            refresh_failures: self.refresh_failure_count(),
+        }
+    }
+
+    /// Record that the engine has dispatched a background refresh for a stale
+    /// entry. Called once per refresh the engine spawns; the matching upstream
+    /// outcome is reported via [`Self::note_refresh_failed`] on failure.
+    pub fn note_refresh_started(&self) {
+        self.refreshes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a dispatched background refresh failed to resolve upstream.
+    pub fn note_refresh_failed(&self) {
+        self.refresh_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Seed the lifetime counters from a persisted snapshot at startup, so the
+    /// optimistic-caching metrics accumulate across restarts rather than resetting
+    /// to zero. Call before serving traffic (the counters then count up from here).
+    pub fn seed_counters(&self, c: CacheCounters) {
+        self.hits.store(c.hits, Ordering::Relaxed);
+        self.misses.store(c.misses, Ordering::Relaxed);
+        self.stale_hits.store(c.stale_hits, Ordering::Relaxed);
+        self.refreshes.store(c.refreshes, Ordering::Relaxed);
+        self.refresh_failures.store(c.refresh_failures, Ordering::Relaxed);
+    }
+
+    /// Zero the lifetime counters (the "reset statistics" action clears these
+    /// alongside the aggregate stats, since they're the same analytics surface).
+    pub fn reset_counters(&self) {
+        self.seed_counters(CacheCounters::default());
+    }
+
     /// Look up a response, returning it ready to serve with TTLs decremented to
     /// remaining lifetime and the transaction id set to `id`. Returns `None` on a
     /// true miss; counts hits/misses.
@@ -333,6 +416,10 @@ impl DnsCache {
                 // lifetime of a stale-servable entry.
                 let stale_max_age = self.cfg.stale_max_age.load(Ordering::Relaxed);
                 if age.saturating_sub(entry_ttl) < stale_max_age {
+                    // A stale serve is still a hit (counted below), but track the
+                    // optimistic subset separately: it's the slice of the hit rate
+                    // that costs a background upstream refresh.
+                    self.stale_hits.fetch_add(1, Ordering::Relaxed);
                     (stored, STALE_SERVE_TTL, true, verdict)
                 } else {
                     // Too old / not optimistic: drop it and report a miss.
@@ -893,6 +980,41 @@ mod tests {
             e.stored_at = Instant::now() - std::time::Duration::from_secs(7200);
         }
         assert!(cache.get(&key("h.com."), 0).is_none());
+    }
+
+    #[test]
+    fn counters_split_fresh_from_stale_and_track_refreshes() {
+        let cache = DnsCache::new(100, 0, 0, 3600);
+        cache.insert(key("c.com."), &answer("c.com.", 1));
+
+        // A fresh hit bumps `hits` but not `stale_hits`.
+        cache.get(&key("c.com."), 0).expect("fresh hit");
+        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(cache.stale_hit_count(), 0);
+
+        // Force expiry into the stale window: the next hit is a stale serve.
+        {
+            let mut map = cache.shard(&key("c.com.")).lock();
+            let e = map.get_mut(&key("c.com.")).unwrap();
+            e.stored_at = Instant::now() - Duration::from_secs(10);
+        }
+        assert!(cache.get(&key("c.com."), 0).expect("stale hit").stale);
+        assert_eq!(cache.hit_count(), 2, "stale serve still counts as a hit");
+        assert_eq!(cache.stale_hit_count(), 1, "...and as a stale hit");
+
+        // A true miss touches neither hit counter.
+        assert!(cache.get(&key("absent.com."), 0).is_none());
+        assert_eq!(cache.miss_count(), 1);
+
+        // Refresh dispatch/outcome counters are driven by the engine.
+        cache.note_refresh_started();
+        cache.note_refresh_started();
+        cache.note_refresh_failed();
+        let c = cache.counters();
+        assert_eq!(c.refreshes, 2);
+        assert_eq!(c.refresh_failures, 1);
+        assert_eq!(c.hits, 2);
+        assert_eq!(c.stale_hits, 1);
     }
 
     #[test]

@@ -39,6 +39,10 @@ export type AuthConfig = {
     Skipped when absent so the redacted (`None`) value the API returns never
     rides the wire, and the YAML stays clean before setup. */
     password_hash?: string | null;
+    /** HMAC secret (base64url) for signing session JWTs. Generated on first run
+    if absent. Redacted from the config API like `password_hash`; deleting it
+    from the YAML rotates the secret and invalidates all outstanding tokens. */
+    session_secret?: string | null;
     /** Admin username. */
     username?: string;
 };
@@ -251,7 +255,23 @@ export type LatencyPercentilesDto = {
 export type StatsResponse = {
     block_rate: number;
     blocked: number;
+    /** Total cache hits (fresh + stale) over the cache's lifetime (persisted in
+    `stats.json`, so it accumulates across restarts). */
+    cache_hits: number;
+    /** Cache lookups that found nothing servable and went upstream. */
+    cache_misses: number;
+    /** Background refreshes that failed to resolve upstream. */
+    cache_refresh_failures: number;
+    /** Background refreshes dispatched upstream (intent; the pool may
+    single-flight concurrent identical ones). This is the upstream traffic the
+    client-facing hit rate hides. */
+    cache_refreshes: number;
     cache_size: number;
+    /** Subset of `cache_hits` served stale under optimistic caching. Each one is
+    a client-facing hit that also kicked off a background refresh, so the
+    client hit rate (`cache_hits/total`) overstates how little we touch
+    upstream by exactly this much. */
+    cache_stale_hits: number;
     cached: number;
     errors: number;
     p95_processing_ms: number;

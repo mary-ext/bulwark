@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::CacheCounters;
 use crate::clients::ClientMatcher;
 use crate::querylog::{QueryAction, QueryLogEntry};
 
@@ -90,6 +91,23 @@ struct StatsInner {
 
     #[serde(default)]
     series: Vec<Bucket>,
+
+    // The DNS cache's lifetime counters (hits/misses/stale serves/background
+    // refreshes). These live on the cache itself as cheap atomics on the hot
+    // path; they are carried *here* only so they persist in stats.json. Unlike
+    // every other field they are NOT per-shard tallies — `record`/`merge_from`
+    // leave them at zero, `export` stamps them from the live cache, and `import`
+    // hands them back so the caller can seed the cache (see [`Stats::export`]).
+    #[serde(default)]
+    cache_hits: u64,
+    #[serde(default)]
+    cache_misses: u64,
+    #[serde(default)]
+    cache_stale_hits: u64,
+    #[serde(default)]
+    cache_refreshes: u64,
+    #[serde(default)]
+    cache_refresh_failures: u64,
 }
 
 impl StatsInner {
@@ -479,16 +497,34 @@ impl Stats {
         }
     }
 
-    /// Serialize state for persistence.
-    pub fn export(&self) -> String {
-        serde_json::to_string(&self.merged()).unwrap_or_default()
+    /// Serialize state for persistence. The cache's lifetime counters live on the
+    /// cache (not in the sharded stats), so the caller passes a current snapshot
+    /// of them to be stamped into the persisted blob; [`Self::import`] hands them
+    /// back on load so the cache can be re-seeded.
+    pub fn export(&self, cache: CacheCounters) -> String {
+        let mut merged = self.merged();
+        merged.cache_hits = cache.hits;
+        merged.cache_misses = cache.misses;
+        merged.cache_stale_hits = cache.stale_hits;
+        merged.cache_refreshes = cache.refreshes;
+        merged.cache_refresh_failures = cache.refresh_failures;
+        serde_json::to_string(&merged).unwrap_or_default()
     }
 
     /// Load persisted state (best-effort; ignores malformed data). Everything is
-    /// loaded into a single shard; the rest are cleared.
-    pub fn import(&self, json: &str) {
+    /// loaded into a single shard; the rest are cleared. Returns the cache
+    /// counters the blob carried (zero if absent/malformed) so the caller can
+    /// seed the DNS cache, which owns the live atomics.
+    pub fn import(&self, json: &str) -> CacheCounters {
         let Ok(loaded) = serde_json::from_str::<StatsInner>(json) else {
-            return;
+            return CacheCounters::default();
+        };
+        let cache = CacheCounters {
+            hits: loaded.cache_hits,
+            misses: loaded.cache_misses,
+            stale_hits: loaded.cache_stale_hits,
+            refreshes: loaded.cache_refreshes,
+            refresh_failures: loaded.cache_refresh_failures,
         };
         for (i, shard) in self.shards.iter().enumerate() {
             let mut g = shard.lock();
@@ -498,6 +534,7 @@ impl Stats {
                 *g = StatsInner::default();
             }
         }
+        cache
     }
 }
 
@@ -748,10 +785,47 @@ mod tests {
     fn export_import_roundtrip() {
         let s = Stats::new(true, 30, false);
         s.record(&entry("x.com.", forwarded("8.8.8.8"), 3.0), Some(3.0));
-        let dump = s.export();
+        let dump = s.export(CacheCounters::default());
         let s2 = Stats::new(true, 30, false);
         s2.import(&dump);
         assert_eq!(s2.snapshot(10, &ClientMatcher::default()).total, 1);
+    }
+
+    #[test]
+    fn cache_counters_survive_export_import() {
+        let s = Stats::new(true, 30, false);
+        let counters = CacheCounters {
+            hits: 900,
+            misses: 100,
+            stale_hits: 120,
+            refreshes: 118,
+            refresh_failures: 4,
+        };
+        let dump = s.export(counters);
+
+        let s2 = Stats::new(true, 30, false);
+        let restored = s2.import(&dump);
+        assert_eq!(restored.hits, 900);
+        assert_eq!(restored.misses, 100);
+        assert_eq!(restored.stale_hits, 120);
+        assert_eq!(restored.refreshes, 118);
+        assert_eq!(restored.refresh_failures, 4);
+    }
+
+    #[test]
+    fn import_of_legacy_blob_without_cache_counters_is_zero() {
+        // A stats.json written before cache counters existed has no such fields;
+        // serde defaults them to zero and the cache simply starts fresh.
+        let s = Stats::new(true, 30, false);
+        // A pre-cache-counters blob: all the fields that existed then, none of the
+        // new `cache_*` ones.
+        let legacy = r#"{"total":5,"blocked":1,"cached":2,"rewritten":0,"errors":0,
+            "blocked_domains":{},"clients":{},"upstreams":{},
+            "upstream_rtt_sum":{},"upstream_rtt_count":{}}"#;
+        let restored = s.import(legacy);
+        assert_eq!(restored.hits, 0);
+        assert_eq!(restored.refreshes, 0);
+        assert_eq!(s.snapshot(10, &ClientMatcher::default()).total, 5);
     }
 
     #[test]

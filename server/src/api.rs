@@ -1060,7 +1060,7 @@ pub async fn get_stats(
     let clients = state.engine.clients();
     let summary = state.engine.stats().snapshot(q.top, &clients);
     let cache = state.engine.cache();
-    Json(StatsResponse::new(summary, cache.len()))
+    Json(StatsResponse::new(summary, cache.len(), cache.counters()))
 }
 
 #[utoipa::path(
@@ -1071,6 +1071,10 @@ pub async fn get_stats(
 )]
 pub async fn reset_stats(State(state): State<AppState>) -> Json<OkResponse> {
     state.engine.stats().reset();
+    // The cache's lifetime counters are part of the same analytics surface, so
+    // clear them too — otherwise the optimistic-caching tile would survive a
+    // "reset statistics" with stale numbers.
+    state.engine.cache().reset_counters();
     OkResponse::ok()
 }
 
