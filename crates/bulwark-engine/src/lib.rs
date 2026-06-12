@@ -446,8 +446,10 @@ impl Engine {
                     state.block_v6,
                     state.blocked_ttl,
                 );
-                if hit.stale {
-                    self.spawn_refresh(&state, memoize, query, key.clone());
+                if hit.freshness.requires_refresh() {
+                    // The query is already parsed here (block synthesis needs it),
+                    // so hand it to the refresh as-is rather than re-parsing.
+                    self.spawn_refresh(&state, memoize, Lazy::Msg(query), key.clone());
                 }
                 let action = QueryAction::Blocked {
                     rule: info.rule,
@@ -457,13 +459,13 @@ impl Engine {
             }
 
             // Clean (or filtering off for this client): serve the cached answer.
-            if hit.stale {
+            if hit.freshness.requires_refresh() {
                 // Optimistic: refresh in the background (single-flight in the pool
-                // ensures only one upstream request). If the query somehow won't
-                // re-parse, skip the refresh and still serve the cached hit.
-                if let Some(refresh) = lazy.into_message() {
-                    self.spawn_refresh(&state, memoize, refresh, key.clone());
-                }
+                // ensures only one upstream request). This is the dominant cache
+                // path, and the serve below is a pure byte clone — so the query is
+                // re-parsed *inside* `spawn_refresh`, off the hot path, rather than
+                // here just to build the refresh.
+                self.spawn_refresh(&state, memoize, lazy, key.clone());
             }
             return match hit.response {
                 // Fast path: pre-encoded bytes with id + TTLs already patched.
@@ -592,7 +594,7 @@ impl Engine {
     /// it also recomputes the client-independent verdict so the refreshed entry
     /// keeps its fast path. Otherwise it inserts without a verdict and the next
     /// filtering hit re-evaluates.
-    fn spawn_refresh(&self, state: &EngineState, memoize: bool, query: Message, key: QueryKey) {
+    fn spawn_refresh(&self, state: &EngineState, memoize: bool, lazy: Lazy, key: QueryKey) {
         let cache = self.cache.clone();
         let pool = state.pool.clone();
         let filter = state.filter.clone();
@@ -601,6 +603,15 @@ impl Engine {
         // task is still in flight; the outcome is recorded when it completes.
         cache.note_refresh_started();
         tokio::spawn(async move {
+            // Materialise the query here, off the hot path: a clean-stale serve
+            // (the dominant hit) hands us the unparsed `Lazy::Bytes` so the serve
+            // itself stays a pure byte clone. A parse failure is effectively
+            // unreachable (the bytes already parsed once on the fast path); record
+            // it as a refresh failure rather than dropping the counted dispatch.
+            let Some(query) = lazy.into_message() else {
+                cache.note_refresh_failed();
+                return;
+            };
             let resolved = match pool.resolve(&query).await {
                 Ok(resolved) => resolved,
                 Err(_) => {

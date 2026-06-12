@@ -147,12 +147,32 @@ impl CachedResponse {
     }
 }
 
+/// Whether a cache hit is within TTL or is being served past expiry under the
+/// optimistic (serve-stale) window. Under serve-stale, `Stale` is the *expected*
+/// dominant hit path — not an error case — so it's modelled as a freshness state
+/// rather than a `stale: bool` to keep callers from treating it as exceptional.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HitFreshness {
+    /// Within TTL: serve as-is.
+    Fresh,
+    /// Past TTL but within the serve-stale window: serve now, but the caller
+    /// must kick off a background refresh to re-populate the entry.
+    Stale,
+}
+
+impl HitFreshness {
+    /// A stale serve must trigger a background refresh; a fresh one need not.
+    pub fn requires_refresh(self) -> bool {
+        matches!(self, HitFreshness::Stale)
+    }
+}
+
 /// Result of a cache lookup.
 pub struct CacheHit {
     pub response: CachedResponse,
-    /// True when this is a stale (expired) answer served optimistically; the
-    /// caller should trigger a background refresh.
-    pub stale: bool,
+    /// Whether the answer is fresh or is being served stale (which obliges the
+    /// caller to trigger a background refresh). See [`HitFreshness`].
+    pub freshness: HitFreshness,
     /// The memoised response-side verdict for this entry, if any. The engine
     /// gates on this before serving raw bytes to a filtering client (see
     /// [`ResponseVerdict`]); `None`, or a stale generation, forces a per-client
@@ -391,7 +411,7 @@ impl DnsCache {
         // (pointer-only) handle to the stored form; the actual byte clone + TTL
         // patch (or message clone) is deferred until after the guard is dropped
         // so concurrent hits don't serialize on it.
-        let (stored, ttl, stale, verdict) = {
+        let (stored, ttl, freshness, verdict) = {
             let mut map = self.shard(key).lock();
             let Some(entry) = map.get(key) else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
@@ -408,7 +428,7 @@ impl DnsCache {
             let verdict = entry.verdict.clone();
 
             if age < entry_ttl {
-                (stored, (entry_ttl - age).max(1), false, verdict)
+                (stored, (entry_ttl - age).max(1), HitFreshness::Fresh, verdict)
             } else {
                 // Expired. Optionally serve stale within the configured window
                 // (serve-stale is on iff `stale_max_age > 0`). The window is
@@ -420,7 +440,7 @@ impl DnsCache {
                     // optimistic subset separately: it's the slice of the hit rate
                     // that costs a background upstream refresh.
                     self.stale_hits.fetch_add(1, Ordering::Relaxed);
-                    (stored, STALE_SERVE_TTL, true, verdict)
+                    (stored, STALE_SERVE_TTL, HitFreshness::Stale, verdict)
                 } else {
                     // Too old / not optimistic: drop it and report a miss.
                     map.pop(key);
@@ -454,7 +474,7 @@ impl DnsCache {
         };
         Some(CacheHit {
             response,
-            stale,
+            freshness,
             verdict,
         })
     }
@@ -892,7 +912,7 @@ mod tests {
         let cache = DnsCache::new(100, 0, 0, 0);
         cache.insert(key("a.com."), &answer("a.com.", 100));
         let hit = cache.get(&key("a.com."), 0).unwrap();
-        assert!(!hit.stale);
+        assert!(!hit.freshness.requires_refresh());
         let m = hit.response.into_message();
         assert!(m.answers[0].ttl <= 100);
         assert!(m.answers[0].ttl >= 99);
@@ -970,7 +990,7 @@ mod tests {
             e.stored_at = Instant::now() - std::time::Duration::from_secs(10);
         }
         let hit = cache.get(&key("h.com."), 0).expect("stale hit");
-        assert!(hit.stale);
+        assert!(hit.freshness.requires_refresh());
 
         // Now push it beyond the stale window -> miss.
         cache.insert(key("h.com."), &answer("h.com.", 1));
@@ -998,7 +1018,7 @@ mod tests {
             let e = map.get_mut(&key("c.com.")).unwrap();
             e.stored_at = Instant::now() - Duration::from_secs(10);
         }
-        assert!(cache.get(&key("c.com."), 0).expect("stale hit").stale);
+        assert!(cache.get(&key("c.com."), 0).expect("stale hit").freshness.requires_refresh());
         assert_eq!(cache.hit_count(), 2, "stale serve still counts as a hit");
         assert_eq!(cache.stale_hit_count(), 1, "...and as a stale hit");
 
@@ -1026,7 +1046,7 @@ mod tests {
         let restored = DnsCache::new(100, 0, 0, 0);
         assert_eq!(restored.import_snapshot(&blob), 1);
         let hit = restored.get(&key("a.com."), 0).expect("restored hit");
-        assert!(!hit.stale);
+        assert!(!hit.freshness.requires_refresh());
         // TTL is the remaining lifetime, decremented from the original 100.
         let m = hit.response.into_message();
         assert!(m.answers[0].ttl <= 100 && m.answers[0].ttl >= 95);
@@ -1064,7 +1084,7 @@ mod tests {
 
         let restored = DnsCache::new(100, 0, 0, 3600);
         assert_eq!(restored.import_snapshot(&blob), 1);
-        assert!(restored.get(&key("h.com."), 0).expect("stale hit").stale);
+        assert!(restored.get(&key("h.com."), 0).expect("stale hit").freshness.requires_refresh());
     }
 
     #[test]
