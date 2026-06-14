@@ -32,7 +32,7 @@ use hickory_proto::rr::rdata::svcb::{SvcParamValue, SVCB};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 
 use crate::block::{block_response, error_response, rewrite_response, Rewritten};
-use crate::cache::{CachedResponse, DnsCache, Outcome, ResponseVerdict};
+use crate::cache::{CachedResponse, DnsCache, InsertedWire, Outcome, ResponseVerdict};
 use crate::clients::{ClientMatcher, ResolvedClient};
 use crate::querylog::{QueryAction, QueryLog, QueryLogEntry};
 use crate::stats::Stats;
@@ -473,7 +473,7 @@ impl Engine {
                     bytes,
                     rcode,
                     answers,
-                } => self.finalize_wire(bytes, rcode, answers, log, start),
+                } => self.finalize_wire(bytes, rcode, answers, QueryAction::Cached, log, start),
                 CachedResponse::Message(resp) => {
                     self.finalize(resp, QueryAction::Cached, log, start)
                 }
@@ -541,8 +541,8 @@ impl Engine {
                 // the raw answer. When a global verdict is memoisable, compute it
                 // even for an unfiltered requester so filtered clients get the fast
                 // path on their first hit rather than re-evaluating every time.
-                if memoize {
-                    let verdict = if client_filtered {
+                let verdict = if memoize {
+                    Some(if client_filtered {
                         // Already known clean for this — hence every — client.
                         ResponseVerdict::clean(generation)
                     } else {
@@ -550,16 +550,27 @@ impl Engine {
                             Some(info) => ResponseVerdict::block(info, generation),
                             None => ResponseVerdict::clean(generation),
                         }
-                    };
-                    self.cache
-                        .insert_with_verdict(key, &resolved.message, Some(verdict));
+                    })
                 } else {
-                    self.cache.insert(key, &resolved.message);
-                }
+                    None
+                };
+                // Insert and reclaim the encoded bytes: the cache just serialized
+                // this answer to wire to store it, so serve those exact bytes
+                // rather than re-encoding the same `Message` a second time on the
+                // way out. (Both encodes take the identical message, so the bytes
+                // match what the listener would have produced.)
+                let served = self.cache.insert_returning(key, &resolved.message, verdict);
                 let action = QueryAction::Forwarded {
                     upstream: resolved.upstream,
                 };
-                self.finalize(resolved.message, action, log, start)
+                match served {
+                    Some(InsertedWire {
+                        bytes,
+                        rcode,
+                        answers,
+                    }) => self.finalize_wire(bytes, rcode, answers, action, log, start),
+                    None => self.finalize(resolved.message, action, log, start),
+                }
             }
             Err(e) => {
                 tracing::debug!(name = %key.name, error = %e, "upstream resolution failed");
@@ -728,18 +739,13 @@ impl Engine {
         bytes: Vec<u8>,
         rcode: ResponseCode,
         answers: Arc<[String]>,
+        action: QueryAction,
         log: LogBuilder,
         start: Instant,
     ) -> EngineResponse {
         // The cache already holds these summaries as an `Arc`; share it (clone the
         // pointer) instead of deep-copying each string into the entry.
-        self.record(
-            log,
-            QueryAction::Cached,
-            rcode_label(rcode),
-            || answers,
-            start,
-        );
+        self.record(log, action, rcode_label(rcode), || answers, start);
         EngineResponse::Wire(bytes)
     }
 }

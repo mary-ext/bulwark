@@ -134,6 +134,16 @@ pub enum CachedResponse {
     Message(Message),
 }
 
+/// The encoded wire bytes (plus the log/stats metadata) of a freshly-inserted
+/// answer, handed back by [`DnsCache::insert_returning`] so the cache-miss path
+/// can serve the response it just encoded without a second `to_vec`. Same shape
+/// a [`CachedResponse::Wire`] hit yields.
+pub struct InsertedWire {
+    pub bytes: Vec<u8>,
+    pub rcode: ResponseCode,
+    pub answers: Arc<[String]>,
+}
+
 impl CachedResponse {
     /// Decode to a structured `Message`. The `Wire` variant re-parses its bytes
     /// (only used off the hot path — e.g. by the UDP truncation fallback or
@@ -500,27 +510,63 @@ impl DnsCache {
         self.insert_inner(key, message, verdict);
     }
 
-    fn insert_inner(&self, key: QueryKey, message: &Message, verdict: Option<ResponseVerdict>) {
+    /// Insert like [`Self::insert_with_verdict`] but return the encoded wire
+    /// bytes ready to serve (mirroring a [`CachedResponse::Wire`] hit), so the
+    /// cache-miss path serves the answer it just encoded instead of re-encoding
+    /// the `Message` a second time. `None` means it wasn't stored as wire (not
+    /// cacheable, or the rare `Message` fallback) — the caller then serves its
+    /// own `Message`.
+    pub fn insert_returning(
+        &self,
+        key: QueryKey,
+        message: &Message,
+        verdict: Option<ResponseVerdict>,
+    ) -> Option<InsertedWire> {
+        self.insert_inner(key, message, verdict)
+    }
+
+    fn insert_inner(
+        &self,
+        key: QueryKey,
+        message: &Message,
+        verdict: Option<ResponseVerdict>,
+    ) -> Option<InsertedWire> {
         if !self.is_enabled() {
-            return;
+            return None;
         }
-        let Some(ttl) = self.cacheable_ttl(message) else {
-            return;
-        };
+        let ttl = self.cacheable_ttl(message)?;
         // Encode once and record TTL offsets so hits are a byte clone + patch.
-        // Fall back to storing the `Message` if encoding or the wire scan fails
-        // (rare; keeps correctness for anything we can't safely patch).
-        let stored = match message.to_vec() {
+        // When the wire form is built we also hand the encoded bytes back (see
+        // [`InsertedWire`]) so the cache-miss path serves the response it just
+        // encoded rather than re-encoding the same `Message`. Fall back to
+        // storing the `Message` (serving nothing back) if encoding or the wire
+        // scan fails (rare; keeps correctness for anything we can't safely patch).
+        let (stored, served) = match message.to_vec() {
             Ok(bytes) => match crate::wire::scan_ttl_offsets(&bytes) {
-                Some(offsets) => Stored::Wire {
-                    bytes: Arc::from(bytes.into_boxed_slice()),
-                    ttl_offsets: Arc::from(offsets.into_boxed_slice()),
-                    rcode: message.metadata.response_code,
-                    answers: message.answers.iter().map(summarize).collect(),
-                },
-                None => Stored::Message(Arc::new(message.clone())),
+                Some(offsets) => {
+                    let rcode = message.metadata.response_code;
+                    let answers: Arc<[String]> = message.answers.iter().map(summarize).collect();
+                    let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
+                    // A flat memcpy of the just-encoded bytes — far cheaper than
+                    // the full `to_vec` re-encode it spares on the serve path.
+                    let served = InsertedWire {
+                        bytes: bytes.to_vec(),
+                        rcode,
+                        answers: answers.clone(),
+                    };
+                    (
+                        Stored::Wire {
+                            bytes,
+                            ttl_offsets: Arc::from(offsets.into_boxed_slice()),
+                            rcode,
+                            answers,
+                        },
+                        Some(served),
+                    )
+                }
+                None => (Stored::Message(Arc::new(message.clone())), None),
             },
-            Err(_) => Stored::Message(Arc::new(message.clone())),
+            Err(_) => (Stored::Message(Arc::new(message.clone())), None),
         };
         let entry = Entry {
             stored,
@@ -529,6 +575,7 @@ impl DnsCache {
             verdict,
         };
         self.shard(&key).lock().put(key, entry);
+        served
     }
 
     /// Decide whether a response is cacheable and compute its clamped TTL.

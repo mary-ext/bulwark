@@ -260,6 +260,30 @@ async fn cache_hit_serves_patched_wire() {
 }
 
 #[tokio::test]
+async fn forwarded_miss_serves_wire_without_reencoding() {
+    // A clean cache miss must serve the bytes the cache just encoded (the `Wire`
+    // variant), not a `Message` the listener re-encodes. The served bytes must
+    // decode to the right answer with the client's transaction id intact.
+    let (up, _count) = mock_upstream(Ipv4Addr::new(5, 6, 7, 8)).await;
+    let engine = make_engine("", up).await;
+
+    let resp = engine
+        .handle(ingest(query("fresh.com.", RecordType::A)), local())
+        .await;
+
+    let bytes = match &resp {
+        crate::EngineResponse::Wire(b) => b.clone(),
+        crate::EngineResponse::Message(_) => panic!("forwarded miss should serve wire bytes"),
+    };
+    // The served wire is self-consistent and carries the client id + answer.
+    let decoded = Message::from_vec(&bytes).expect("served wire decodes");
+    assert_eq!(decoded.metadata.id, 0xABCD);
+    assert_eq!(decoded.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(decoded.answers.len(), 1);
+    assert!(matches!(&decoded.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(5, 6, 7, 8)));
+}
+
+#[tokio::test]
 async fn blocks_filtered_domain() {
     let (up, count) = mock_upstream(Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||ads.example.com^", up).await;
