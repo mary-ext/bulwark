@@ -1753,6 +1753,125 @@ async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: S
 }
 
 // ---------------------------------------------------------------------------
+// End-to-end UDP loopback benchmark.
+//
+// Everything else in this file is a CPU micro-bench: it calls `engine.handle`
+// directly and never touches a socket or spawns a task. The biggest remaining
+// performance lever (a synchronous cache-hit fast path that skips the per-query
+// `tokio::spawn` + inflight semaphore) lives *entirely* in the listener layer
+// that those phases omit — so it is invisible to them. This arm drives a real
+// `Engine` behind a real UDP listener over loopback, capturing the full cost:
+// `recv_from`/`send_to` syscalls, the semaphore, the per-datagram spawn, and the
+// cross-thread wakeups.
+// ---------------------------------------------------------------------------
+
+/// Baseline UDP serve loop — a faithful copy of production `server::spawn_udp`
+/// (inflight semaphore + one `tokio::spawn` per datagram). The fast-path
+/// experiment will A/B a synchronous variant against this exact loop.
+fn spawn_listener_baseline(
+    engine: Arc<Engine>,
+    socket: UdpSocket,
+) -> tokio::task::JoinHandle<()> {
+    let socket = Arc::new(socket);
+    let inflight = Arc::new(tokio::sync::Semaphore::new(1024));
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, peer) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(ing) = Ingress::parse(&buf[..n]) else {
+                continue;
+            };
+            let Ok(permit) = inflight.clone().acquire_owned().await else {
+                return;
+            };
+            let engine = engine.clone();
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let max = ing.udp_max_payload();
+                let resp = engine.handle(ing, peer.ip()).await;
+                let bytes = encode_udp_response(resp, max);
+                if !bytes.is_empty() {
+                    let _ = socket.send_to(&bytes, peer).await;
+                }
+            });
+        }
+    })
+}
+
+/// Drive a real UDP listener over loopback with a warm, fresh, allowed
+/// cache-hit name (the dominant DNS path). Reports closed-loop per-query latency
+/// (one query in flight) and open-loop throughput at `concurrency` parallel
+/// client sockets.
+async fn udp_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, concurrency: usize) {
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let peer = local();
+    // Warm the cache so every client query is a fresh, allowed hit.
+    let hot = "req-hot.example.";
+    let _ = engine.handle(ingress(query(hot, RecordType::A)), peer).await;
+    let qbytes = query(hot, RecordType::A).to_vec().unwrap();
+
+    let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let server_addr = server_sock.local_addr().unwrap();
+    let _listener = spawn_listener_baseline(engine.clone(), server_sock);
+
+    println!("\n== UDP end-to-end (loopback, warm cache hit) ==");
+    println!("  listener at {server_addr}  workload='{hot}' (fresh allowed hit)");
+
+    // --- Closed-loop latency: one in-flight query at a time. ---
+    {
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(server_addr).await.unwrap();
+        let mut rbuf = vec![0u8; 4096];
+        for _ in 0..2000 {
+            client.send(&qbytes).await.unwrap();
+            let _ = client.recv(&mut rbuf).await.unwrap();
+        }
+        let mut ns = Vec::with_capacity(n);
+        for _ in 0..n {
+            let t = Instant::now();
+            client.send(&qbytes).await.unwrap();
+            let _ = client.recv(&mut rbuf).await.unwrap();
+            ns.push(t.elapsed().as_nanos() as u64);
+        }
+        report("udp closed-loop RTT", ns);
+    }
+
+    // --- Open-loop throughput: `concurrency` parallel closed-loop clients. ---
+    let tput_total = n.max(200_000);
+    let per_client = (tput_total / concurrency).max(1);
+    let t = Instant::now();
+    let mut tasks = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let qb = qbytes.clone();
+        let addr = server_addr;
+        tasks.push(tokio::spawn(async move {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client.connect(addr).await.unwrap();
+            let mut rbuf = vec![0u8; 4096];
+            for _ in 0..per_client {
+                if client.send(&qb).await.is_err() {
+                    break;
+                }
+                let _ = client.recv(&mut rbuf).await;
+            }
+        }));
+    }
+    for h in tasks {
+        let _ = h.await;
+    }
+    let elapsed = t.elapsed();
+    let total = (per_client * concurrency) as f64;
+    println!(
+        "  udp throughput @ {concurrency} clients: {:>10.0} q/s  ({total:.0} queries in {elapsed:?})",
+        total / elapsed.as_secs_f64()
+    );
+}
+
+// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -1780,6 +1899,13 @@ async fn main() {
     println!("  sampled {} real blockable domains", blocked.len());
 
     let (upstream, _count) = mock_upstream(delay).await;
+
+    // End-to-end UDP loopback: real listener + real client sockets. Captures
+    // the syscall/semaphore/spawn costs the CPU-only phases omit.
+    if std::env::var("BENCH_PROFILE").as_deref() == Ok("udp_e2e") {
+        udp_e2e(filter, upstream, n, concurrency).await;
+        return;
+    }
 
     // Profiling mode: when BENCH_PROFILE=<scenario> is set, run ONLY that
     // full-request workload at high volume and exit — a clean target for
