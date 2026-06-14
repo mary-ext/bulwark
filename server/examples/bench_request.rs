@@ -1802,6 +1802,167 @@ fn spawn_listener_baseline(
     })
 }
 
+/// Fast-path UDP serve loop — the experiment. The fresh, clean cache-hit branch
+/// of `Engine::handle` never `.await`s, so polling the returned future once
+/// inline drives it to completion synchronously; we send the response with NO
+/// `tokio::spawn`. Anything that actually awaits (cache miss → upstream, or a
+/// rewrite CNAME resolve) returns `Pending`; we migrate the same in-flight
+/// future into a spawned task (tokio's I/O resources cache readiness, so the
+/// waker swap on the next poll is safe). No engine logic is duplicated.
+fn spawn_listener_fastpath(
+    engine: Arc<Engine>,
+    socket: UdpSocket,
+) -> tokio::task::JoinHandle<()> {
+    // FAST_LOOPS recv loops share the socket — a stand-in for SO_REUSEPORT
+    // per-core sockets, to test whether inline handling scales with cores.
+    let loops = env_usize("FAST_LOOPS", 1);
+    let socket = Arc::new(socket);
+    let inflight = Arc::new(tokio::sync::Semaphore::new(1024));
+    for _ in 1..loops {
+        fastpath_loop(engine.clone(), socket.clone(), inflight.clone());
+    }
+    fastpath_loop(engine, socket, inflight)
+}
+
+fn fastpath_loop(
+    engine: Arc<Engine>,
+    socket: Arc<UdpSocket>,
+    inflight: Arc<tokio::sync::Semaphore>,
+) -> tokio::task::JoinHandle<()> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        let waker = Waker::noop();
+        loop {
+            let (n, peer) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(ing) = Ingress::parse(&buf[..n]) else {
+                continue;
+            };
+            let max = ing.udp_max_payload();
+            // The async block owns an engine handle so the future is `'static`
+            // and can migrate into a spawn on the (rare) Pending path.
+            let eng = engine.clone();
+            let mut fut: Pin<Box<dyn Future<Output = EngineResponse> + Send>> =
+                Box::pin(async move { eng.handle(ing, peer.ip()).await });
+            // Scope the (non-Send) Context so it is dropped before any await.
+            let polled = {
+                let mut cx = Context::from_waker(waker);
+                fut.as_mut().poll(&mut cx)
+            };
+            match polled {
+                Poll::Ready(resp) => {
+                    // Synchronous completion (the cache hit): send inline.
+                    let bytes = encode_udp_response(resp, max);
+                    if !bytes.is_empty() {
+                        let _ = socket.send_to(&bytes, peer).await;
+                    }
+                }
+                Poll::Pending => {
+                    // Hit a real await (miss/cname): finish on a spawned task.
+                    let Ok(permit) = inflight.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let socket = socket.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let resp = fut.await;
+                        let bytes = encode_udp_response(resp, max);
+                        if !bytes.is_empty() {
+                            let _ = socket.send_to(&bytes, peer).await;
+                        }
+                    });
+                }
+            }
+        }
+    })
+}
+
+/// Same-run, interleaved A/B: one client alternates between a baseline listener
+/// (spawn-per-query) and a fast-path listener (inline poll) sharing one engine,
+/// so thermal/scheduler drift cancels. Also reports saturated throughput per
+/// listener.
+async fn udp_fast_ab(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, concurrency: usize) {
+    let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
+    let peer = local();
+    let hot = "req-hot.example.";
+    let _ = engine.handle(ingress(query(hot, RecordType::A)), peer).await;
+    let qbytes = query(hot, RecordType::A).to_vec().unwrap();
+
+    let base_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let base_addr = base_sock.local_addr().unwrap();
+    let _base = spawn_listener_baseline(engine.clone(), base_sock);
+    let fast_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let fast_addr = fast_sock.local_addr().unwrap();
+    let _fast = spawn_listener_fastpath(engine.clone(), fast_sock);
+
+    println!("\n== UDP fast-path A/B (loopback, warm cache hit) ==");
+    println!("  baseline={base_addr}  fastpath={fast_addr}  workload='{hot}'");
+
+    // --- Interleaved closed-loop latency. ---
+    let base_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    base_client.connect(base_addr).await.unwrap();
+    let fast_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    fast_client.connect(fast_addr).await.unwrap();
+    let mut rbuf = vec![0u8; 4096];
+    for _ in 0..2000 {
+        base_client.send(&qbytes).await.unwrap();
+        base_client.recv(&mut rbuf).await.unwrap();
+        fast_client.send(&qbytes).await.unwrap();
+        fast_client.recv(&mut rbuf).await.unwrap();
+    }
+    let mut base_ns = Vec::with_capacity(n);
+    let mut fast_ns = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        base_client.send(&qbytes).await.unwrap();
+        base_client.recv(&mut rbuf).await.unwrap();
+        base_ns.push(t.elapsed().as_nanos() as u64);
+
+        let t = Instant::now();
+        fast_client.send(&qbytes).await.unwrap();
+        fast_client.recv(&mut rbuf).await.unwrap();
+        fast_ns.push(t.elapsed().as_nanos() as u64);
+    }
+    report("baseline (spawn)  RTT", base_ns);
+    report("fastpath (inline) RTT", fast_ns);
+
+    // --- Saturated throughput per listener. ---
+    let tput_total = n.max(200_000);
+    for (label, addr) in [("baseline", base_addr), ("fastpath", fast_addr)] {
+        let per_client = (tput_total / concurrency).max(1);
+        let t = Instant::now();
+        let mut tasks = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            let qb = qbytes.clone();
+            tasks.push(tokio::spawn(async move {
+                let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                client.connect(addr).await.unwrap();
+                let mut rbuf = vec![0u8; 4096];
+                for _ in 0..per_client {
+                    if client.send(&qb).await.is_err() {
+                        break;
+                    }
+                    let _ = client.recv(&mut rbuf).await;
+                }
+            }));
+        }
+        for h in tasks {
+            let _ = h.await;
+        }
+        let elapsed = t.elapsed();
+        let total = (per_client * concurrency) as f64;
+        println!(
+            "  {label:<9} throughput @ {concurrency} clients: {:>10.0} q/s",
+            total / elapsed.as_secs_f64()
+        );
+    }
+}
+
 /// Drive a real UDP listener over loopback with a warm, fresh, allowed
 /// cache-hit name (the dominant DNS path). Reports closed-loop per-query latency
 /// (one query in flight) and open-loop throughput at `concurrency` parallel
@@ -1904,6 +2065,11 @@ async fn main() {
     // the syscall/semaphore/spawn costs the CPU-only phases omit.
     if std::env::var("BENCH_PROFILE").as_deref() == Ok("udp_e2e") {
         udp_e2e(filter, upstream, n, concurrency).await;
+        return;
+    }
+    // Same-run A/B of the synchronous cache-hit fast path vs spawn-per-query.
+    if std::env::var("BENCH_PROFILE").as_deref() == Ok("udp_fast_ab") {
+        udp_fast_ab(filter, upstream, n, concurrency).await;
         return;
     }
 
