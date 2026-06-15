@@ -118,6 +118,41 @@ async fn resolves_via_udp_and_restores_id() {
 }
 
 #[tokio::test]
+async fn udp_socket_idle_closes_then_redials() {
+    use crate::plain::UdpTransport;
+    use crate::transport::Transport;
+
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
+    // A short idle window so the test drives the close/redial cycle in <1s.
+    let t = UdpTransport::with_idle_timeout(mock.addr, Duration::from_millis(150));
+
+    // First query dials the persistent socket; its reader is alive afterwards.
+    let r1 = t.query(&make_query("example.com.")).await.unwrap();
+    assert_eq!(r1.answers.len(), 1);
+    assert!(
+        !t.cached_conn_is_dead().await,
+        "socket should be live immediately after a query"
+    );
+
+    // Go quiet past the idle window: the reader self-closes, freeing its 64 KiB
+    // buffer and ending the task, and marks the cached connection dead.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        t.cached_conn_is_dead().await,
+        "socket should idle-close after the idle window elapses with no traffic"
+    );
+
+    // A fresh query transparently re-dials and still resolves correctly.
+    let r2 = t.query(&make_query("example.com.")).await.unwrap();
+    assert_eq!(r2.answers.len(), 1);
+    assert!(
+        !t.cached_conn_is_dead().await,
+        "re-dial should install a fresh, live socket"
+    );
+    assert_eq!(mock.received.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn single_flight_coalesces_identical_queries() {
     // Slow answer so concurrent callers all join the in-flight request.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(9, 9, 9, 9), 150)).await;

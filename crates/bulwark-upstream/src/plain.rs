@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -59,12 +60,26 @@ where
     Ok(())
 }
 
+/// How long a connected UDP socket may sit idle — no datagram received and no
+/// query in flight — before its reader task exits, freeing the 64 KiB receive
+/// buffer and the task itself; the next query re-dials. Sized well above any
+/// inter-query gap a browsing session produces (so an active resolver keeps its
+/// warm socket and pays no per-query bind), but short enough that a quiet
+/// home/SBC box stops holding the buffer at rest. Re-dialing is a local
+/// bind+connect with no round-trip — UDP has no handshake — so the close/redial
+/// cycle costs no measurable latency even when a burst follows an idle gap.
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One persistent connected UDP socket, multiplexed: many queries can be in
 /// flight at once, each tagged with a distinct socket-local id, and a background
 /// reader demultiplexes datagrams back to the waiting callers by that id. This
 /// avoids binding a fresh socket and allocating a 64 KiB receive buffer for every
 /// single query (the old behaviour), which was syscall- and allocation-heavy on
 /// the cache-miss path for plain-UDP upstreams.
+///
+/// The socket is not held forever: after [`UDP_IDLE_TIMEOUT`] with no traffic the
+/// reader self-closes (see [`udp_reader_loop`]), so an idle box gives the buffer
+/// and task back rather than pinning them per upstream.
 struct UdpConn {
     sock: Arc<UdpSocket>,
     pending: Pending,
@@ -79,10 +94,10 @@ impl Drop for UdpConn {
 }
 
 impl UdpConn {
-    fn new(sock: UdpSocket) -> Arc<Self> {
+    fn new(sock: UdpSocket, idle_timeout: Duration) -> Arc<Self> {
         let sock = Arc::new(sock);
         let pending: Pending = Arc::new(SyncMutex::new(PendingState::default()));
-        let reader = tokio::spawn(udp_reader_loop(sock.clone(), pending.clone()));
+        let reader = tokio::spawn(udp_reader_loop(sock.clone(), pending.clone(), idle_timeout));
         Arc::new(UdpConn {
             sock,
             pending,
@@ -141,13 +156,39 @@ impl UdpConn {
 /// the response id. On a socket error the connection is dead: mark it and drop
 /// every pending sender so all in-flight queries wake with an error and fail over
 /// promptly. Undecodable or unsolicited datagrams are ignored.
-async fn udp_reader_loop(sock: Arc<UdpSocket>, pending: Pending) {
+///
+/// The recv is bounded by `idle_timeout`: if nothing arrives within it *and* no
+/// query is in flight, the socket has gone idle, so we close it (mark dead and
+/// return), freeing the 64 KiB `buf` and ending the task. The close decision and
+/// the send path interlock on the `pending` lock — `exchange` checks `dead`
+/// before inserting its waiter, so a query racing the timeout either lands in
+/// `map` first (non-empty → we keep the socket) or sees `dead` and re-dials; we
+/// never strand a query whose datagram we then stop reading. A genuinely lost
+/// response leaves its waiter in `map`, so we keep waiting until the caller's
+/// own timeout removes it, after which the next idle tick closes the socket.
+async fn udp_reader_loop(sock: Arc<UdpSocket>, pending: Pending, idle_timeout: Duration) {
     let mut buf = vec![0u8; 65535];
-    while let Ok(n) = sock.recv(&mut buf).await {
-        if let Ok(msg) = decode(&buf[..n]) {
-            let waiter = pending.lock().map.remove(&msg.metadata.id);
-            if let Some(tx) = waiter {
-                let _ = tx.send(msg);
+    loop {
+        match tokio::time::timeout(idle_timeout, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) => {
+                if let Ok(msg) = decode(&buf[..n]) {
+                    let waiter = pending.lock().map.remove(&msg.metadata.id);
+                    if let Some(tx) = waiter {
+                        let _ = tx.send(msg);
+                    }
+                }
+            }
+            // Socket error: the connection is dead.
+            Ok(Err(_)) => break,
+            // Idle: close only if nothing is waiting on us. recv is cancel-safe,
+            // so a datagram that lands exactly now stays buffered for the next
+            // dial (and has no waiter anyway, since `map` is empty).
+            Err(_elapsed) => {
+                let mut p = pending.lock();
+                if p.map.is_empty() {
+                    p.dead = true;
+                    break;
+                }
             }
         }
     }
@@ -161,6 +202,7 @@ async fn udp_reader_loop(sock: Arc<UdpSocket>, pending: Pending) {
 pub struct UdpTransport {
     addr: SocketAddr,
     conn: Mutex<Option<Arc<UdpConn>>>,
+    idle_timeout: Duration,
     desc: String,
 }
 
@@ -170,7 +212,25 @@ impl UdpTransport {
             desc: format!("udp://{addr}"),
             addr,
             conn: Mutex::new(None),
+            idle_timeout: UDP_IDLE_TIMEOUT,
         }
+    }
+
+    /// Construct with a custom idle-close window (tests use a short one to drive
+    /// the close/redial cycle without waiting [`UDP_IDLE_TIMEOUT`]).
+    #[cfg(test)]
+    pub(crate) fn with_idle_timeout(addr: SocketAddr, idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            ..Self::new(addr)
+        }
+    }
+
+    /// Whether the cached connection currently exists and has been marked dead
+    /// (e.g. by an idle close). Used by tests to observe the lifecycle.
+    #[cfg(test)]
+    pub(crate) async fn cached_conn_is_dead(&self) -> bool {
+        matches!(self.conn.lock().await.as_ref(), Some(c) if c.is_dead())
     }
 
     /// Bind an ephemeral socket connected to the upstream. A connected UDP socket
@@ -197,7 +257,7 @@ impl UdpTransport {
                 return Ok(c.clone());
             }
         }
-        let conn = UdpConn::new(self.dial().await?);
+        let conn = UdpConn::new(self.dial().await?, self.idle_timeout);
         *guard = Some(conn.clone());
         Ok(conn)
     }
