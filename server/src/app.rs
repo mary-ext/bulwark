@@ -170,6 +170,8 @@ pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Eng
         cfg.cache.max_ttl_secs,
         cfg.cache.optimistic_max_age_secs,
     );
+    // Only retain per-answer log summaries on cache entries while logging is on.
+    cache.set_store_summaries(cfg.query_log.enabled);
     let log = Arc::new(QueryLog::new(
         cfg.query_log.enabled,
         cfg.privacy.anonymize_client_ips,
@@ -217,6 +219,10 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         new_cfg.cache.max_ttl_secs,
         new_cfg.cache.optimistic_max_age_secs,
     );
+    state
+        .engine
+        .cache()
+        .set_store_summaries(new_cfg.query_log.enabled);
     state
         .engine
         .log()

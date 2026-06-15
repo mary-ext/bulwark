@@ -205,6 +205,15 @@ pub struct CacheConfig {
     /// stale entry may still be served while it refreshes in the background.
     /// `0` disables serve-stale; any value `> 0` enables it and bounds staleness.
     pub stale_max_age: AtomicU32,
+    /// Whether to precompute and store per-answer log summaries on each cache
+    /// entry. They feed *only* the query log, so when logging is off they are
+    /// pure resident overhead (an `Arc<[String]>` per entry, kept for the whole
+    /// entry lifetime). Mirrors `query_log.enabled`: on when logging is on (where
+    /// the stored copy makes a logged hit a cheap `Arc` clone instead of a wire
+    /// re-parse), off otherwise so an idle/SBC box doesn't carry summaries nobody
+    /// reads. Toggling at runtime only affects entries inserted afterwards; the
+    /// rest fill in (empty → populated, or vice versa) as they refresh.
+    pub store_summaries: AtomicBool,
 }
 
 /// Number of cache shards: a power of two (so shard selection is a cheap mask)
@@ -288,6 +297,11 @@ impl DnsCache {
                 min_ttl: AtomicU32::new(min_ttl),
                 max_ttl: AtomicU32::new(max_ttl),
                 stale_max_age: AtomicU32::new(stale_max_age),
+                // Default on: the engine syncs this to `query_log.enabled` right
+                // after construction. On keeps existing behaviour (and tests) and
+                // is the safe default — we only ever drop summaries we're sure
+                // nothing reads.
+                store_summaries: AtomicBool::new(true),
             },
             capacity: AtomicUsize::new(cap),
             hits: AtomicU64::new(0),
@@ -333,6 +347,14 @@ impl DnsCache {
 
     pub fn is_enabled(&self) -> bool {
         self.cfg.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Mirror query-logging state into the cache: when logging is off, new
+    /// entries skip the per-answer log summaries entirely (see
+    /// [`CacheConfig::store_summaries`]). Called by the engine on startup and on
+    /// every config reload, alongside the query log's own reconfigure.
+    pub fn set_store_summaries(&self, store: bool) {
+        self.cfg.store_summaries.store(store, Ordering::Relaxed);
     }
 
     pub fn clear(&self) {
@@ -545,7 +567,15 @@ impl DnsCache {
             Ok(bytes) => match crate::wire::scan_ttl_offsets(&bytes) {
                 Some(offsets) => {
                     let rcode = message.metadata.response_code;
-                    let answers: Arc<[String]> = message.answers.iter().map(summarize).collect();
+                    // Only pay to build + retain the per-answer log summaries when
+                    // query logging is on; otherwise store an empty slice so an
+                    // idle box doesn't carry summaries nothing will read.
+                    let answers: Arc<[String]> =
+                        if self.cfg.store_summaries.load(Ordering::Relaxed) {
+                            message.answers.iter().map(summarize).collect()
+                        } else {
+                            Arc::from([])
+                        };
                     let bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
                     // A flat memcpy of the just-encoded bytes — far cheaper than
                     // the full `to_vec` re-encode it spares on the serve path.
