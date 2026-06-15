@@ -22,10 +22,13 @@ use crate::store::QueryStore;
 /// [`spawn_querylog_writer`]) and keeps up with any realistic query rate by a
 /// wide margin, so in steady state the channel sits near-empty — the cap is
 /// reached only while the writer is stalled (slow fsync, disk contention, the
-/// pruner holding the write lock). At ~400 B per [`QueryLogEntry`] all-in, this
-/// bounds that worst-case spike to ~1.5 MB while still buffering eight full
-/// drain batches before shedding — ample for a transient stall.
-pub const QUERYLOG_CHANNEL_CAP: usize = 4_096;
+/// pruner holding the write lock). A home deployment runs on the order of one
+/// query/second, so this cap is one full drain batch of headroom — enough to
+/// ride out a multi-minute stall before shedding — while bounding the
+/// worst-case spike to ~200 KB at ~400 B per [`QueryLogEntry`]. The old 4096
+/// was sized for throughput we never see; on an SBC the tighter bound is the
+/// better trade.
+pub const QUERYLOG_CHANNEL_CAP: usize = 512;
 
 fn now_ms() -> i64 {
     SystemTime::now()
