@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::{Result, UpstreamError};
 use crate::transport::{
-    decode, encode, matches_query, Pending, PendingGuard, PendingState, Transport,
+    decode, encode, matches_query, Pending, PendingGuard, PendingState, Transport, MAX_UDP_PAYLOAD,
     UPSTREAM_IDLE_TIMEOUT,
 };
 
@@ -66,9 +66,9 @@ where
 /// One persistent connected UDP socket, multiplexed: many queries can be in
 /// flight at once, each tagged with a distinct socket-local id, and a background
 /// reader demultiplexes datagrams back to the waiting callers by that id. This
-/// avoids binding a fresh socket and allocating a 64 KiB receive buffer for every
-/// single query (the old behaviour), which was syscall- and allocation-heavy on
-/// the cache-miss path for plain-UDP upstreams.
+/// avoids binding a fresh socket and allocating a receive buffer for every single
+/// query (the old behaviour), which was syscall- and allocation-heavy on the
+/// cache-miss path for plain-UDP upstreams.
 ///
 /// The socket is not held forever: after [`UPSTREAM_IDLE_TIMEOUT`] with no traffic the
 /// reader self-closes (see [`udp_reader_loop`]), so an idle box gives the buffer
@@ -152,7 +152,7 @@ impl UdpConn {
 ///
 /// The recv is bounded by `idle_timeout`: if nothing arrives within it *and* no
 /// query is in flight, the socket has gone idle, so we close it (mark dead and
-/// return), freeing the 64 KiB `buf` and ending the task. The close decision and
+/// return), freeing the receive `buf` and ending the task. The close decision and
 /// the send path interlock on the `pending` lock — `exchange` checks `dead`
 /// before inserting its waiter, so a query racing the timeout either lands in
 /// `map` first (non-empty → we keep the socket) or sees `dead` and re-dials; we
@@ -160,7 +160,10 @@ impl UdpConn {
 /// response leaves its waiter in `map`, so we keep waiting until the caller's
 /// own timeout removes it, after which the next idle tick closes the socket.
 async fn udp_reader_loop(sock: Arc<UdpSocket>, pending: Pending, idle_timeout: Duration) {
-    let mut buf = vec![0u8; 65535];
+    // Sized to the largest payload we ever advertise upstream (responses bigger
+    // than this arrive truncated and are refetched over TCP), so a connection
+    // holds 4 KiB rather than 64 KiB while it's warm. See [`MAX_UDP_PAYLOAD`].
+    let mut buf = vec![0u8; MAX_UDP_PAYLOAD as usize];
     loop {
         match tokio::time::timeout(idle_timeout, sock.recv(&mut buf)).await {
             Ok(Ok(n)) => {

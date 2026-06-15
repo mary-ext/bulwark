@@ -107,27 +107,42 @@ pub fn dnssec_ok(msg: &Message) -> bool {
     msg.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok)
 }
 
+/// Largest EDNS UDP payload size we advertise to upstreams. A connected-UDP
+/// upstream sizes its fixed receive buffer to this (see `plain::udp_reader_loop`),
+/// so we must never tell an upstream it may send us more than we can receive —
+/// otherwise the reply would be silently truncated at the socket (which is *not*
+/// the EDNS TC→TCP path). Clamping here also keeps large replies from arriving as
+/// fragmented UDP: anything bigger comes back with TC set and is refetched over
+/// TCP. 4096 is the classic safe EDNS buffer size and covers the overwhelming
+/// majority of answers in a single datagram.
+pub(crate) const MAX_UDP_PAYLOAD: u16 = 4096;
+
 /// Strip EDNS options we neither honour nor key on before forwarding a query
 /// upstream, keeping only the DNSSEC-OK bit (which the cache / single-flight
-/// [`QueryKey`] *does* distinguish) and the advertised payload size.
+/// [`QueryKey`] *does* distinguish), and clamp the advertised UDP payload to
+/// [`MAX_UDP_PAYLOAD`].
 ///
 /// The proxy forwards the client's message essentially verbatim, and two queries
 /// that differ only in an option like EDNS Client Subnet, COOKIE, or NSID share
 /// one cache / single-flight key. Without this, a client's subnet-tailored answer
 /// could be cross-served to another client, and client identifiers would leak to
 /// the upstream. Dropping those options makes the forwarded query — and thus the
-/// answer cached under that key — independent of them. A query with no OPT
-/// record, or one already carrying no options, is left untouched.
+/// answer cached under that key — independent of them. The payload clamp keeps a
+/// client that advertises an oversized buffer from making an upstream send a
+/// datagram our fixed receive buffer couldn't hold. A query with no OPT record is
+/// left untouched; one with no options and an in-range payload needs no change.
 pub fn normalize_upstream_edns(msg: &mut Message) {
     let Some(edns) = msg.edns.as_ref() else {
         return;
     };
-    if edns.options().options.is_empty() {
+    let has_options = !edns.options().options.is_empty();
+    let over_max = edns.max_payload() > MAX_UDP_PAYLOAD;
+    if !has_options && !over_max {
         return;
     }
     let mut clean = Edns::new();
     clean.set_version(edns.version());
-    clean.set_max_payload(edns.max_payload());
+    clean.set_max_payload(edns.max_payload().min(MAX_UDP_PAYLOAD));
     clean.set_dnssec_ok(edns.flags().dnssec_ok);
     msg.set_edns(clean);
 }
@@ -268,6 +283,27 @@ mod tests {
         assert!(msg.edns.is_none());
         normalize_upstream_edns(&mut msg);
         assert!(msg.edns.is_none(), "a query with no OPT record is untouched");
+    }
+
+    #[test]
+    fn normalize_clamps_oversized_payload_even_without_options() {
+        use hickory_proto::op::Edns;
+
+        // A client advertising a 65535-byte buffer and *no* options must still get
+        // its payload clamped, so an upstream can't be told to send us more than
+        // our fixed UDP receive buffer (MAX_UDP_PAYLOAD) can hold.
+        let mut msg = query(1, "a.com", true, RecordType::A);
+        let mut edns = Edns::new();
+        edns.set_version(0);
+        edns.set_max_payload(u16::MAX);
+        edns.set_dnssec_ok(true);
+        msg.set_edns(edns);
+
+        normalize_upstream_edns(&mut msg);
+
+        let e = msg.edns.as_ref().expect("EDNS envelope is kept");
+        assert_eq!(e.max_payload(), MAX_UDP_PAYLOAD, "oversized payload is clamped");
+        assert!(e.flags().dnssec_ok, "the DO bit must be preserved");
     }
 
     #[test]
