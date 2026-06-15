@@ -55,10 +55,11 @@ impl Default for PoolSettings {
     }
 }
 
-/// How long after a healthy sample the next probe is scheduled. Live queries
-/// refresh the same health, so a busy upstream keeps pushing this out and is
-/// effectively never probed — only idle upstreams (e.g. standby fallbacks) get
-/// probed, and only to keep their latency estimate from going stale.
+/// How often a healthy upstream is probed. The probe RTT *is* the routing
+/// signal (see [`Health::routing_latency_ms`]), so every healthy upstream —
+/// busy or idle — is probed on this cadence to keep its estimate fresh; live
+/// traffic no longer defers it. The idle-close window on the transports is
+/// shorter than this, so a connection still reclaims in the gap between probes.
 const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(60);
 
 /// First retry delay after an upstream goes down. A downed upstream gets no live
@@ -99,43 +100,6 @@ fn startup_delay(max: Duration) -> Duration {
     max.mul_f64(rand::random::<f64>())
 }
 
-/// How long to wait before re-probing a *healthy idle* upstream, from its own
-/// smoothed latency and the lowest among its healthy peers.
-///
-/// With several upstreams configured, some are simply always slower and will
-/// never be picked. There's no point polling them as often as the contenders —
-/// so an upstream competitive with the leader keeps the base cadence, while one
-/// that sits progressively further behind gets a progressively longer interval
-/// (up to 8×). The leader itself is kept fresh; we only back off the also-rans,
-/// and only by latency margin, so a backup that's *close* still stays warm for
-/// failover. Unknown latency (just came up) counts as competitive so we sample
-/// it properly first.
-fn idle_probe_window(self_ewma: Option<f64>, best_ewma: Option<f64>) -> Duration {
-    let mult = match (self_ewma, best_ewma) {
-        (Some(mine), Some(best)) => match mine / best.max(1.0) {
-            // Floor `best` at 1ms so a near-zero leader (e.g. a LAN resolver)
-            // can't blow the ratio up to infinity.
-            r if r <= 1.5 => 1,
-            r if r <= 3.0 => 2,
-            r if r <= 6.0 => 4,
-            _ => 8,
-        },
-        _ => 1,
-    };
-    HEALTHY_PROBE_WINDOW * mult
-}
-
-/// Where a latency sample came from. Live and background-probe latencies are
-/// tracked in separate EWMAs because they measure different things: the probe is
-/// a tiny, cache-hot `NS .`, while live traffic is real A/AAAA/HTTPS lookups that
-/// may exercise slower resolver paths. Mixing them into one average lets the
-/// cheap probe flatter (or the real traffic distort) the other.
-#[derive(Clone, Copy)]
-enum Source {
-    Live,
-    Probe,
-}
-
 /// EWMA update: the first sample seeds the average, later ones blend in by
 /// `alpha`.
 fn ewma(samples: u64, prev_ms: f64, sample_ms: f64, alpha: f64) -> f64 {
@@ -148,13 +112,9 @@ fn ewma(samples: u64, prev_ms: f64, sample_ms: f64, alpha: f64) -> f64 {
 
 #[derive(Debug, Clone)]
 struct Health {
-    /// Smoothed latency of real user queries, with its sample count and the
-    /// instant of the most recent sample (used to decide which estimate is
-    /// fresher — see [`Health::estimate_ms`]).
-    live_ewma_ms: f64,
-    live_samples: u64,
-    live_at: Option<Instant>,
-    /// Smoothed latency of background probes, kept apart from the live figure.
+    /// Smoothed latency of background probes (`NS .`). This is the routing
+    /// signal: measured the same way for every upstream so they're directly
+    /// comparable (see [`Health::routing_latency_ms`]).
     probe_ewma_ms: f64,
     probe_samples: u64,
     probe_at: Option<Instant>,
@@ -164,25 +124,24 @@ struct Health {
     /// distinguished from an untried one and would never sort as down.)
     up: bool,
     consecutive_failures: u32,
+    /// Live query counters (probes don't count toward these — they're the volume
+    /// of *real* traffic this upstream served, for the UI).
     total_queries: u64,
     total_failures: u64,
+    /// Latency of the most recent live query (not probes), for the UI.
     last_rtt_ms: Option<f64>,
     last_error: Option<String>,
-    /// When this upstream is next due for a background probe. Rescheduled by
-    /// every probe *and* every live query: a healthy sample pushes it out a full
-    /// window, a failure pushes it out by an exponentially-backed-off (and
-    /// jittered) retry delay. `None` means "due now" — never sampled yet. This is
-    /// the whole self-tuning cadence: busy upstreams keep deferring their probe
-    /// via live traffic, idle ones get kept warm, dead ones back off.
+    /// When this upstream is next due for a background probe. Rescheduled by each
+    /// probe: a healthy probe pushes it out a full window, a failed one by an
+    /// exponentially-backed-off (and jittered) retry delay. `None` means "due
+    /// now" — never probed yet. Live traffic no longer touches this; probing is
+    /// independent so the routing latency stays fresh even for a busy upstream.
     next_probe_at: Option<Instant>,
 }
 
 impl Default for Health {
     fn default() -> Self {
         Self {
-            live_ewma_ms: 0.0,
-            live_samples: 0,
-            live_at: None,
             probe_ewma_ms: 0.0,
             probe_samples: 0,
             probe_at: None,
@@ -198,22 +157,20 @@ impl Default for Health {
 }
 
 impl Health {
-    /// The latency estimate to rank by: the EWMA of whichever source sampled
-    /// most recently. A busy upstream's live samples dominate; an idle backup
-    /// falls back to its background probe; a former leader gone idle switches to
-    /// the probe once that's the fresher signal. `None` until either source has
-    /// a sample (a never-touched upstream has no latency knowledge at all).
-    fn estimate_ms(&self) -> Option<f64> {
-        match (self.live_at, self.probe_at) {
-            (Some(l), Some(p)) => Some(if l >= p {
-                self.live_ewma_ms
-            } else {
-                self.probe_ewma_ms
-            }),
-            (Some(_), None) => Some(self.live_ewma_ms),
-            (None, Some(_)) => Some(self.probe_ewma_ms),
-            (None, None) => None,
-        }
+    /// The latency to rank by for selection: the smoothed background-probe RTT.
+    /// `None` until the first probe lands (an unprobed upstream sorts after
+    /// proven ones — see [`Upstream::sort_key`]).
+    ///
+    /// Live query latency is deliberately *not* used here. It mixes in recursion
+    /// time (so it's on a different, higher scale than the cache-hot `NS .`
+    /// probe) and is only sampled on whichever upstream happened to get traffic.
+    /// Ranking on it meant the act of answering a query bumped an upstream onto
+    /// the slower live scale and demoted it below idle peers still showing their
+    /// cheap probe figure — so the fastest upstream kept handing off leadership
+    /// the moment it was used. Probe RTT is the one signal measured identically
+    /// for every upstream, busy or idle, so selection is stable and comparable.
+    fn routing_latency_ms(&self) -> Option<f64> {
+        (self.probe_samples > 0).then_some(self.probe_ewma_ms)
     }
 }
 
@@ -226,82 +183,73 @@ pub struct Upstream {
 }
 
 impl Upstream {
-    fn record_success(&self, rtt: Duration, alpha: f64, source: Source) {
+    /// Record a successful *live* query. Updates the real-traffic counters and
+    /// liveness, but deliberately does NOT touch the routing latency (that's the
+    /// probe's job) or the probe cadence (probing runs independently so a busy
+    /// upstream's estimate doesn't go stale).
+    fn record_live_success(&self, rtt: Duration) {
         let mut h = self.health.lock();
-        let ms = rtt.as_secs_f64() * 1000.0;
-        let now = Instant::now();
-        // Fold the sample into the matching EWMA only, so live and probe
-        // latencies stay independent.
-        match source {
-            Source::Live => {
-                h.live_ewma_ms = ewma(h.live_samples, h.live_ewma_ms, ms, alpha);
-                h.live_samples += 1;
-                h.live_at = Some(now);
-            }
-            Source::Probe => {
-                h.probe_ewma_ms = ewma(h.probe_samples, h.probe_ewma_ms, ms, alpha);
-                h.probe_samples += 1;
-                h.probe_at = Some(now);
-            }
-        }
         h.total_queries += 1;
-        h.last_rtt_ms = Some(ms);
+        h.last_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
         h.consecutive_failures = 0;
         h.up = true;
         h.last_error = None;
-        // Healthy: defer the next probe a full window (jittered to de-sync).
-        h.next_probe_at = Some(now + jitter(HEALTHY_PROBE_WINDOW));
     }
 
-    fn record_failure(&self, err: &UpstreamError, threshold: u32) {
+    /// Record a successful background probe: fold its RTT into the routing EWMA,
+    /// confirm liveness, and schedule the next probe a full window out.
+    fn record_probe_success(&self, rtt: Duration, alpha: f64) {
+        let mut h = self.health.lock();
+        let ms = rtt.as_secs_f64() * 1000.0;
+        h.probe_ewma_ms = ewma(h.probe_samples, h.probe_ewma_ms, ms, alpha);
+        h.probe_samples += 1;
+        h.probe_at = Some(Instant::now());
+        h.consecutive_failures = 0;
+        h.up = true;
+        h.last_error = None;
+        h.next_probe_at = Some(Instant::now() + jitter(HEALTHY_PROBE_WINDOW));
+    }
+
+    /// Record a failed *live* query: count it against real-traffic totals and
+    /// health, mark down past the threshold, and bring the recovery probe forward.
+    fn record_live_failure(&self, err: &UpstreamError, threshold: u32) {
         let mut h = self.health.lock();
         h.total_queries += 1;
         h.total_failures += 1;
+        self.fold_failure(&mut h, err, threshold);
+    }
+
+    /// Record a failed background probe: it drives health and the recovery
+    /// schedule but is not real traffic, so it doesn't touch the query counters.
+    fn record_probe_failure(&self, err: &UpstreamError, threshold: u32) {
+        let mut h = self.health.lock();
+        self.fold_failure(&mut h, err, threshold);
+    }
+
+    /// Shared failure bookkeeping: bump consecutive failures, mark down past the
+    /// threshold, and retry with exponential backoff + jitter so a dead upstream
+    /// is probed often at first, then ever less aggressively.
+    fn fold_failure(&self, h: &mut Health, err: &UpstreamError, threshold: u32) {
         h.consecutive_failures += 1;
         h.last_error = Some(err.to_string());
         if h.consecutive_failures >= threshold {
             h.up = false;
         }
-        // Failing: retry with exponential backoff + jitter so a dead upstream is
-        // probed often at first, then ever less aggressively.
         h.next_probe_at = Some(Instant::now() + jitter(retry_backoff(h.consecutive_failures)));
     }
 
-    /// Record an attempt that didn't usefully answer but doesn't indict the
+    /// Record a live attempt that didn't usefully answer but doesn't indict the
     /// upstream's health — a SERVFAIL/FORMERR that's plausibly the *query's*
     /// fault (a DNSSEC-bogus or malformed name), not the resolver's. It shows up
     /// in the totals so the UI reflects the miss, but it leaves `up`,
-    /// `consecutive_failures`, the latency EWMA, and the probe schedule alone:
+    /// `consecutive_failures`, the routing latency, and the probe schedule alone:
     /// otherwise one repeatedly-queried bogus domain could mark every upstream
-    /// down, and a fast SERVFAIL could capture the latency lead.
+    /// down.
     fn record_soft_failure(&self, err: &UpstreamError) {
         let mut h = self.health.lock();
         h.total_queries += 1;
         h.total_failures += 1;
         h.last_error = Some(err.to_string());
-    }
-
-    /// This upstream's smoothed latency, but only if it's currently a viable
-    /// pick — healthy and actually sampled. `None` for a down or never-sampled
-    /// upstream (which shouldn't count toward "the fastest peer").
-    fn healthy_ewma(&self) -> Option<f64> {
-        let h = self.health.lock();
-        h.up.then(|| h.estimate_ms()).flatten()
-    }
-
-    /// After a probe, stretch this upstream's next-probe deadline if it's clearly
-    /// outclassed by a faster peer — a perennial loser needn't be polled as often
-    /// (see [`idle_probe_window`]). Only adjusts a healthy upstream; a down one
-    /// keeps the failure backoff that `record_failure` just set.
-    fn defer_if_outclassed(&self, peers: &[Arc<Upstream>]) {
-        let Some(mine) = self.healthy_ewma() else {
-            return;
-        };
-        // Fastest healthy peer (starting from `mine`, so an upstream that is the
-        // best — or the only one up — compares against itself and stays at base).
-        let best = peers.iter().filter_map(|u| u.healthy_ewma()).fold(mine, f64::min);
-        let window = idle_probe_window(Some(mine), Some(best));
-        self.health.lock().next_probe_at = Some(Instant::now() + jitter(window));
     }
 
     /// Give a not-yet-scheduled upstream its first probe at a random point within
@@ -338,7 +286,7 @@ impl Upstream {
     fn sort_key(&self) -> (bool, bool, u64) {
         let h = self.health.lock();
         let down = !h.up;
-        let est = h.estimate_ms();
+        let est = h.routing_latency_ms();
         let unsampled = est.is_none();
         let lat = est.unwrap_or(0.0).round() as u64;
         (down, unsampled, lat)
@@ -352,7 +300,7 @@ impl Upstream {
             name: self.name.clone(),
             kind: self.spec.kind,
             up: h.up,
-            avg_rtt_ms: h.estimate_ms(),
+            avg_rtt_ms: h.routing_latency_ms(),
             last_rtt_ms: h.last_rtt_ms,
             total_queries: h.total_queries,
             total_failures: h.total_failures,
@@ -506,7 +454,6 @@ impl UpstreamPool {
                 drop(map);
                 let ordered = self.ordered();
                 let timeout = self.settings.query_timeout;
-                let alpha = self.settings.ewma_alpha;
                 let threshold = self.settings.failure_threshold;
                 // Forward only the EDNS we honour/key on: strip client options
                 // (ECS, COOKIE, NSID, …) so a query differing only in such an
@@ -515,7 +462,7 @@ impl UpstreamPool {
                 let mut q = query.clone();
                 normalize_upstream_edns(&mut q);
                 let fut: ResolveFuture =
-                    async move { resolve_sequential(ordered, q, timeout, alpha, threshold).await }
+                    async move { resolve_sequential(ordered, q, timeout, threshold).await }
                         .boxed()
                         .shared();
                 let mut map = self.inflight.lock();
@@ -555,12 +502,10 @@ impl UpstreamPool {
 
     /// Spawn one self-scheduling probe task per upstream and keep their handles.
     ///
-    /// This is what makes the probe cadence *self-tuning and per-upstream* —
-    /// there is no fixed interval and no global sweep. Each task owns its
-    /// upstream's deadline independently: sleep until due, probe, reschedule. So
-    /// a slow probe to one upstream never delays another, a busy upstream keeps
-    /// deferring its probe via live traffic (and is effectively never probed),
-    /// an idle one is kept warm a window at a time, and a down one backs off
+    /// Each task owns its upstream's deadline independently: sleep until due,
+    /// probe, reschedule. So a slow probe to one upstream never delays another;
+    /// a healthy upstream re-probes every window (the probe RTT is the routing
+    /// signal, kept fresh regardless of live traffic), and a down one backs off
     /// exponentially (see [`retry_backoff`]). Deadlines are jittered to avoid a
     /// stampede.
     ///
@@ -571,12 +516,9 @@ impl UpstreamPool {
             // upstream whose schedule was carried over by `adopt_health_from`).
             up.schedule_initial_probe();
             let up = up.clone();
-            // Each task can see all upstreams so it can rank itself against the
-            // fastest and back off if it's clearly outclassed.
-            let peers = self.upstreams.clone();
             let settings = self.settings.clone();
             self.probe_tasks
-                .push(tokio::spawn(probe_loop(up, peers, settings)));
+                .push(tokio::spawn(probe_loop(up, settings)));
         }
     }
 
@@ -607,18 +549,16 @@ impl UpstreamPool {
 }
 
 /// A single upstream's probe loop: wait until it's due, probe it, repeat. Reads
-/// the deadline fresh each pass, so a live query that refreshes health while we
-/// sleep simply pushes the next probe out instead of us probing needlessly.
-/// After a probe, a healthy-but-outclassed upstream stretches its own interval.
-async fn probe_loop(up: Arc<Upstream>, peers: Vec<Arc<Upstream>>, settings: PoolSettings) {
+/// the deadline fresh each pass; the probe RTT is the routing signal, so every
+/// healthy upstream is probed on the same cadence (a probe reschedules itself a
+/// window out; a failure backs off — see [`Upstream::record_probe_success`] /
+/// [`Upstream::record_probe_failure`]).
+async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings) {
     let query = probe_query();
     loop {
         match up.probe_due_in(Instant::now()) {
             Some(remaining) => tokio::time::sleep(remaining).await,
-            None => {
-                probe_once(&up, &query, &settings).await;
-                up.defer_if_outclassed(&peers);
-            }
+            None => probe_once(&up, &query, &settings).await,
         }
     }
 }
@@ -631,11 +571,11 @@ async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings) {
         // an arbitrary live query, *any* non-answer to it (SERVFAIL as much as
         // REFUSED) genuinely indicts the resolver — treat it as a failed probe.
         Ok(Ok(resp)) => match classify(&resp) {
-            Verdict::Answer => up.record_success(start.elapsed(), settings.ewma_alpha, Source::Probe),
-            _ => up.record_failure(&rcode_err(&resp), settings.failure_threshold),
+            Verdict::Answer => up.record_probe_success(start.elapsed(), settings.ewma_alpha),
+            _ => up.record_probe_failure(&rcode_err(&resp), settings.failure_threshold),
         },
-        Ok(Err(e)) => up.record_failure(&e, settings.failure_threshold),
-        Err(_) => up.record_failure(&UpstreamError::Timeout, settings.failure_threshold),
+        Ok(Err(e)) => up.record_probe_failure(&e, settings.failure_threshold),
+        Err(_) => up.record_probe_failure(&UpstreamError::Timeout, settings.failure_threshold),
     }
 }
 
@@ -678,7 +618,6 @@ async fn resolve_sequential(
     ordered: Vec<Arc<Upstream>>,
     query: Message,
     timeout: Duration,
-    alpha: f64,
     threshold: u32,
 ) -> SharedResult<Resolved> {
     let mut last = UpstreamError::NoUpstreams;
@@ -696,22 +635,21 @@ async fn resolve_sequential(
                 let rtt_ms = rtt.as_secs_f64() * 1000.0;
                 match classify(&resp) {
                     Verdict::Answer => {
-                        up.record_success(rtt, alpha, Source::Live);
+                        up.record_live_success(rtt);
                         return Ok(Resolved {
                             message: resp,
                             upstream: up.name.clone(),
                             rtt_ms,
                         });
                     }
-                    // A rejection/soft-failure must not become the latency
-                    // leader, so neither path calls `record_success`. Reject
-                    // counts against health; SoftFail is logged but health-
-                    // neutral (see `record_soft_failure`). Either way we keep the
-                    // response and try the next upstream.
+                    // A rejection/soft-failure must not be treated as a clean
+                    // answer. Reject counts against health; SoftFail is logged but
+                    // health-neutral (see `record_soft_failure`). Either way we
+                    // keep the response and try the next upstream.
                     verdict => {
                         let err = rcode_err(&resp);
                         match verdict {
-                            Verdict::Reject => up.record_failure(&err, threshold),
+                            Verdict::Reject => up.record_live_failure(&err, threshold),
                             _ => up.record_soft_failure(&err),
                         }
                         // Keep the first (most-preferred) non-answer as fallback.
@@ -727,11 +665,11 @@ async fn resolve_sequential(
                 }
             }
             Ok(Err(e)) => {
-                up.record_failure(&e, threshold);
+                up.record_live_failure(&e, threshold);
                 last = e;
             }
             Err(_) => {
-                up.record_failure(&UpstreamError::Timeout, threshold);
+                up.record_live_failure(&UpstreamError::Timeout, threshold);
                 last = UpstreamError::Timeout;
             }
         }
@@ -836,59 +774,21 @@ mod backoff_tests {
     }
 
     #[test]
-    fn estimate_uses_the_freshest_source() {
-        let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(10);
-
-        // Both sampled, live more recently (a busy leader) → rank by live.
+    fn routing_latency_is_probe_only() {
+        // Ranking uses the probe EWMA and ignores live traffic entirely, so an
+        // upstream that just served a slow live query is NOT demoted below an idle
+        // peer's cheap probe figure (the serve-to-demote oscillation we fixed).
         let h = Health {
-            live_ewma_ms: 10.0,
-            live_samples: 1,
-            live_at: Some(t1),
-            probe_ewma_ms: 99.0,
+            probe_ewma_ms: 19.0,
             probe_samples: 1,
-            probe_at: Some(t0),
+            probe_at: Some(Instant::now()),
+            // A live success records last_rtt_ms but must not affect routing.
+            last_rtt_ms: Some(120.0),
             ..Health::default()
         };
-        assert_eq!(h.estimate_ms(), Some(10.0));
+        assert_eq!(h.routing_latency_ms(), Some(19.0));
 
-        // Probe sampled more recently (a former leader gone idle) → rank by probe,
-        // not the now-stale live figure.
-        let h = Health {
-            live_ewma_ms: 10.0,
-            live_samples: 1,
-            live_at: Some(t0),
-            probe_ewma_ms: 99.0,
-            probe_samples: 1,
-            probe_at: Some(t1),
-            ..Health::default()
-        };
-        assert_eq!(h.estimate_ms(), Some(99.0));
-
-        // Only one source sampled, and never-sampled.
-        let h = Health {
-            probe_ewma_ms: 42.0,
-            probe_samples: 1,
-            probe_at: Some(t0),
-            ..Health::default()
-        };
-        assert_eq!(h.estimate_ms(), Some(42.0));
-        assert_eq!(Health::default().estimate_ms(), None);
-    }
-
-    #[test]
-    fn idle_window_stretches_for_perennial_losers() {
-        let base = HEALTHY_PROBE_WINDOW;
-        // The leader (or anyone within 1.5×) keeps the base cadence.
-        assert_eq!(idle_probe_window(Some(20.0), Some(20.0)), base);
-        assert_eq!(idle_probe_window(Some(28.0), Some(20.0)), base); // 1.4×
-        // The further behind, the longer the interval...
-        assert_eq!(idle_probe_window(Some(50.0), Some(20.0)), base * 2); // 2.5×
-        assert_eq!(idle_probe_window(Some(100.0), Some(20.0)), base * 4); // 5×
-        assert_eq!(idle_probe_window(Some(400.0), Some(20.0)), base * 8); // 20×
-        // A just-came-up upstream with no estimate yet is probed at base cadence.
-        assert_eq!(idle_probe_window(None, Some(20.0)), base);
-        // A near-zero leader can't blow the ratio up to infinity.
-        assert_eq!(idle_probe_window(Some(5.0), Some(0.0)), base * 4);
+        // No probe yet → no routing latency (sorts after proven upstreams).
+        assert_eq!(Health::default().routing_latency_ms(), None);
     }
 }

@@ -264,7 +264,9 @@ async fn known_leader_preferred_over_freshly_added_unknown() {
     let old = UpstreamPool::build(&[entry(known.addr)], settings())
         .await
         .unwrap();
-    old.resolve(&make_query("warm.test.")).await.unwrap();
+    // Routing latency is the probe RTT, so a probe (not a live query) is what
+    // makes the known upstream count as "sampled".
+    old.probe_all().await;
     let known_after_warmup = known.received.load(Ordering::SeqCst);
 
     // Reload: a new upstream is listed FIRST, the known one second. The new pool
@@ -398,10 +400,11 @@ async fn reload_matches_upstreams_by_endpoint_not_spelling() {
 }
 
 #[tokio::test]
-async fn live_query_defers_the_probe() {
-    // A live query refreshes the same health a probe would, so an upstream that
-    // just answered a real query has its probe deferred — this is what lets a
-    // busy upstream stop being probed entirely.
+async fn probing_runs_regardless_of_live_traffic() {
+    // The probe RTT is the routing signal, so a healthy upstream is probed on
+    // cadence even right after serving live traffic. (The old "a live query
+    // defers the probe" behavior is gone: it would let a busy upstream's routing
+    // estimate go stale, since live latency no longer feeds selection.)
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(7, 7, 7, 7), 0)).await;
     let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -411,12 +414,12 @@ async fn live_query_defers_the_probe() {
     let after_query = mock.received.load(Ordering::SeqCst);
 
     pool.start_probing();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        mock.received.load(Ordering::SeqCst),
-        after_query,
-        "a freshly-used upstream must not be probed"
-    );
+    // A probe must fire despite the recent live query (wait_for panics on timeout).
+    wait_for(
+        || mock.received.load(Ordering::SeqCst) > after_query,
+        Duration::from_secs(4),
+    )
+    .await;
 }
 
 #[tokio::test]

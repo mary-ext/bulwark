@@ -83,7 +83,7 @@
     {#snippet head()}
       <tr>
         <th></th><th>Name</th><th>Type</th>
-        <th class="num">avg</th>
+        <th class="num" title="background probe RTT — the latency selection ranks by">probe</th>
         <th class="num">queries</th><th class="num">fails</th><th></th>
       </tr>
     {/snippet}
@@ -122,7 +122,7 @@
         </div>
         {#if s.last_error}<div class="up-error" title={s.last_error}>{s.last_error}</div>{/if}
         <div class="up-metrics muted">
-          <span>avg {duration(s.avg_rtt_ms)}</span>
+          <span title="background probe RTT — the latency selection ranks by">probe {duration(s.avg_rtt_ms)}</span>
           <span>{num(s.total_queries)} q</span>
           <span class:bad={s.total_failures > 0}>{num(s.total_failures)} fail</span>
         </div>
