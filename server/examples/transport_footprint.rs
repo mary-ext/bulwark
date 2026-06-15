@@ -36,6 +36,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
+
+// Match production's allocator (server/src/main.rs) so RSS reclaim is
+// representative: glibc keeps a freed 64 KiB buffer on its arena free-list, but
+// jemalloc with the background purge thread returns it to the OS on decay — which
+// is what an idle-close actually buys an SBC.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
 use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -69,6 +76,14 @@ fn kib(bytes: u64) -> String {
 }
 
 /// Print an RSS checkpoint with the delta from the previous sample.
+///
+/// RSS is allocator-gated: a freed 64 KiB buffer is below jemalloc's purge
+/// granularity and gets reused/retained, so an idle-close won't always show as
+/// an immediate RSS drop here — what RSS *does* show cleanly is that, before
+/// idle-close, a persistent transport's footprint stays resident across idle
+/// forever. That the reader actually closes the socket on idle (freeing the
+/// buffer + task) is asserted deterministically by the unit test
+/// `udp_socket_idle_closes_then_redials` in the upstream crate.
 fn mark(label: &str, prev: &mut u64) {
     let now = rss_bytes();
     let delta = now as i64 - *prev as i64;
@@ -218,6 +233,12 @@ async fn main() {
     let burst = env_usize("FOOT_BURST", 50);
     let idle_secs = env_usize("FOOT_IDLE_SECS", 5) as u64;
     let delay = Duration::from_micros(env_usize("FOOT_DELAY_US", 0) as u64);
+
+    // Turn on jemalloc's background purge thread (off by default) so freed pages
+    // are returned to the OS on decay, the same as the real server does.
+    if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
+        eprintln!("  (could not enable jemalloc background_thread: {e})");
+    }
 
     println!("== transport footprint probe ==");
     println!("  transport={transport}  burst={burst}  idle={idle_secs}s  upstream_delay={delay:?}\n");
