@@ -12,14 +12,14 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use hickory_proto::op::Message;
 use quinn::crypto::rustls::QuicClientConfig;
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, TransportConfig};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
 use crate::spec::UpstreamSpec;
 use crate::tlsconf::doq_config;
-use crate::transport::{decode, encode, matches_query, Transport};
+use crate::transport::{decode, encode, matches_query, Transport, UPSTREAM_IDLE_TIMEOUT};
 
 pub struct DoqTransport {
     spec: UpstreamSpec,
@@ -50,7 +50,21 @@ impl DoqTransport {
                 let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(quic)?;
                 let crypto = QuicClientConfig::try_from((*doq_config()).clone())
                     .map_err(|e| UpstreamError::Tls(e.to_string()))?;
-                endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+                let mut client_config = ClientConfig::new(Arc::new(crypto));
+                // Close the connection after the shared idle window so a quiet box
+                // doesn't keep the QUIC session resident. We leave keep_alive_interval
+                // at its default (None), so we never ping the connection alive — an
+                // idle connection genuinely idles out and closes, after which
+                // `connection()` re-dials on the next query. The handshake that costs
+                // is exactly what persistence is worth paying for on a burst after
+                // idle; holding it open around the clock is not.
+                let mut transport = TransportConfig::default();
+                transport.max_idle_timeout(Some(
+                    IdleTimeout::try_from(UPSTREAM_IDLE_TIMEOUT)
+                        .expect("idle timeout fits in a QUIC varint"),
+                ));
+                client_config.transport_config(Arc::new(transport));
+                endpoint.set_default_client_config(client_config);
                 Ok(endpoint)
             })
             .await

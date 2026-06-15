@@ -15,7 +15,10 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::error::{Result, UpstreamError};
-use crate::transport::{decode, encode, matches_query, Pending, PendingGuard, PendingState, Transport};
+use crate::transport::{
+    decode, encode, matches_query, Pending, PendingGuard, PendingState, Transport,
+    UPSTREAM_IDLE_TIMEOUT,
+};
 
 fn io(e: std::io::Error) -> UpstreamError {
     UpstreamError::Io(e.to_string())
@@ -60,16 +63,6 @@ where
     Ok(())
 }
 
-/// How long a connected UDP socket may sit idle — no datagram received and no
-/// query in flight — before its reader task exits, freeing the 64 KiB receive
-/// buffer and the task itself; the next query re-dials. Sized well above any
-/// inter-query gap a browsing session produces (so an active resolver keeps its
-/// warm socket and pays no per-query bind), but short enough that a quiet
-/// home/SBC box stops holding the buffer at rest. Re-dialing is a local
-/// bind+connect with no round-trip — UDP has no handshake — so the close/redial
-/// cycle costs no measurable latency even when a burst follows an idle gap.
-const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// One persistent connected UDP socket, multiplexed: many queries can be in
 /// flight at once, each tagged with a distinct socket-local id, and a background
 /// reader demultiplexes datagrams back to the waiting callers by that id. This
@@ -77,7 +70,7 @@ const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// single query (the old behaviour), which was syscall- and allocation-heavy on
 /// the cache-miss path for plain-UDP upstreams.
 ///
-/// The socket is not held forever: after [`UDP_IDLE_TIMEOUT`] with no traffic the
+/// The socket is not held forever: after [`UPSTREAM_IDLE_TIMEOUT`] with no traffic the
 /// reader self-closes (see [`udp_reader_loop`]), so an idle box gives the buffer
 /// and task back rather than pinning them per upstream.
 struct UdpConn {
@@ -212,12 +205,12 @@ impl UdpTransport {
             desc: format!("udp://{addr}"),
             addr,
             conn: Mutex::new(None),
-            idle_timeout: UDP_IDLE_TIMEOUT,
+            idle_timeout: UPSTREAM_IDLE_TIMEOUT,
         }
     }
 
     /// Construct with a custom idle-close window (tests use a short one to drive
-    /// the close/redial cycle without waiting [`UDP_IDLE_TIMEOUT`]).
+    /// the close/redial cycle without waiting [`UPSTREAM_IDLE_TIMEOUT`]).
     #[cfg(test)]
     pub(crate) fn with_idle_timeout(addr: SocketAddr, idle_timeout: Duration) -> Self {
         Self {

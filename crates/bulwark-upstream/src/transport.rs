@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use hickory_proto::op::{Edns, Message};
@@ -10,6 +11,20 @@ use parking_lot::Mutex as SyncMutex;
 use tokio::sync::oneshot;
 
 use crate::error::{Result, UpstreamError};
+
+/// How long a persistent upstream connection may sit idle before it's torn down,
+/// shared across every connection-oriented transport (connected UDP, DoT, DoQ,
+/// DoH) so they reclaim idle resources on the same schedule.
+///
+/// A home/SBC deployment runs ~1 query/s with long idle gaps, so holding a
+/// socket + reader task + buffers (or a TLS/QUIC session) resident around the
+/// clock is the wrong trade. This window is comfortably longer than any
+/// inter-query gap a browsing burst produces — so an active resolver keeps its
+/// warm connection and pays no per-query reconnect — but short enough that a
+/// quiet box stops holding the connection at rest. UDP and DoT enforce it via a
+/// reader read-timeout, DoQ via QUIC `max_idle_timeout`, DoH via reqwest's
+/// connection-pool idle timeout.
+pub(crate) const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Waiters for in-flight queries on a pipelined connection, keyed by
 /// connection-local id, plus a `dead` flag. The flag and the map are guarded

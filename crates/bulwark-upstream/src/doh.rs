@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use crate::bootstrap::SharedBootstrap;
 use crate::error::{Result, UpstreamError};
 use crate::spec::UpstreamSpec;
-use crate::transport::{decode, encode, matches_query, Transport};
+use crate::transport::{decode, encode, matches_query, Transport, UPSTREAM_IDLE_TIMEOUT};
 
 const DNS_MESSAGE: &str = "application/dns-message";
 
@@ -125,7 +125,11 @@ impl DohTransport {
         let host = self.spec.host.to_string();
         let mut builder = reqwest::Client::builder()
             .https_only(true)
-            .pool_idle_timeout(Duration::from_secs(90))
+            // Drop pooled connections after the shared idle window so a quiet box
+            // doesn't keep a TLS/QUIC session resident. The h2 keep-alive below only
+            // pings while a request is in flight (we don't set keep_alive_while_idle),
+            // so an idle connection genuinely ages out of the pool here.
+            .pool_idle_timeout(UPSTREAM_IDLE_TIMEOUT)
             .user_agent("bulwark");
         if force_h3 {
             builder = builder.http3_prior_knowledge();

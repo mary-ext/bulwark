@@ -12,6 +12,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -30,7 +31,9 @@ use crate::error::{Result, UpstreamError};
 use crate::plain::{read_tcp_message, write_tcp_bytes};
 use crate::spec::UpstreamSpec;
 use crate::tlsconf::dot_config;
-use crate::transport::{encode, matches_query, Pending, PendingGuard, PendingState, Transport};
+use crate::transport::{
+    encode, matches_query, Pending, PendingGuard, PendingState, Transport, UPSTREAM_IDLE_TIMEOUT,
+};
 
 /// One pipelined connection: a serialized write half, the pending-waiter table,
 /// the id allocator, and the reader task draining the read half.
@@ -54,10 +57,10 @@ impl<S> Conn<S>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    fn new(stream: S) -> Arc<Self> {
+    fn new(stream: S, idle_timeout: Duration) -> Arc<Self> {
         let (read, write) = split(stream);
         let pending: Pending = Arc::new(SyncMutex::new(PendingState::default()));
-        let reader = tokio::spawn(reader_loop(read, pending.clone()));
+        let reader = tokio::spawn(reader_loop(read, pending.clone(), idle_timeout));
         Arc::new(Conn {
             write: Mutex::new(write),
             pending,
@@ -122,15 +125,28 @@ where
 /// On any read error the connection is dead: mark it so and drop every pending
 /// sender, which wakes all in-flight queries with a recv error so they fail over
 /// promptly instead of hanging until the pool timeout.
-async fn reader_loop<R: AsyncRead + Unpin>(mut read: R, pending: Pending) {
-    while let Ok(msg) = read_tcp_message(&mut read).await {
+///
+/// The read is bounded by `idle_timeout`: if no complete response arrives within
+/// it the connection has gone idle, so we close it, freeing the TLS read half +
+/// task rather than pinning them on a quiet box. Unlike connected UDP, a
+/// length-prefixed read is *not* cancel-safe — timing out mid-frame would
+/// desync the stream — so an idle timeout always tears the connection down
+/// (never resumes a partial read). That's safe here because a real DNS response
+/// completes in milliseconds, resetting the timer; only a genuinely idle (or
+/// stuck) connection ever reaches the timeout, and any waiter still parked on it
+/// has long since hit the much shorter pool query timeout and failed over.
+async fn reader_loop<R: AsyncRead + Unpin>(mut read: R, pending: Pending, idle_timeout: Duration) {
+    // Loop while a complete response keeps arriving within the idle window. A read
+    // error/EOF (`Ok(Err)`) or an idle timeout (`Err`) both fall out of the
+    // `while let` and tear the connection down below — for an idle timeout that
+    // means closing rather than resuming a partial (non-cancel-safe) framed read.
+    while let Ok(Ok(msg)) = tokio::time::timeout(idle_timeout, read_tcp_message(&mut read)).await {
         let waiter = pending.lock().map.remove(&msg.metadata.id);
         if let Some(tx) = waiter {
             let _ = tx.send(msg);
         }
         // An id with no waiter (already cancelled, or unsolicited) is dropped.
     }
-    // The read half hit EOF or an error: the connection is dead.
     let mut p = pending.lock();
     p.dead = true;
     p.map.clear();
@@ -142,6 +158,7 @@ pub struct DotTransport {
     connector: TlsConnector,
     server_name: ServerName<'static>,
     conn: Mutex<Option<Arc<Conn<TlsStream<TcpStream>>>>>,
+    idle_timeout: Duration,
     desc: String,
 }
 
@@ -156,6 +173,7 @@ impl DotTransport {
             spec,
             bootstrap,
             conn: Mutex::new(None),
+            idle_timeout: UPSTREAM_IDLE_TIMEOUT,
         })
     }
 
@@ -187,7 +205,7 @@ impl DotTransport {
                 return Ok(c.clone());
             }
         }
-        let conn = Conn::new(self.connect().await?);
+        let conn = Conn::new(self.connect().await?, self.idle_timeout);
         *guard = Some(conn.clone());
         Ok(conn)
     }
@@ -281,7 +299,7 @@ mod tests {
         // the connection-local id.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve(server, 2, true));
-        let conn = Conn::new(client);
+        let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
 
         let qa = query(0x1111, "a.test.");
         let qb = query(0x2222, "b.test.");
@@ -303,7 +321,7 @@ mod tests {
         // having the server withhold the first response until the second is sent.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve(server, 2, true));
-        let conn = Conn::new(client);
+        let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
 
         // Fire both; if the connection serialized, this would deadlock against the
         // server waiting for the 2nd query before answering. It completing proves
@@ -329,13 +347,30 @@ mod tests {
             let _ = read_tcp_message(&mut server).await;
             drop(server); // close without responding
         });
-        let conn = Conn::new(client);
+        let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
 
         let err = tokio::time::timeout(Duration::from_secs(2), conn.exchange(&query(7, "x.test.")))
             .await
             .expect("must not hang on a dropped connection");
         assert!(err.is_err(), "a closed connection must wake the waiter with an error");
         assert!(conn.is_dead(), "the connection should be marked dead");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_closes() {
+        // With nothing to read, the reader must self-close after the idle window
+        // (freeing the TLS read half + task) and mark the connection dead so the
+        // next query re-dials. The server keeps the pipe open but sends nothing.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let _keepalive = server; // hold the far end open; just never write to it.
+        let conn = Conn::new(client, Duration::from_millis(150));
+
+        assert!(!conn.is_dead(), "a fresh connection is live");
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            conn.is_dead(),
+            "an idle connection must self-close after the idle window"
+        );
     }
 
     #[tokio::test]
@@ -351,7 +386,7 @@ mod tests {
             resp.metadata.id = q.metadata.id;
             write_tcp_message(&mut server, &resp).await.unwrap();
         });
-        let conn = Conn::new(client);
+        let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
 
         let r = conn.exchange(&query(5, "good.test.")).await;
         assert!(matches!(r, Err(UpstreamError::Proto(_))));
