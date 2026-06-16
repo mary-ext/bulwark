@@ -10,6 +10,7 @@
     color = "var(--accent)",
     height = 44,
     area = true,
+    smooth = true,
     ariaLabel,
   }: {
     values: number[];
@@ -18,6 +19,8 @@
     color?: string;
     height?: number;
     area?: boolean;
+    /** Curve interpolation + density-adaptive denoising. Off = raw polyline. */
+    smooth?: boolean;
     ariaLabel?: string;
   } = $props();
 
@@ -32,6 +35,30 @@
   const max = $derived(Math.max(1, ...values));
   const xAt = (i: number) => (n <= 1 ? w / 2 : (i / (n - 1)) * w);
   const yAt = (v: number) => height - pad - (v / max) * (height - 2 * pad);
+  const r = (x: number) => Math.round(x * 10) / 10;
+
+  // Dynamic denoising: once points get denser than the canvas can resolve
+  // (target ~1 point / 3px), centred-average them so the trend stays legible.
+  // Short retention (e.g. 24 hourly buckets in ~150px) is left untouched.
+  const win = $derived(
+    smooth && n >= 8 && w > 0 ? Math.max(1, Math.round((n / w) * 3)) : 1,
+  );
+  const plotted = $derived(win > 1 ? movingAvg(values, win) : values);
+
+  function movingAvg(a: number[], window: number): number[] {
+    const half = Math.floor(window / 2);
+    return a.map((_, i) => {
+      let sum = 0,
+        cnt = 0;
+      for (let j = i - half; j <= i + half; j++) {
+        if (j >= 0 && j < a.length) {
+          sum += a[j];
+          cnt++;
+        }
+      }
+      return sum / cnt;
+    });
+  }
 
   // A single bucket (e.g. a fresh instance with only the current hour) has no
   // span to plot across, so draw it as a flat line spanning the full width
@@ -39,16 +66,63 @@
   const pts = $derived(
     n === 1
       ? [
-          [0, yAt(values[0])],
-          [w, yAt(values[0])],
+          [0, yAt(plotted[0])],
+          [w, yAt(plotted[0])],
         ]
-      : values.map((v, i) => [xAt(i), yAt(v)]),
+      : plotted.map((v, i) => [r(xAt(i)), r(yAt(v))]),
   );
 
-  const linePts = $derived(pts.map(([x, y]) => `${x},${y}`).join(" "));
+  // Monotone cubic interpolation (Fritsch–Carlson): a smooth line that passes
+  // through every point without overshooting into invented dips/peaks — unlike
+  // a plain Bézier/Catmull-Rom, which would dip below zero between buckets.
+  function curve(p: number[][]): string {
+    const N = p.length;
+    if (N < 2) return "";
+    if (!smooth) return p.map(([x, y]) => `L${x},${y}`).join(" ");
+    const dx: number[] = [],
+      m: number[] = [];
+    for (let i = 0; i < N - 1; i++) {
+      dx[i] = p[i + 1][0] - p[i][0];
+      m[i] = dx[i] === 0 ? 0 : (p[i + 1][1] - p[i][1]) / dx[i];
+    }
+    const t = new Array(N);
+    t[0] = m[0];
+    t[N - 1] = m[N - 2];
+    for (let i = 1; i < N - 1; i++) t[i] = m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2;
+    for (let i = 0; i < N - 1; i++) {
+      if (m[i] === 0) {
+        t[i] = 0;
+        t[i + 1] = 0;
+        continue;
+      }
+      const a = t[i] / m[i],
+        b = t[i + 1] / m[i],
+        s = a * a + b * b;
+      if (s > 9) {
+        const tau = 3 / Math.sqrt(s);
+        t[i] = tau * a * m[i];
+        t[i + 1] = tau * b * m[i];
+      }
+    }
+    let d = "";
+    for (let i = 0; i < N - 1; i++) {
+      const c1x = r(p[i][0] + dx[i] / 3),
+        c1y = r(p[i][1] + (t[i] * dx[i]) / 3),
+        c2x = r(p[i + 1][0] - dx[i] / 3),
+        c2y = r(p[i + 1][1] - (t[i + 1] * dx[i]) / 3);
+      d += `C${c1x},${c1y} ${c2x},${c2y} ${p[i + 1][0]},${p[i + 1][1]} `;
+    }
+    return d.trim();
+  }
+
+  // Solve the curve once; line and area share the same interpolated middle.
+  const mid = $derived(pts.length ? `M${pts[0][0]},${pts[0][1]} ${curve(pts)}` : "");
+  const linePath = $derived(mid);
   const areaPath = $derived(
-    `M0,${height} ` + pts.map(([x, y]) => `L${x},${y}`).join(" ") + ` L${w},${height} Z`,
+    pts.length ? `M0,${height} L${mid.slice(1)} L${w},${height} Z` : "",
   );
+
+  const hoverX = $derived(hover === null ? 0 : xAt(hover));
 
   function onmove(e: PointerEvent) {
     if (n === 0 || w === 0) return;
@@ -77,8 +151,8 @@
       {#if area}
         <path d={areaPath} fill="url(#{gid})" />
       {/if}
-      <polyline
-        points={linePts}
+      <path
+        d={linePath}
         fill="none"
         stroke={color}
         stroke-width="1.5"
@@ -87,22 +161,22 @@
       />
       {#if hover !== null}
         <line
-          x1={xAt(hover)}
+          x1={hoverX}
           y1={pad}
-          x2={xAt(hover)}
+          x2={hoverX}
           y2={height}
           stroke={color}
           stroke-width="1"
           stroke-opacity="0.35"
         />
-        <circle cx={xAt(hover)} cy={yAt(values[hover])} r="2.75" fill={color} />
+        <circle cx={hoverX} cy={yAt(plotted[hover])} r="2.75" fill={color} />
       {/if}
     </svg>
     {#if hover !== null}
       <div
         class="spark-tip"
-        style="left:{Math.max(0, Math.min(w - 1, xAt(hover)))}px"
-        class:flip={xAt(hover) > w / 2}
+        style="left:{Math.max(0, Math.min(w - 1, hoverX))}px"
+        class:flip={hoverX > w / 2}
       >
         <span class="v">{values[hover].toLocaleString()}</span>
         {#if labels[hover]}<span class="t">{labels[hover]}</span>{/if}
