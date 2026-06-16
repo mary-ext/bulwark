@@ -65,16 +65,15 @@
 
   // Hourly trend, oldest → newest, for the stat-card sparklines.
   const series = $derived([...(stats?.series ?? [])].sort((a, b) => a.hour - b.hour));
-  const sparkLabels = $derived(
-    series.map((p) =>
-      new Date(p.hour * 3_600_000).toLocaleString(undefined, {
-        weekday: "short",
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      }),
-    ),
-  );
+  const fmtStamp = (hour: number) =>
+    new Date(hour * 3_600_000).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+  const sparkLabels = $derived(series.map((p) => fmtStamp(p.hour)));
   const totalTrend = $derived(series.map((p) => p.total));
   const blockedTrend = $derived(series.map((p) => p.blocked));
 </script>
