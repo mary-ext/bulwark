@@ -9,11 +9,11 @@ use std::time::Duration;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{middleware, Json, Router};
 use bulwark_config::{
     BlockingMode, CacheConfig, ClientConfig, Config, FilterListConfig, PrivacyConfig,
-    QueryLogConfig, ServerConfig, StatsConfig, UpstreamsConfig,
+    QueryLogConfig, ServerConfig, StatsConfig, UpstreamLogConfig, UpstreamsConfig,
 };
 use bulwark_filter::{ClientInfo, Verdict};
 use bulwark_upstream::{test_spec, UpstreamSpec};
@@ -87,6 +87,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/config/filtering", put(put_filtering))
         .route("/api/config/server", put(put_server))
         .route("/api/config/querylog", put(put_querylog))
+        .route("/api/config/upstreamlog", put(put_upstream_log))
         .route("/api/config/stats", put(put_stats_cfg))
         .route("/api/config/privacy", put(put_privacy))
         .route("/api/filters", get(get_filters))
@@ -104,6 +105,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stats", get(get_stats))
         .route("/api/stats/reset", post(reset_stats))
         .route("/api/querylog", get(get_querylog).delete(clear_querylog))
+        .route("/api/upstreamlog", delete(clear_upstream_log))
+        .route("/api/upstreamlog/export", get(export_upstream_log))
         .route("/api/upstreams", get(get_upstreams))
         .route("/api/upstreams/test", post(test_upstream))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
@@ -490,6 +493,25 @@ pub async fn put_querylog(
 ) -> ApiResult<Json<OkResponse>> {
     let (mut cfg, _update) = state.begin_update().await;
     cfg.query_log = body;
+    apply_config(&state, cfg)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(OkResponse::ok())
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/config/upstreamlog",
+    tag = "config",
+    request_body = UpstreamLogConfig,
+    responses((status = 200, body = OkResponse), (status = 400, body = ErrorResponse))
+)]
+pub async fn put_upstream_log(
+    State(state): State<AppState>,
+    Json(body): Json<UpstreamLogConfig>,
+) -> ApiResult<Json<OkResponse>> {
+    let (mut cfg, _update) = state.begin_update().await;
+    cfg.upstream_log = body;
     apply_config(&state, cfg)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -1152,6 +1174,41 @@ pub async fn get_querylog(
 pub async fn clear_querylog(State(state): State<AppState>) -> ApiResult<Json<OkResponse>> {
     state.store.clear().await.map_err(internal)?;
     Ok(OkResponse::ok())
+}
+
+#[utoipa::path(
+    delete,
+    path = "/api/upstreamlog",
+    tag = "upstreamlog",
+    responses((status = 200, body = OkResponse), (status = 401, body = ErrorResponse))
+)]
+pub async fn clear_upstream_log(State(state): State<AppState>) -> ApiResult<Json<OkResponse>> {
+    state.probe_store.clear().await.map_err(internal)?;
+    Ok(OkResponse::ok())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/upstreamlog/export",
+    tag = "upstreamlog",
+    responses(
+        (status = 200, description = "Probe telemetry as newline-delimited JSON", content_type = "application/x-ndjson"),
+        (status = 401, body = ErrorResponse)
+    )
+)]
+pub async fn export_upstream_log(State(state): State<AppState>) -> ApiResult<Response> {
+    let body = state.probe_store.export_jsonl().await.map_err(internal)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/x-ndjson"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"upstream-probes.jsonl\"",
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 #[utoipa::path(

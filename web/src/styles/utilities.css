@@ -107,6 +107,9 @@
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
+  /* Element-agnostic: when applied to an <a> (e.g. a download link), suppress
+     the global anchor underline, including on hover. */
+  text-decoration: none;
   transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
 }
 .btn:hover {

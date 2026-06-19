@@ -5,6 +5,7 @@
     Config,
     CacheConfig,
     QueryLogConfig,
+    UpstreamLogConfig,
     StatsConfig,
     ServerConfig,
     PrivacyConfig,
@@ -21,6 +22,7 @@
   let loaded = $state(false);
   let confirmClearLog = $state(false);
   let confirmResetStats = $state(false);
+  let confirmClearTelemetry = $state(false);
 
   let filtering = $state({
     enabled: true,
@@ -31,6 +33,7 @@
   });
   let cache = $state<Required<CacheConfig> | null>(null);
   let querylog = $state<Required<QueryLogConfig> | null>(null);
+  let upstreamlog = $state<Required<UpstreamLogConfig> | null>(null);
   let stats = $state<Required<StatsConfig> | null>(null);
   let server = $state<Required<ServerConfig> | null>(null);
   // Privacy lives in its own config section (it affects stats too), but its
@@ -55,6 +58,7 @@
     };
     cache = (c.cache ?? null) as Required<CacheConfig> | null;
     querylog = (c.query_log ?? null) as Required<QueryLogConfig> | null;
+    upstreamlog = (c.upstream_log ?? null) as Required<UpstreamLogConfig> | null;
     stats = (c.stats ?? null) as Required<StatsConfig> | null;
     server = (c.server ?? null) as Required<ServerConfig> | null;
     privacy = (c.privacy ?? { anonymize_client_ips: false }) as Required<PrivacyConfig>;
@@ -80,6 +84,10 @@
 
   function resetStats() {
     run(() => ok(api.resetStats()), "Statistics cleared");
+  }
+
+  function clearTelemetry() {
+    run(() => ok(api.clearUpstreamLog()), "Upstream telemetry cleared");
   }
 
   const blockingModes: { value: BlockingMode; label: string }[] = [
@@ -196,6 +204,47 @@
             </button>
             <button class="btn btn-danger" onclick={() => (confirmClearLog = true)}>
               Clear log
+            </button>
+          </div>
+        </div>
+      </section>
+    {/if}
+
+    <!-- Upstream telemetry -->
+    {#if upstreamlog}
+      <section class="card">
+        <div class="card-title">Upstream telemetry</div>
+        <div class="stack">
+          <p class="muted" style="margin:0;font-size:0.85rem">
+            Records each upstream's probe round-trip and health over time, for diagnosing
+            flaky or slow resolvers. Off by default.
+          </p>
+          <SwitchRow bind:checked={upstreamlog.enabled} label="Record probe telemetry" />
+          <SwitchRow
+            bind:checked={upstreamlog.persist}
+            label="Persist to disk"
+            hint="Disk vs in-memory is fixed at startup; this takes effect on the next restart."
+          />
+          <Field
+            label="Retention (days)"
+            htmlFor="u-retention"
+            hint="Probe events older than this are pruned. 0 keeps them indefinitely."
+          >
+            <input id="u-retention" type="number" min="0" bind:value={upstreamlog.retention_days} />
+          </Field>
+          <div class="btn-row">
+            <button
+              class="btn btn-primary"
+              onclick={() =>
+                upstreamlog && run(() => ok(api.putUpstreamLog(upstreamlog!)), "Upstream telemetry saved")}
+            >
+              Save
+            </button>
+            <a class="btn" href="/api/upstreamlog/export" download="upstream-probes.jsonl">
+              Export JSONL
+            </a>
+            <button class="btn btn-danger" onclick={() => (confirmClearTelemetry = true)}>
+              Clear telemetry
             </button>
           </div>
         </div>
@@ -319,6 +368,15 @@
   confirmLabel="Clear statistics"
   danger
   onConfirm={resetStats}
+/>
+
+<ConfirmDialog
+  bind:open={confirmClearTelemetry}
+  title="Clear upstream telemetry?"
+  message="This permanently deletes all recorded probe telemetry, including history persisted on disk. This cannot be undone."
+  confirmLabel="Clear telemetry"
+  danger
+  onConfirm={clearTelemetry}
 />
 
 <style>

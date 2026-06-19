@@ -118,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         sessions,
         store: store.clone(),
         probe_log: probe_log.clone(),
+        probe_store: probe_store.clone(),
         update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 

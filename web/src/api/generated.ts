@@ -117,6 +117,18 @@ export type StatsConfig = {
     the query-log retention). */
     retention_days?: number;
 };
+export type UpstreamLogConfig = {
+    /** Persist probe telemetry. Off by default; can be toggled at runtime. */
+    enabled?: boolean;
+    /** Persist to disk so it survives restarts. When off, an in-memory database
+    is used for the lifetime of the process (and no file is created). Fixed at
+    startup — changing it takes effect on the next restart. */
+    persist?: boolean;
+    /** How many days of probe telemetry to retain. Probes are low-volume (one
+    per upstream per minute), so a generous default is cheap. 0 disables
+    time-based pruning. */
+    retention_days?: number;
+};
 export type UpstreamsConfig = {
     /** Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames. */
     bootstrap?: string[];
@@ -137,6 +149,7 @@ export type Config = {
     query_log?: QueryLogConfig;
     server?: ServerConfig;
     stats?: StatsConfig;
+    upstream_log?: UpstreamLogConfig;
     upstreams?: UpstreamsConfig;
     version?: number;
 };
@@ -458,6 +471,19 @@ export function putStatsCfg(statsConfig: StatsConfig, opts?: Oazapfts.RequestOpt
         body: statsConfig
     }));
 }
+export function putUpstreamLog(upstreamLogConfig: UpstreamLogConfig, opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: OkResponse;
+    } | {
+        status: 400;
+        data: ErrorResponse;
+    }>("/api/config/upstreamlog", oazapfts.json({
+        ...opts,
+        method: "PUT",
+        body: upstreamLogConfig
+    }));
+}
 export function putUpstreams(upstreamsConfig: UpstreamsConfig, opts?: Oazapfts.RequestOpts) {
     return oazapfts.fetchJson<{
         status: 200;
@@ -676,6 +702,29 @@ export function status(opts?: Oazapfts.RequestOpts) {
         status: 200;
         data: StatusResponse;
     }>("/api/status", {
+        ...opts
+    });
+}
+export function clearUpstreamLog(opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: OkResponse;
+    } | {
+        status: 401;
+        data: ErrorResponse;
+    }>("/api/upstreamlog", {
+        ...opts,
+        method: "DELETE"
+    });
+}
+export function exportUpstreamLog(opts?: Oazapfts.RequestOpts) {
+    return oazapfts.fetchJson<{
+        status: 200;
+        data: Blob;
+    } | {
+        status: 401;
+        data: ErrorResponse;
+    }>("/api/upstreamlog/export", {
         ...opts
     });
 }

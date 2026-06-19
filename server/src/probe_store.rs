@@ -115,6 +115,32 @@ impl ProbeStore {
         Ok(())
     }
 
+    /// Remove all events.
+    pub async fn clear(&self) -> turso::Result<()> {
+        let conn = self.write.lock().await;
+        conn.execute("DELETE FROM probes", ()).await?;
+        Ok(())
+    }
+
+    /// Every event as newline-delimited JSON, oldest first — the natural log-file
+    /// order for an export/download. Probe telemetry is low-volume (≈ one row per
+    /// upstream per minute), so materializing the whole table as one string is
+    /// fine for the deployments this runs on.
+    pub async fn export_jsonl(&self) -> turso::Result<String> {
+        let sql = "SELECT time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
+             consecutive_failures, detail FROM probes ORDER BY id ASC";
+        let mut rows = self.read.query(sql, ()).await?;
+        let mut out = String::new();
+        while let Some(row) = rows.next().await? {
+            let event = row_to_event(&row)?;
+            if let Ok(line) = serde_json::to_string(&event) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
     /// Delete every event older than `cutoff_ms`. Returns the number removed.
     pub async fn delete_older_than(&self, cutoff_ms: i64) -> turso::Result<u64> {
         let conn = self.write.lock().await;

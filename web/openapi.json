@@ -450,6 +450,46 @@
         }
       }
     },
+    "/api/config/upstreamlog": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_upstream_log",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamLogConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/config/upstreams": {
       "put": {
         "tags": [
@@ -1117,6 +1157,62 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/upstreamlog": {
+      "delete": {
+        "tags": [
+          "upstreamlog"
+        ],
+        "operationId": "clear_upstream_log",
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/upstreamlog/export": {
+      "get": {
+        "tags": [
+          "upstreamlog"
+        ],
+        "operationId": "export_upstream_log",
+        "responses": {
+          "200": {
+            "description": "Probe telemetry as newline-delimited JSON",
+            "content": {
+              "application/x-ndjson": {}
+            }
+          },
+          "401": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2304,6 +2400,10 @@
     {
       "name": "querylog",
       "description": "Query log browsing"
+    },
+    {
+      "name": "upstreamlog",
+      "description": "Upstream probe telemetry export and reset"
     },
     {
       "name": "upstreams",

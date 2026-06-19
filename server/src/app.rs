@@ -66,6 +66,9 @@ pub struct AppState {
     /// reloads so the wiring survives a reload. Detached (a no-op) unless probe
     /// persistence was enabled at startup.
     pub probe_log: Arc<ProbeLog>,
+    /// Disk-backed probe-telemetry store, read by the API (export) and cleared by
+    /// the API; written by the background probe writer.
+    pub probe_store: Arc<crate::probe_store::ProbeStore>,
     /// Serializes config read-modify-write updates. Held across a handler's
     /// clone → mutate → [`apply_config`] sequence so concurrent edits can't lose
     /// each other's writes or allocate the same list id twice.
