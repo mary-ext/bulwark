@@ -1452,6 +1452,9 @@
           "stats": {
             "$ref": "#/components/schemas/StatsConfig"
           },
+          "upstream_log": {
+            "$ref": "#/components/schemas/UpstreamLogConfig"
+          },
           "upstreams": {
             "$ref": "#/components/schemas/UpstreamsConfig"
           },
@@ -2183,6 +2186,26 @@
           "https",
           "quic"
         ]
+      },
+      "UpstreamLogConfig": {
+        "type": "object",
+        "description": "Persistence of upstream **probe telemetry** — the background `NS .` RTT\nsamples and the health they drive — for maintenance and diagnostics (\"when\ndid this upstream flap down, is its latency creeping up\"). Distinct from the\nquery log: separate DB file, retention, and toggle.\n\n**Off by default.** `enabled` toggles live (no restart): the writer is always\nwired, so flipping it on starts persisting immediately. Only `persist` (disk\nvs in-memory) is fixed at startup, exactly as for the query log.",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Persist probe telemetry. Off by default; can be toggled at runtime."
+          },
+          "persist": {
+            "type": "boolean",
+            "description": "Persist to disk so it survives restarts. When off, an in-memory database\nis used for the lifetime of the process (and no file is created). Fixed at\nstartup — changing it takes effect on the next restart."
+          },
+          "retention_days": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How many days of probe telemetry to retain. Probes are low-volume (one\nper upstream per minute), so a generous default is cheap. 0 disables\ntime-based pruning.",
+            "minimum": 0
+          }
+        }
       },
       "UpstreamStatDto": {
         "type": "object",

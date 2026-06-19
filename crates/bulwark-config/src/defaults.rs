@@ -49,6 +49,10 @@ pub(crate) fn default_log_retention_days() -> u32 {
     7
 }
 
+pub(crate) fn default_probe_log_retention_days() -> u32 {
+    30
+}
+
 pub(crate) fn default_block_ipv4() -> Ipv4Addr {
     Ipv4Addr::UNSPECIFIED
 }

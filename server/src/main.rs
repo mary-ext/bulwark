@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bulwark::app::{self, AppState, Paths};
-use bulwark::{api, assets, auth, persist, store};
+use bulwark::{api, assets, auth, persist, probe_store, store};
 use bulwark_config::Config;
+use bulwark_upstream::ProbeLog;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -53,8 +54,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(data_dir = %paths.data_dir.display(), "starting bulwark");
 
+    // The probe-telemetry sink, shared with every pool's probe tasks. The enabled
+    // toggle tracks config and can be flipped at runtime on reload; the sink +
+    // writer are always wired below so a runtime enable takes effect without a
+    // restart. Created before the engine so the startup pool already holds it.
+    let probe_log = Arc::new(ProbeLog::new(config.upstream_log.enabled));
+
     // Build the engine.
-    let engine = app::build_engine(&config, &paths).await?;
+    let engine = app::build_engine(&config, &paths, probe_log.clone()).await?;
 
     // Restore persisted statistics.
     if config.stats.persist {
@@ -83,6 +90,26 @@ async fn main() -> anyhow::Result<()> {
     engine.log().set_sink(tx);
     persist::spawn_querylog_writer(store.clone(), rx);
 
+    // Upstream probe telemetry (opt-in). The store + writer are always wired so
+    // the feature can be toggled at runtime (writes are gated by `probe_log`'s
+    // enabled flag, updated on reload). Like the query log, `persist` decides
+    // disk vs in-memory and is fixed at startup: `persist=true` (the default)
+    // opens the disk store now so a later enable needs no restart; set it false
+    // to keep telemetry in-memory and leave no file behind.
+    let probe_store_path = if config.upstream_log.persist {
+        paths.upstream_log_db.to_string_lossy().into_owned()
+    } else {
+        ":memory:".to_string()
+    };
+    let probe_store = Arc::new(
+        probe_store::ProbeStore::open(&probe_store_path)
+            .await
+            .context("opening probe-log store")?,
+    );
+    let (ptx, prx) = tokio::sync::mpsc::channel(persist::PROBE_CHANNEL_CAP);
+    probe_log.set_sink(ptx);
+    persist::spawn_probe_writer(probe_store.clone(), prx);
+
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let state = AppState {
         engine: engine.clone(),
@@ -90,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         paths: paths.clone(),
         sessions,
         store: store.clone(),
+        probe_log: probe_log.clone(),
         update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -98,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
     persist::spawn_stats_snapshotter(engine.clone(), paths.stats.clone(), config.clone());
     persist::spawn_cache_snapshotter(engine.clone(), paths.cache_snapshot.clone());
     persist::spawn_querylog_pruner(store.clone(), config.clone());
+    persist::spawn_probe_pruner(probe_store.clone(), config.clone());
 
     // Start DNS listeners.
     let dns_binds = config.read().await.server.dns_bind.clone();

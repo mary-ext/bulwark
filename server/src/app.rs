@@ -12,7 +12,7 @@ use bulwark_engine::querylog::QueryLog;
 use bulwark_engine::stats::Stats;
 use bulwark_engine::{Engine, EngineState};
 use bulwark_filter::Compiler;
-use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
+use bulwark_upstream::{PoolEntry, PoolSettings, ProbeLog, UpstreamPool};
 use tokio::sync::RwLock;
 
 use crate::auth::SessionSigner;
@@ -25,6 +25,9 @@ pub struct Paths {
     pub lists_dir: PathBuf,
     /// Disk-backed query-log database (SQLite via Turso).
     pub querylog_db: PathBuf,
+    /// Disk-backed upstream probe-telemetry database (opt-in; see
+    /// [`bulwark_config::UpstreamLogConfig`]).
+    pub upstream_log_db: PathBuf,
     pub stats: PathBuf,
     /// DNS cache snapshot, restored on startup to warm the cache (see
     /// [`crate::persist::load_cache`]).
@@ -37,6 +40,7 @@ impl Paths {
             config: data_dir.join("config.yaml"),
             lists_dir: data_dir.join("lists"),
             querylog_db: data_dir.join("querylog.db"),
+            upstream_log_db: data_dir.join("upstream_log.db"),
             stats: data_dir.join("stats.json"),
             cache_snapshot: data_dir.join("cache.snap"),
             data_dir,
@@ -58,6 +62,10 @@ pub struct AppState {
     /// Disk-backed query-log store, read by the API and written by the
     /// background writer task.
     pub store: Arc<crate::store::QueryStore>,
+    /// Probe-telemetry sink, shared with every upstream pool built across config
+    /// reloads so the wiring survives a reload. Detached (a no-op) unless probe
+    /// persistence was enabled at startup.
+    pub probe_log: Arc<ProbeLog>,
     /// Serializes config read-modify-write updates. Held across a handler's
     /// clone → mutate → [`apply_config`] sequence so concurrent edits can't lose
     /// each other's writes or allocate the same list id twice.
@@ -103,7 +111,11 @@ pub fn compile_filters(
 /// Build the upstream pool from the enabled configured upstreams. On a config
 /// reload, pass the outgoing pool as `prev` so per-upstream health/stats are
 /// carried over for upstreams whose spec is unchanged.
-pub async fn build_pool(cfg: &Config, prev: Option<&UpstreamPool>) -> anyhow::Result<UpstreamPool> {
+pub async fn build_pool(
+    cfg: &Config,
+    prev: Option<&UpstreamPool>,
+    probe_log: Arc<ProbeLog>,
+) -> anyhow::Result<UpstreamPool> {
     let entries: Vec<PoolEntry> = cfg
         .upstreams
         .active_specs()
@@ -126,6 +138,9 @@ pub async fn build_pool(cfg: &Config, prev: Option<&UpstreamPool>) -> anyhow::Re
     if let Some(prev) = prev {
         pool.adopt_health_from(prev);
     }
+    // Share the (possibly detached) probe-telemetry sink with this pool's probe
+    // tasks before they start. Must precede `start_probing`.
+    pool.set_probe_log(probe_log);
     // Each upstream drives its own probe schedule; the tasks stop when this pool
     // is dropped (e.g. replaced on the next config reload).
     pool.start_probing();
@@ -138,9 +153,10 @@ pub async fn build_engine_state(
     cfg: &Config,
     paths: &Paths,
     prev: Option<&UpstreamPool>,
+    probe_log: Arc<ProbeLog>,
 ) -> anyhow::Result<EngineState> {
     let (filter, _counts) = compile_filters(cfg, paths);
-    let pool = Arc::new(build_pool(cfg, prev).await?);
+    let pool = Arc::new(build_pool(cfg, prev, probe_log).await?);
     let clients = Arc::new(ClientMatcher::build(&cfg.clients));
     Ok(EngineState {
         filter: Arc::new(filter),
@@ -155,8 +171,12 @@ pub async fn build_engine_state(
 }
 
 /// Build the engine + cache/log/stats at startup from config.
-pub async fn build_engine(cfg: &Config, paths: &Paths) -> anyhow::Result<Arc<Engine>> {
-    let state = build_engine_state(cfg, paths, None).await?;
+pub async fn build_engine(
+    cfg: &Config,
+    paths: &Paths,
+    probe_log: Arc<ProbeLog>,
+) -> anyhow::Result<Arc<Engine>> {
+    let state = build_engine_state(cfg, paths, None, probe_log).await?;
     let cache = Arc::new(DnsCache::new(
         cfg.cache.size,
         cfg.cache.min_ttl_secs,
@@ -206,7 +226,13 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         // Hold the outgoing pool just long enough to inherit its health; it's
         // still the live one until `swap_state` below.
         let prev_pool = state.engine.pool();
-        build_engine_state(&new_cfg, &state.paths, Some(prev_pool.as_ref())).await?
+        build_engine_state(
+            &new_cfg,
+            &state.paths,
+            Some(prev_pool.as_ref()),
+            state.probe_log.clone(),
+        )
+        .await?
     };
     new_cfg.save(&state.paths.config).context("saving config")?;
     state.engine.swap_state(engine_state);
@@ -235,6 +261,9 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         new_cfg.stats.retention_days,
         new_cfg.privacy.anonymize_client_ips,
     );
+    // Probe-telemetry persistence toggles live (the sink is already wired); only
+    // the disk/in-memory `persist` choice is fixed at startup.
+    state.probe_log.reconfigure(new_cfg.upstream_log.enabled);
 
     *state.config.write().await = new_cfg;
     Ok(())

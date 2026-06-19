@@ -45,6 +45,8 @@ pub struct Config {
     #[serde(default)]
     pub query_log: QueryLogConfig,
     #[serde(default)]
+    pub upstream_log: UpstreamLogConfig,
+    #[serde(default)]
     pub stats: StatsConfig,
     #[serde(default)]
     pub privacy: PrivacyConfig,
@@ -62,6 +64,7 @@ impl Default for Config {
             filtering: FilteringConfig::default(),
             clients: Vec::new(),
             query_log: QueryLogConfig::default(),
+            upstream_log: UpstreamLogConfig::default(),
             stats: StatsConfig::default(),
             privacy: PrivacyConfig::default(),
             auth: AuthConfig::default(),
@@ -317,6 +320,41 @@ impl Default for QueryLogConfig {
             enabled: true,
             persist: true,
             retention_days: default_log_retention_days(),
+        }
+    }
+}
+
+/// Persistence of upstream **probe telemetry** — the background `NS .` RTT
+/// samples and the health they drive — for maintenance and diagnostics ("when
+/// did this upstream flap down, is its latency creeping up"). Distinct from the
+/// query log: separate DB file, retention, and toggle.
+///
+/// **Off by default.** `enabled` toggles live (no restart): the writer is always
+/// wired, so flipping it on starts persisting immediately. Only `persist` (disk
+/// vs in-memory) is fixed at startup, exactly as for the query log.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct UpstreamLogConfig {
+    /// Persist probe telemetry. Off by default; can be toggled at runtime.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Persist to disk so it survives restarts. When off, an in-memory database
+    /// is used for the lifetime of the process (and no file is created). Fixed at
+    /// startup — changing it takes effect on the next restart.
+    #[serde(default = "btrue")]
+    pub persist: bool,
+    /// How many days of probe telemetry to retain. Probes are low-volume (one
+    /// per upstream per minute), so a generous default is cheap. 0 disables
+    /// time-based pruning.
+    #[serde(default = "default_probe_log_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for UpstreamLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            persist: true,
+            retention_days: default_probe_log_retention_days(),
         }
     }
 }

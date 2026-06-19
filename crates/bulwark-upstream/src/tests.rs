@@ -13,6 +13,7 @@ use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
 use crate::pool::{PoolEntry, PoolSettings, UpstreamPool};
+use crate::probe_log::{ProbeLog, ProbeOutcome};
 use crate::spec::UpstreamSpec;
 use crate::transport::{decode, encode};
 
@@ -115,6 +116,53 @@ async fn resolves_via_udp_and_restores_id() {
     assert_eq!(resp.message.answers.len(), 1);
     assert_eq!(resp.upstream, format!("udp://{}", mock.addr));
     assert_eq!(mock.received.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn successful_probe_emits_telemetry_event() {
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
+    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+    let probe_log = Arc::new(ProbeLog::new(true));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    probe_log.set_sink(tx);
+    pool.set_probe_log(probe_log);
+
+    pool.probe_all().await;
+
+    let ev = rx.try_recv().expect("a probe event was emitted");
+    assert_eq!(ev.outcome, ProbeOutcome::Answer);
+    assert_eq!(ev.upstream, format!("udp://{}", mock.addr));
+    assert!(ev.rtt_ms.is_some());
+    assert!(ev.ewma_ms.is_some(), "first successful probe seeds the routing EWMA");
+    assert!(ev.up);
+    assert_eq!(ev.consecutive_failures, 0);
+    assert!(ev.detail.is_none(), "a clean answer carries no detail");
+}
+
+#[tokio::test]
+async fn failed_probe_emits_failure_event() {
+    // The mock receives but never answers, so the probe times out.
+    let mock = spawn_mock(Behaviour::Drop).await;
+    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+    let probe_log = Arc::new(ProbeLog::new(true));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    probe_log.set_sink(tx);
+    pool.set_probe_log(probe_log);
+
+    pool.probe_all().await;
+
+    let ev = rx.try_recv().expect("a probe event was emitted");
+    assert_eq!(ev.outcome, ProbeOutcome::Timeout);
+    assert!(ev.rtt_ms.is_none(), "a failed probe has no RTT");
+    assert!(ev.ewma_ms.is_none(), "no successful probe yet → no routing latency");
+    assert!(ev.detail.is_some());
+    // failure_threshold is 1 in test settings, so one failed probe marks it down.
+    assert!(!ev.up);
+    assert_eq!(ev.consecutive_failures, 1);
 }
 
 #[tokio::test]

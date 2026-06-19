@@ -21,6 +21,7 @@ use crate::doq::DoqTransport;
 use crate::dot::DotTransport;
 use crate::error::{Result, SharedResult, UpstreamError};
 use crate::plain::{TcpTransport, UdpTransport};
+use crate::probe_log::{now_ms, ProbeEvent, ProbeLog, ProbeOutcome};
 use crate::spec::{Host, TransportKind, UpstreamSpec};
 use crate::transport::{normalize_upstream_edns, QueryKey, Transport};
 
@@ -172,6 +173,25 @@ impl Health {
     fn routing_latency_ms(&self) -> Option<f64> {
         (self.probe_samples > 0).then_some(self.probe_ewma_ms)
     }
+
+    /// The post-update fields a [`ProbeEvent`] persists, captured under the same
+    /// lock acquisition that recorded the probe so the event reflects exactly the
+    /// state the update produced.
+    fn snapshot(&self) -> ProbeSnapshot {
+        ProbeSnapshot {
+            ewma_ms: self.routing_latency_ms(),
+            up: self.up,
+            consecutive_failures: self.consecutive_failures,
+        }
+    }
+}
+
+/// The health fields captured right after recording a probe, handed back to the
+/// probe loop so it can build a self-contained [`ProbeEvent`] without re-locking.
+struct ProbeSnapshot {
+    ewma_ms: Option<f64>,
+    up: bool,
+    consecutive_failures: u32,
 }
 
 /// A single upstream and its live health.
@@ -197,8 +217,9 @@ impl Upstream {
     }
 
     /// Record a successful background probe: fold its RTT into the routing EWMA,
-    /// confirm liveness, and schedule the next probe a full window out.
-    fn record_probe_success(&self, rtt: Duration, alpha: f64) {
+    /// confirm liveness, and schedule the next probe a full window out. Returns
+    /// the resulting health for telemetry.
+    fn record_probe_success(&self, rtt: Duration, alpha: f64) -> ProbeSnapshot {
         let mut h = self.health.lock();
         let ms = rtt.as_secs_f64() * 1000.0;
         h.probe_ewma_ms = ewma(h.probe_samples, h.probe_ewma_ms, ms, alpha);
@@ -208,6 +229,7 @@ impl Upstream {
         h.up = true;
         h.last_error = None;
         h.next_probe_at = Some(Instant::now() + jitter(HEALTHY_PROBE_WINDOW));
+        h.snapshot()
     }
 
     /// Record a failed *live* query: count it against real-traffic totals and
@@ -221,9 +243,11 @@ impl Upstream {
 
     /// Record a failed background probe: it drives health and the recovery
     /// schedule but is not real traffic, so it doesn't touch the query counters.
-    fn record_probe_failure(&self, err: &UpstreamError, threshold: u32) {
+    /// Returns the resulting health for telemetry.
+    fn record_probe_failure(&self, err: &UpstreamError, threshold: u32) -> ProbeSnapshot {
         let mut h = self.health.lock();
         self.fold_failure(&mut h, err, threshold);
+        h.snapshot()
     }
 
     /// Shared failure bookkeeping: bump consecutive failures, mark down past the
@@ -358,6 +382,12 @@ pub struct UpstreamPool {
     inflight: Mutex<HashMap<QueryKey, ResolveFuture>>,
     settings: PoolSettings,
     bootstrap: SharedBootstrap,
+    /// Sink for probe telemetry. Defaults to a detached (no-sink) [`ProbeLog`]
+    /// that drops every event; the server swaps in a wired one via
+    /// [`set_probe_log`](UpstreamPool::set_probe_log) when persistence is enabled.
+    /// Shared with each probe task so the wiring survives — it's set before
+    /// [`start_probing`].
+    probe_log: Arc<ProbeLog>,
     /// One background probe task per upstream, spawned by [`start_probing`].
     /// Aborted when the pool is dropped (e.g. on config reload) — each task
     /// holds only an `Arc<Upstream>`, never the pool, so the pool can drop.
@@ -395,8 +425,17 @@ impl UpstreamPool {
             inflight: Mutex::new(HashMap::new()),
             settings,
             bootstrap,
+            probe_log: Arc::new(ProbeLog::new(false)),
             probe_tasks: Vec::new(),
         })
+    }
+
+    /// Attach a probe-telemetry sink, shared with the per-upstream probe tasks.
+    /// Call after [`build`](Self::build) and before
+    /// [`start_probing`](Self::start_probing); a no-op telemetry log is used
+    /// otherwise, so persistence stays entirely off until this is wired.
+    pub fn set_probe_log(&mut self, probe_log: Arc<ProbeLog>) {
+        self.probe_log = probe_log;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -496,7 +535,7 @@ impl UpstreamPool {
     pub async fn probe_all(&self) {
         let query = probe_query();
         for up in &self.upstreams {
-            probe_once(up, &query, &self.settings).await;
+            probe_once(up, &query, &self.settings, &self.probe_log).await;
         }
     }
 
@@ -517,8 +556,9 @@ impl UpstreamPool {
             up.schedule_initial_probe();
             let up = up.clone();
             let settings = self.settings.clone();
+            let probe_log = self.probe_log.clone();
             self.probe_tasks
-                .push(tokio::spawn(probe_loop(up, settings)));
+                .push(tokio::spawn(probe_loop(up, settings, probe_log)));
         }
     }
 
@@ -553,29 +593,74 @@ impl UpstreamPool {
 /// healthy upstream is probed on the same cadence (a probe reschedules itself a
 /// window out; a failure backs off — see [`Upstream::record_probe_success`] /
 /// [`Upstream::record_probe_failure`]).
-async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings) {
+async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings, probe_log: Arc<ProbeLog>) {
     let query = probe_query();
     loop {
         match up.probe_due_in(Instant::now()) {
             Some(remaining) => tokio::time::sleep(remaining).await,
-            None => probe_once(&up, &query, &settings).await,
+            None => probe_once(&up, &query, &settings, &probe_log).await,
         }
     }
 }
 
-/// Probe a single upstream once and fold the outcome into its health.
-async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings) {
+/// Probe a single upstream once, fold the outcome into its health, and — when a
+/// sink is attached — persist the measurement and resulting health as a
+/// [`ProbeEvent`]. Building the event is gated on [`ProbeLog::is_enabled`], so a
+/// pool without telemetry wired pays nothing here beyond a relaxed atomic load.
+async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, probe_log: &ProbeLog) {
     let start = Instant::now();
-    match tokio::time::timeout(settings.query_timeout, up.transport.query(query)).await {
-        // The probe is a fixed, universally-answerable query (`NS .`), so unlike
-        // an arbitrary live query, *any* non-answer to it (SERVFAIL as much as
-        // REFUSED) genuinely indicts the resolver — treat it as a failed probe.
-        Ok(Ok(resp)) => match classify(&resp) {
-            Verdict::Answer => up.record_probe_success(start.elapsed(), settings.ewma_alpha),
-            _ => up.record_probe_failure(&rcode_err(&resp), settings.failure_threshold),
-        },
-        Ok(Err(e)) => up.record_probe_failure(&e, settings.failure_threshold),
-        Err(_) => up.record_probe_failure(&UpstreamError::Timeout, settings.failure_threshold),
+    // Each arm records health (under one lock, returning the resulting snapshot)
+    // and surfaces the non-answer error, if any. The error is kept as a value and
+    // only stringified for the event below, so a disabled probe log allocates
+    // nothing here.
+    let (outcome, rtt_ms, snap, err) =
+        match tokio::time::timeout(settings.query_timeout, up.transport.query(query)).await {
+            // The probe is a fixed, universally-answerable query (`NS .`), so
+            // unlike an arbitrary live query, *any* non-answer to it (SERVFAIL as
+            // much as REFUSED) genuinely indicts the resolver — failed probe.
+            Ok(Ok(resp)) => match classify(&resp) {
+                Verdict::Answer => {
+                    let rtt = start.elapsed();
+                    let snap = up.record_probe_success(rtt, settings.ewma_alpha);
+                    (ProbeOutcome::Answer, Some(rtt.as_secs_f64() * 1000.0), snap, None)
+                }
+                verdict => {
+                    let err = rcode_err(&resp);
+                    let snap = up.record_probe_failure(&err, settings.failure_threshold);
+                    let outcome = match verdict {
+                        Verdict::Reject => ProbeOutcome::Reject,
+                        _ => ProbeOutcome::SoftFail,
+                    };
+                    (outcome, None, snap, Some(err))
+                }
+            },
+            Ok(Err(e)) => {
+                let snap = up.record_probe_failure(&e, settings.failure_threshold);
+                (ProbeOutcome::Error, None, snap, Some(e))
+            }
+            Err(_) => {
+                let err = UpstreamError::Timeout;
+                let snap = up.record_probe_failure(&err, settings.failure_threshold);
+                (ProbeOutcome::Timeout, None, snap, Some(err))
+            }
+        };
+
+    // Build and persist the event only when telemetry is on; this gate skips the
+    // field clones and the error-to-string entirely when off. `push` re-checks
+    // the toggle as its own invariant.
+    if probe_log.is_enabled() {
+        probe_log.push(ProbeEvent {
+            time_ms: now_ms(),
+            upstream: up.spec.display.clone(),
+            name: up.name.clone(),
+            kind: up.spec.kind,
+            outcome,
+            rtt_ms,
+            ewma_ms: snap.ewma_ms,
+            up: snap.up,
+            consecutive_failures: snap.consecutive_failures,
+            detail: err.map(|e| e.to_string()),
+        });
     }
 }
 

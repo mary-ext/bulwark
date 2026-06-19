@@ -12,4 +12,5 @@ pub mod auth;
 pub mod dto;
 pub mod openapi;
 pub mod persist;
+pub mod probe_store;
 pub mod store;

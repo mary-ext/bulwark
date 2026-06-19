@@ -49,6 +49,17 @@ impl TransportKind {
             TransportKind::Quic => "quic",
         }
     }
+
+    /// Parse back from [`as_str`](Self::as_str); unknown labels fall back to UDP.
+    pub fn from_label(s: &str) -> Self {
+        match s {
+            "tcp" => TransportKind::Tcp,
+            "tls" => TransportKind::Tls,
+            "https" => TransportKind::Https,
+            "quic" => TransportKind::Quic,
+            _ => TransportKind::Udp,
+        }
+    }
 }
 
 /// Where the host part of a spec points.
@@ -292,5 +303,20 @@ mod tests {
         assert_ne!(id("8.8.8.8"), id("8.8.8.8:5353"));
         assert_ne!(id("https://dns.google/a"), id("https://dns.google/b"));
         assert_ne!(id("https://dns.google"), id("h3://dns.google"));
+    }
+
+    #[test]
+    fn transport_kind_label_round_trips() {
+        // The probe store persists `as_str` and reads back via `from_label`, so
+        // every variant must survive the round trip.
+        for k in [
+            TransportKind::Udp,
+            TransportKind::Tcp,
+            TransportKind::Tls,
+            TransportKind::Https,
+            TransportKind::Quic,
+        ] {
+            assert_eq!(TransportKind::from_label(k.as_str()), k);
+        }
     }
 }

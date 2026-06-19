@@ -9,8 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bulwark_engine::querylog::QueryLogEntry;
 use bulwark_engine::Engine;
+use bulwark_upstream::ProbeEvent;
 use tokio::sync::mpsc::Receiver;
 
+use crate::probe_store::ProbeStore;
 use crate::store::QueryStore;
 
 /// Bound on the query-log writer channel. Caps how many log entries can queue
@@ -82,6 +84,69 @@ pub fn spawn_querylog_pruner(
                 Ok(n) if n > 0 => tracing::debug!(removed = n, "pruned old query-log entries"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "query log prune failed"),
+            }
+        }
+    })
+}
+
+/// Bound on the probe-telemetry writer channel. Probes are low-volume (about one
+/// per upstream per minute), so this only ever fills during a sustained writer
+/// stall, in which case the probe loop sheds events (see
+/// [`bulwark_upstream::ProbeLog::push`]). A small cap is plenty of headroom while
+/// keeping the worst-case spike negligible.
+pub const PROBE_CHANNEL_CAP: usize = 256;
+
+/// Max probe events folded into one write transaction. A separate concept from
+/// [`PROBE_CHANNEL_CAP`] (a backpressure bound) — this only caps a single
+/// transaction's size — so the two are named distinctly even when equal.
+const PROBE_DRAIN_BATCH: usize = 256;
+
+/// Spawn the background writer that batches probe events into the probe store.
+/// Mirrors [`spawn_querylog_writer`]: drain whatever is queued and write it as a
+/// single transaction.
+pub fn spawn_probe_writer(
+    store: Arc<ProbeStore>,
+    mut rx: Receiver<ProbeEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Some(first) = rx.recv().await else {
+                break;
+            };
+            let mut batch = vec![first];
+            while let Ok(e) = rx.try_recv() {
+                batch.push(e);
+                if batch.len() >= PROBE_DRAIN_BATCH {
+                    break;
+                }
+            }
+            if let Err(e) = store.insert_batch(&batch).await {
+                tracing::warn!(error = %e, "probe log batch insert failed");
+            }
+        }
+    })
+}
+
+/// Periodically delete probe-telemetry events older than the retention window.
+pub fn spawn_probe_pruner(
+    store: Arc<ProbeStore>,
+    config: Arc<tokio::sync::RwLock<bulwark_config::Config>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(3600));
+        tick.tick().await; // skip immediate
+        loop {
+            tick.tick().await;
+            let retention = config.read().await.upstream_log.retention_days;
+            // 0 disables time-based pruning.
+            if retention == 0 {
+                continue;
+            }
+            let cutoff = now_ms() - (retention as i64) * 86_400_000;
+            match store.delete_older_than(cutoff).await {
+                Ok(n) if n > 0 => tracing::debug!(removed = n, "pruned old probe-log events"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "probe log prune failed"),
             }
         }
     })
