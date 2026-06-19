@@ -5,12 +5,15 @@
     label,
     value,
     sub,
+    sub2,
     tone = "default",
     spark,
   }: {
     label: string;
     value: string | number;
     sub?: string;
+    /** Optional second sub line rendered below {sub}. */
+    sub2?: string;
     tone?: "default" | "good" | "bad" | "accent";
     /** Optional trend visual rendered flush to the bottom of the card. */
     spark?: Snippet;
@@ -21,6 +24,7 @@
   <div class="stat-label">{label}</div>
   <div class="stat-value {tone}">{value}</div>
   {#if sub}<div class="stat-sub">{sub}</div>{/if}
+  {#if sub2}<div class="stat-sub">{sub2}</div>{/if}
   {#if spark}<div class="stat-spark">{@render spark()}</div>{/if}
 </div>
 
