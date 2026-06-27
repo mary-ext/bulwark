@@ -12,7 +12,7 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
-use crate::pool::{PoolEntry, PoolSettings, UpstreamPool};
+use crate::pool::{PoolEntry, PoolSettings, Upstream, UpstreamPool};
 use crate::probe_log::{ProbeLog, ProbeOutcome};
 use crate::spec::UpstreamSpec;
 use crate::transport::{decode, encode};
@@ -339,6 +339,52 @@ async fn known_leader_preferred_over_freshly_added_unknown() {
     assert_eq!(
         known.received.load(Ordering::SeqCst),
         known_after_warmup + 1
+    );
+}
+
+#[tokio::test]
+async fn leadership_is_sticky_within_the_switch_margin() {
+    // Selection is lowest-latency-wins, but a challenger only *takes* the lead once
+    // it clears the switch margin — so near-tied upstreams don't trade leadership
+    // (and churn warm connections) over sub-margin probe noise.
+    let a = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 0)).await;
+    let b = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;
+    let pool = UpstreamPool::build(&[entry(a.addr), entry(b.addr)], settings())
+        .await
+        .unwrap();
+    // Sample both so each has a routing latency; we then drive the EWMAs directly.
+    pool.probe_all().await;
+    let a_up = pool.upstreams()[0].clone();
+    let b_up = pool.upstreams()[1].clone();
+    let leads = |pool: &UpstreamPool, who: &Arc<Upstream>| Arc::ptr_eq(&pool.ordered()[0], who);
+
+    // A is clearly fastest → it leads.
+    a_up.set_routing_latency_for_test(15.0);
+    b_up.set_routing_latency_for_test(24.0);
+    assert!(leads(&pool, &a_up));
+
+    // A drifts to just behind B, but inside the margin → incumbent A is held.
+    a_up.set_routing_latency_for_test(24.0);
+    b_up.set_routing_latency_for_test(23.0);
+    assert!(
+        leads(&pool, &a_up),
+        "incumbent held while the challenger leads by less than the switch margin"
+    );
+
+    // B pulls materially ahead, clearing the margin → leadership moves to B.
+    a_up.set_routing_latency_for_test(24.0);
+    b_up.set_routing_latency_for_test(15.0);
+    assert!(
+        leads(&pool, &b_up),
+        "a challenger past the switch margin takes leadership"
+    );
+
+    // B is now the sticky incumbent: A nibbling back inside the margin doesn't flip it.
+    a_up.set_routing_latency_for_test(14.0);
+    b_up.set_routing_latency_for_test(15.0);
+    assert!(
+        leads(&pool, &b_up),
+        "the new incumbent is itself held within the margin"
     );
 }
 

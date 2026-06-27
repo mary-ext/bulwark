@@ -109,6 +109,25 @@ fn startup_delay(max: Duration) -> Duration {
     max.mul_f64(rand::random::<f64>())
 }
 
+/// Leadership hysteresis. Selection is lowest-routing-latency-wins, but the probe
+/// EWMAs of near-tied upstreams cross constantly — the captured log showed the
+/// lead changing ~7×/hour, almost all of it between upstreams within a
+/// millisecond of each other. Each handoff churns a warm QUIC/TLS connection for
+/// no real latency gain, so the standing leader keeps the front of the ranking
+/// unless a challenger beats it by at least `max(LEADER_STICKY_FRACTION × leader,
+/// LEADER_STICKY_FLOOR_MS)` (see [`switch_margin`]). A genuine winner — one
+/// materially faster, like the storm survivor at 15ms vs the field at 24ms —
+/// still clears the margin and takes over immediately.
+const LEADER_STICKY_FRACTION: f64 = 0.15;
+const LEADER_STICKY_FLOOR_MS: f64 = 5.0;
+
+/// How much faster than the incumbent (in ms) a challenger must be to seize
+/// leadership. A relative band handles the fast upstreams where a few ms is
+/// significant; the floor keeps slow ones from flapping over sub-percent noise.
+fn switch_margin(incumbent_ms: f64) -> f64 {
+    (incumbent_ms * LEADER_STICKY_FRACTION).max(LEADER_STICKY_FLOOR_MS)
+}
+
 /// EWMA update: the first sample seeds the average, later ones blend in by
 /// `alpha`.
 fn ewma(samples: u64, prev_ms: f64, sample_ms: f64, alpha: f64) -> f64 {
@@ -324,6 +343,26 @@ impl Upstream {
         (down, unsampled, lat)
     }
 
+    /// Routing latency for leadership hysteresis: `Some(ms)` only when the
+    /// upstream is both up and probe-sampled. A down or never-sampled incumbent
+    /// returns `None` so hysteresis can't pin the lead on it — the ranking falls
+    /// through to the freshly sorted best instead.
+    fn routing_latency_if_eligible(&self) -> Option<f64> {
+        let h = self.health.lock();
+        h.up.then(|| h.routing_latency_ms()).flatten()
+    }
+
+    /// Force this upstream's routing latency (marking it up and sampled) so a test
+    /// can drive selection deterministically without depending on probe timing.
+    #[cfg(test)]
+    pub(crate) fn set_routing_latency_for_test(&self, ms: f64) {
+        let mut h = self.health.lock();
+        h.probe_ewma_ms = ms;
+        h.probe_samples = h.probe_samples.max(1);
+        h.up = true;
+        h.consecutive_failures = 0;
+    }
+
     /// A snapshot of this upstream's stats for the UI.
     pub fn stat(&self) -> UpstreamStat {
         let h = self.health.lock();
@@ -388,6 +427,12 @@ impl Drop for InflightGuard<'_> {
 pub struct UpstreamPool {
     upstreams: Vec<Arc<Upstream>>,
     inflight: Mutex<HashMap<QueryKey, ResolveFuture>>,
+    /// The upstream currently at the front of the ranking, remembered across
+    /// queries so leadership is sticky: [`ordered`](Self::ordered) holds it first
+    /// unless a challenger clears the [`switch_margin`]. Implicitly reset when the
+    /// pool is rebuilt on reload (a fresh leader re-establishes on the first
+    /// query).
+    current_leader: Mutex<Option<Arc<Upstream>>>,
     settings: PoolSettings,
     bootstrap: SharedBootstrap,
     /// Sink for probe telemetry. Defaults to a detached (no-sink) [`ProbeLog`]
@@ -431,6 +476,7 @@ impl UpstreamPool {
         Ok(Self {
             upstreams,
             inflight: Mutex::new(HashMap::new()),
+            current_leader: Mutex::new(None),
             settings,
             bootstrap,
             probe_log: Arc::new(ProbeLog::new(false)),
@@ -464,9 +510,35 @@ impl UpstreamPool {
     }
 
     /// Upstreams ordered best-first for this moment.
-    fn ordered(&self) -> Vec<Arc<Upstream>> {
+    ///
+    /// Lowest routing latency wins, then leadership hysteresis is applied: the
+    /// standing leader is held at the front unless the sorted best beats it by the
+    /// [`switch_margin`], so near-tied upstreams don't trade the lead every probe
+    /// and churn warm connections. An incumbent that has gone down or is unsampled
+    /// is not eligible to be held, so it falls through to the freshly sorted best.
+    pub(crate) fn ordered(&self) -> Vec<Arc<Upstream>> {
         let mut v: Vec<Arc<Upstream>> = self.upstreams.clone();
         v.sort_by_key(|u| u.sort_key());
+
+        let mut leader = self.current_leader.lock();
+        if let Some(cur) = leader.as_ref() {
+            if let Some(pos) = v.iter().position(|u| Arc::ptr_eq(u, cur)) {
+                // Only an off-front incumbent that's still eligible can be held,
+                // and only when the best challenger hasn't cleared the margin.
+                if pos != 0 {
+                    if let (Some(inc), Some(best)) = (
+                        v[pos].routing_latency_if_eligible(),
+                        v[0].routing_latency_if_eligible(),
+                    ) {
+                        if inc - best <= switch_margin(inc) {
+                            let held = v.remove(pos);
+                            v.insert(0, held);
+                        }
+                    }
+                }
+            }
+        }
+        *leader = v.first().cloned();
         v
     }
 
