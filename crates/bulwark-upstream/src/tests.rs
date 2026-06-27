@@ -139,6 +139,39 @@ async fn successful_probe_emits_telemetry_event() {
     assert!(ev.up);
     assert_eq!(ev.consecutive_failures, 0);
     assert!(ev.detail.is_none(), "a clean answer carries no detail");
+    assert!(ev.error_kind.is_none(), "a clean answer carries no error kind");
+    // No live traffic and no selection have happened yet, so those fields are blank.
+    assert!(ev.live_ewma_ms.is_none(), "no live queries → no live EWMA");
+    assert_eq!(ev.live_queries, 0);
+    assert!(ev.rank.is_none(), "no selection has run yet");
+    assert!(!ev.lead_held);
+}
+
+#[tokio::test]
+async fn probe_event_captures_live_traffic_and_rank() {
+    let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
+    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+    let probe_log = Arc::new(ProbeLog::new(true));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    probe_log.set_sink(tx);
+    pool.set_probe_log(probe_log);
+
+    // A real query records a live RTT and stamps the selection rank; the next
+    // probe should carry both alongside the routing EWMA.
+    pool.resolve(&make_query("a.test.")).await.unwrap();
+    pool.probe_all().await;
+
+    let ev = rx.try_recv().expect("a probe event was emitted");
+    assert!(
+        ev.live_ewma_ms.is_some(),
+        "probe captures the live-query EWMA once real traffic has flowed"
+    );
+    assert_eq!(ev.live_queries, 1);
+    assert_eq!(ev.live_failures, 0);
+    assert_eq!(ev.rank, Some(0), "the sole upstream ranks first");
+    assert!(!ev.lead_held, "a raw-fastest leader isn't a hysteresis hold");
 }
 
 #[tokio::test]

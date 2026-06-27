@@ -25,7 +25,7 @@ pub use error::{Result, UpstreamError};
 pub use pool::{
     test_spec, PoolEntry, PoolSettings, Resolved, Upstream, UpstreamPool, UpstreamStat,
 };
-pub use probe_log::{ProbeEvent, ProbeLog, ProbeOutcome};
+pub use probe_log::{ProbeErrorKind, ProbeEvent, ProbeLog, ProbeOutcome};
 pub use spec::{Host, TransportKind, UpstreamSpec};
 pub use transport::{dnssec_ok, QueryKey, Transport};
 

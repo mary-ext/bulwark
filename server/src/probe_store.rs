@@ -11,12 +11,15 @@
 //!
 //! [`store`]: crate::store
 
-use bulwark_upstream::{ProbeEvent, ProbeOutcome, TransportKind};
+use bulwark_upstream::{ProbeErrorKind, ProbeEvent, ProbeOutcome, TransportKind};
 use turso::{params::Params, Builder, Connection, Value};
 
-/// The schema. `rtt_ms`, `ewma_ms`, and `detail` are NULL when they don't apply
-/// (a failed probe has no RTT; an upstream with no successful probe yet has no
-/// EWMA; a clean answer has no detail). `up` is the precomputed liveness flag.
+/// The schema. `rtt_ms`, `ewma_ms`, `detail`, `error_kind`, `live_ewma_ms`, and
+/// `rank` are NULL when they don't apply (a failed probe has no RTT; an upstream
+/// with no successful probe yet has no EWMA; a clean answer has no detail/error
+/// kind; an upstream with no live traffic has no live EWMA; an unranked one has
+/// no rank). `up` and `lead_held` are precomputed boolean flags; `live_queries`/
+/// `live_failures` are cumulative real-traffic counters at probe time.
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS probes (
         id                   INTEGER PRIMARY KEY,
@@ -29,7 +32,13 @@ const SCHEMA: &str = "
         ewma_ms              REAL,
         up                   INTEGER NOT NULL,
         consecutive_failures INTEGER NOT NULL,
-        detail               TEXT
+        detail               TEXT,
+        error_kind           TEXT,
+        live_ewma_ms         REAL,
+        live_queries         INTEGER NOT NULL,
+        live_failures        INTEGER NOT NULL,
+        rank                 INTEGER,
+        lead_held            INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_probes_time ON probes(time_ms);
     CREATE INDEX IF NOT EXISTS idx_probes_upstream ON probes(upstream);
@@ -39,15 +48,25 @@ const SCHEMA: &str = "
 // restart the log keeps growing above existing rows. Plain `INSERT` so a
 // (never-expected) id collision surfaces as an error rather than an overwrite.
 const INSERT_SQL: &str = "INSERT INTO probes
-    (time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, consecutive_failures, detail)
-    VALUES (?,?,?,?,?,?,?,?,?,?)";
+    (time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, consecutive_failures, detail, \
+     error_kind, live_ewma_ms, live_queries, live_failures, rank, lead_held)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+
+/// The columns the reader/writer depend on, in row order. Shared by the export
+/// and `recent` reads and the schema-compatibility probe so they can't drift.
+const COLUMNS: &str = "time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
+    consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, live_failures, \
+    rank, lead_held";
 
 /// Resolves every column the reader/writer depends on without returning rows, to
-/// detect an incompatible pre-existing schema (see [`QueryStore`]).
+/// detect an incompatible pre-existing schema (see [`QueryStore`]). An older DB
+/// missing the newer columns fails here, which routes [`ProbeStore::open`] to
+/// recreate it — acceptable for opt-in diagnostics.
 ///
 /// [`QueryStore`]: crate::store::QueryStore
 const SCHEMA_PROBE: &str = "SELECT id, time_ms, upstream, name, kind, outcome, rtt_ms, \
-    ewma_ms, up, consecutive_failures, detail FROM probes LIMIT 0";
+    ewma_ms, up, consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, \
+    live_failures, rank, lead_held FROM probes LIMIT 0";
 
 pub struct ProbeStore {
     /// All writes funnel through one connection so there is a single writer.
@@ -127,9 +146,8 @@ impl ProbeStore {
     /// upstream per minute), so materializing the whole table as one string is
     /// fine for the deployments this runs on.
     pub async fn export_jsonl(&self) -> turso::Result<String> {
-        let sql = "SELECT time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
-             consecutive_failures, detail FROM probes ORDER BY id ASC";
-        let mut rows = self.read.query(sql, ()).await?;
+        let sql = format!("SELECT {COLUMNS} FROM probes ORDER BY id ASC");
+        let mut rows = self.read.query(&sql, ()).await?;
         let mut out = String::new();
         while let Some(row) = rows.next().await? {
             let event = row_to_event(&row)?;
@@ -161,8 +179,7 @@ impl ProbeStore {
         };
         let n = params.len() + 1;
         let sql = format!(
-            "SELECT time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
-             consecutive_failures, detail FROM probes{where_sql} ORDER BY id DESC LIMIT ?{n}"
+            "SELECT {COLUMNS} FROM probes{where_sql} ORDER BY id DESC LIMIT ?{n}"
         );
         let mut params = params;
         params.push(Value::Integer(limit as i64));
@@ -188,11 +205,19 @@ fn insert_params(e: &ProbeEvent) -> Params {
         Value::Integer(e.up as i64),
         Value::Integer(e.consecutive_failures as i64),
         e.detail.clone().map(Value::Text).unwrap_or(Value::Null),
+        e.error_kind
+            .map(|k| Value::Text(k.as_str().into()))
+            .unwrap_or(Value::Null),
+        e.live_ewma_ms.map(Value::Real).unwrap_or(Value::Null),
+        Value::Integer(e.live_queries as i64),
+        Value::Integer(e.live_failures as i64),
+        e.rank.map(|r| Value::Integer(r as i64)).unwrap_or(Value::Null),
+        Value::Integer(e.lead_held as i64),
     ])
 }
 
-/// Reconstruct a [`ProbeEvent`] from a result row. Column order matches the
-/// SELECT in [`ProbeStore::recent`].
+/// Reconstruct a [`ProbeEvent`] from a result row. Column order matches
+/// [`COLUMNS`] (the shared SELECT list).
 fn row_to_event(row: &turso::Row) -> turso::Result<ProbeEvent> {
     Ok(ProbeEvent {
         time_ms: row.get(0)?,
@@ -205,6 +230,12 @@ fn row_to_event(row: &turso::Row) -> turso::Result<ProbeEvent> {
         up: row.get::<i64>(7)? != 0,
         consecutive_failures: row.get::<i64>(8)? as u32,
         detail: opt_text(row.get_value(9)?),
+        error_kind: opt_text(row.get_value(10)?).map(|s| ProbeErrorKind::from_label(&s)),
+        live_ewma_ms: opt_real(row.get_value(11)?),
+        live_queries: row.get::<i64>(12)? as u64,
+        live_failures: row.get::<i64>(13)? as u64,
+        rank: opt_int(row.get_value(14)?).map(|i| i as u16),
+        lead_held: row.get::<i64>(15)? != 0,
     })
 }
 
@@ -225,6 +256,13 @@ fn opt_text(v: Value) -> Option<String> {
     }
 }
 
+fn opt_int(v: Value) -> Option<i64> {
+    match v {
+        Value::Integer(i) => Some(i),
+        _ => None,
+    }
+}
+
 /// Remove a SQLite DB file and its WAL/journal sidecars so a corrupt or
 /// incompatible probe-log DB can be recreated clean. Best-effort.
 fn reset_db_files(path: &str) {
@@ -238,6 +276,7 @@ mod tests {
     use super::*;
 
     fn event(time_ms: i64, outcome: ProbeOutcome, rtt: Option<f64>) -> ProbeEvent {
+        let answered = outcome == ProbeOutcome::Answer;
         ProbeEvent {
             time_ms,
             upstream: "udp://1.1.1.1:53".into(),
@@ -246,9 +285,15 @@ mod tests {
             outcome,
             rtt_ms: rtt,
             ewma_ms: rtt,
-            up: outcome == ProbeOutcome::Answer,
-            consecutive_failures: if outcome == ProbeOutcome::Answer { 0 } else { 1 },
-            detail: (outcome != ProbeOutcome::Answer).then(|| "Timeout".to_string()),
+            up: answered,
+            consecutive_failures: if answered { 0 } else { 1 },
+            detail: (!answered).then(|| "Timeout".to_string()),
+            error_kind: (!answered).then_some(ProbeErrorKind::Timeout),
+            live_ewma_ms: Some(30.0),
+            live_queries: 42,
+            live_failures: 2,
+            rank: Some(0),
+            lead_held: false,
         }
     }
 
@@ -267,16 +312,25 @@ mod tests {
         let all = store.recent(None, 100).await.unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].time_ms, 3, "newest first");
-        // A failed probe round-trips with NULL rtt and a populated detail.
+        // A failed probe round-trips with NULL rtt, a populated detail, and a
+        // structured error kind.
         let timeout = all.iter().find(|e| e.outcome == ProbeOutcome::Timeout).unwrap();
         assert!(timeout.rtt_ms.is_none());
         assert!(!timeout.up);
         assert_eq!(timeout.detail.as_deref(), Some("Timeout"));
-        // A clean answer keeps its RTT/EWMA and has no detail.
+        assert_eq!(timeout.error_kind, Some(ProbeErrorKind::Timeout));
+        // A clean answer keeps its RTT/EWMA and has no detail/error kind.
         let answer = &all[0];
         assert_eq!(answer.rtt_ms, Some(15.0));
         assert_eq!(answer.kind, TransportKind::Udp);
         assert!(answer.detail.is_none());
+        assert!(answer.error_kind.is_none());
+        // The live-traffic snapshot and selection fields survive the round-trip.
+        assert_eq!(answer.live_ewma_ms, Some(30.0));
+        assert_eq!(answer.live_queries, 42);
+        assert_eq!(answer.live_failures, 2);
+        assert_eq!(answer.rank, Some(0));
+        assert!(!answer.lead_held);
     }
 
     #[tokio::test]

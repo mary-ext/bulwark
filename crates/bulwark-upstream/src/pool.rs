@@ -21,7 +21,7 @@ use crate::doq::DoqTransport;
 use crate::dot::DotTransport;
 use crate::error::{Result, SharedResult, UpstreamError};
 use crate::plain::{TcpTransport, UdpTransport};
-use crate::probe_log::{now_ms, ProbeEvent, ProbeLog, ProbeOutcome};
+use crate::probe_log::{now_ms, ProbeErrorKind, ProbeEvent, ProbeLog, ProbeOutcome};
 use crate::spec::{Host, TransportKind, UpstreamSpec};
 use crate::transport::{normalize_upstream_edns, QueryKey, Transport};
 
@@ -158,6 +158,18 @@ struct Health {
     total_failures: u64,
     /// Latency of the most recent live query (not probes), for the UI.
     last_rtt_ms: Option<f64>,
+    /// Smoothed latency of *live* queries, kept purely for telemetry (it is NOT a
+    /// routing input — see [`Health::routing_latency_ms`] for why). Probes log it
+    /// alongside the routing EWMA so analysis can compare the cache-hot probe RTT
+    /// against real serve latency. `live_samples` seeds it like the probe EWMA.
+    live_ewma_ms: f64,
+    live_samples: u64,
+    /// This upstream's position in the most recent selection ranking (0 = leader),
+    /// and whether it's currently the leader only because hysteresis held it.
+    /// Written by [`UpstreamPool::ordered`], read into probe telemetry so a row
+    /// can be tied to whether the upstream was actually carrying traffic.
+    last_rank: Option<u16>,
+    lead_held: bool,
     last_error: Option<String>,
     /// When this upstream is next due for a background probe. Rescheduled by each
     /// probe: a healthy probe pushes it out a full window, a failed one by an
@@ -178,6 +190,10 @@ impl Default for Health {
             total_queries: 0,
             total_failures: 0,
             last_rtt_ms: None,
+            live_ewma_ms: 0.0,
+            live_samples: 0,
+            last_rank: None,
+            lead_held: false,
             last_error: None,
             next_probe_at: None,
         }
@@ -201,6 +217,13 @@ impl Health {
         (self.probe_samples > 0).then_some(self.probe_ewma_ms)
     }
 
+    /// Smoothed *live*-query latency, `None` until the first live answer. Purely
+    /// telemetry (logged next to the routing EWMA for comparison) — never an input
+    /// to selection.
+    fn live_latency_ms(&self) -> Option<f64> {
+        (self.live_samples > 0).then_some(self.live_ewma_ms)
+    }
+
     /// The post-update fields a [`ProbeEvent`] persists, captured under the same
     /// lock acquisition that recorded the probe so the event reflects exactly the
     /// state the update produced.
@@ -209,6 +232,11 @@ impl Health {
             ewma_ms: self.routing_latency_ms(),
             up: self.up,
             consecutive_failures: self.consecutive_failures,
+            live_ewma_ms: self.live_latency_ms(),
+            live_queries: self.total_queries,
+            live_failures: self.total_failures,
+            rank: self.last_rank,
+            lead_held: self.lead_held,
         }
     }
 }
@@ -219,6 +247,11 @@ struct ProbeSnapshot {
     ewma_ms: Option<f64>,
     up: bool,
     consecutive_failures: u32,
+    live_ewma_ms: Option<f64>,
+    live_queries: u64,
+    live_failures: u64,
+    rank: Option<u16>,
+    lead_held: bool,
 }
 
 /// A single upstream and its live health.
@@ -234,10 +267,15 @@ impl Upstream {
     /// liveness, but deliberately does NOT touch the routing latency (that's the
     /// probe's job) or the probe cadence (probing runs independently so a busy
     /// upstream's estimate doesn't go stale).
-    fn record_live_success(&self, rtt: Duration) {
+    fn record_live_success(&self, rtt: Duration, alpha: f64) {
         let mut h = self.health.lock();
+        let ms = rtt.as_secs_f64() * 1000.0;
         h.total_queries += 1;
-        h.last_rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+        h.last_rtt_ms = Some(ms);
+        // Smooth live latency for telemetry only (probes log it next to the
+        // routing EWMA). This deliberately does NOT feed routing_latency_ms.
+        h.live_ewma_ms = ewma(h.live_samples, h.live_ewma_ms, ms, alpha);
+        h.live_samples += 1;
         h.consecutive_failures = 0;
         h.up = true;
         h.last_error = None;
@@ -521,6 +559,7 @@ impl UpstreamPool {
         v.sort_by_key(|u| u.sort_key());
 
         let mut leader = self.current_leader.lock();
+        let mut held_lead = false;
         if let Some(cur) = leader.as_ref() {
             if let Some(pos) = v.iter().position(|u| Arc::ptr_eq(u, cur)) {
                 // Only an off-front incumbent that's still eligible can be held,
@@ -533,12 +572,22 @@ impl UpstreamPool {
                         if inc - best <= switch_margin(inc) {
                             let held = v.remove(pos);
                             v.insert(0, held);
+                            held_lead = true;
                         }
                     }
                 }
             }
         }
         *leader = v.first().cloned();
+
+        // Stamp the resulting standing into each upstream's health so the probe
+        // telemetry can record where it sat — only the front upstream can be the
+        // hysteresis-held leader.
+        for (i, u) in v.iter().enumerate() {
+            let mut h = u.health.lock();
+            h.last_rank = Some(i.min(u16::MAX as usize) as u16);
+            h.lead_held = i == 0 && held_lead;
+        }
         v
     }
 
@@ -574,6 +623,7 @@ impl UpstreamPool {
                 let ordered = self.ordered();
                 let timeout = self.settings.query_timeout;
                 let threshold = self.settings.failure_threshold;
+                let alpha = self.settings.ewma_alpha;
                 // Forward only the EDNS we honour/key on: strip client options
                 // (ECS, COOKIE, NSID, …) so a query differing only in such an
                 // option can't be cross-served from this shared single-flight
@@ -581,7 +631,7 @@ impl UpstreamPool {
                 let mut q = query.clone();
                 normalize_upstream_edns(&mut q);
                 let fut: ResolveFuture =
-                    async move { resolve_sequential(ordered, q, timeout, threshold).await }
+                    async move { resolve_sequential(ordered, q, timeout, threshold, alpha).await }
                         .boxed()
                         .shared();
                 let mut map = self.inflight.lock();
@@ -729,6 +779,7 @@ async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, pro
     // field clones and the error-to-string entirely when off. `push` re-checks
     // the toggle as its own invariant.
     if probe_log.is_enabled() {
+        let error_kind = err.as_ref().map(ProbeErrorKind::from_error);
         probe_log.push(ProbeEvent {
             time_ms: now_ms(),
             upstream: up.spec.display.clone(),
@@ -740,6 +791,12 @@ async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, pro
             up: snap.up,
             consecutive_failures: snap.consecutive_failures,
             detail: err.map(|e| e.to_string()),
+            error_kind,
+            live_ewma_ms: snap.live_ewma_ms,
+            live_queries: snap.live_queries,
+            live_failures: snap.live_failures,
+            rank: snap.rank,
+            lead_held: snap.lead_held,
         });
     }
 }
@@ -784,6 +841,7 @@ async fn resolve_sequential(
     query: Message,
     timeout: Duration,
     threshold: u32,
+    alpha: f64,
 ) -> SharedResult<Resolved> {
     let mut last = UpstreamError::NoUpstreams;
     // A non-answer response (SERVFAIL/REFUSED/…) to hand back if no upstream
@@ -800,7 +858,7 @@ async fn resolve_sequential(
                 let rtt_ms = rtt.as_secs_f64() * 1000.0;
                 match classify(&resp) {
                     Verdict::Answer => {
-                        up.record_live_success(rtt);
+                        up.record_live_success(rtt, alpha);
                         return Ok(Resolved {
                             message: resp,
                             upstream: up.name.clone(),
