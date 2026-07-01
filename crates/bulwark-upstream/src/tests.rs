@@ -421,6 +421,54 @@ async fn leadership_is_sticky_within_the_switch_margin() {
     );
 }
 
+#[tokio::test]
+async fn recent_hard_failure_yields_leadership_then_reclaims_on_recovery() {
+    // A fast leader that takes a single hard failure (but hasn't yet crossed the
+    // down threshold) must yield the lead to a clean, slightly-slower peer — the
+    // probation tier overriding leadership hysteresis. Once its failure clears it
+    // is eligible to lead again, but only on the usual switch-margin terms.
+    let a = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 0)).await;
+    let b = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;
+    let pool = UpstreamPool::build(&[entry(a.addr), entry(b.addr)], settings())
+        .await
+        .unwrap();
+    pool.probe_all().await;
+    let a_up = pool.upstreams()[0].clone();
+    let b_up = pool.upstreams()[1].clone();
+    let leads = |pool: &UpstreamPool, who: &Arc<Upstream>| Arc::ptr_eq(&pool.ordered()[0], who);
+
+    // A is the sampled, clean leader; B is clean but slightly slower (within the
+    // switch margin, so ordinarily A would be held).
+    a_up.set_routing_latency_for_test(15.0);
+    b_up.set_routing_latency_for_test(17.0);
+    assert!(leads(&pool, &a_up), "clean fast upstream leads");
+
+    // A takes one hard failure without going down. Even though it's still faster
+    // and inside the margin, probation demotes it below clean B.
+    a_up.set_recent_failure_for_test();
+    b_up.set_routing_latency_for_test(17.0); // re-assert B clean; A stays 15ms
+    assert!(
+        leads(&pool, &b_up),
+        "an upstream on probation must not be held as leader over a clean peer"
+    );
+
+    // A's failure clears (a successful probe/live answer would do this). It's now
+    // clean again, but only 2ms faster than incumbent B — under the 5ms floor —
+    // so hysteresis keeps B. No ping-pong back to A.
+    a_up.set_routing_latency_for_test(15.0); // clears consecutive_failures
+    assert!(
+        leads(&pool, &b_up),
+        "a recovered-but-near-tied upstream doesn't reclaim; the incumbent is held"
+    );
+
+    // A pulls materially ahead (past the switch margin) → it reclaims the lead.
+    a_up.set_routing_latency_for_test(5.0);
+    assert!(
+        leads(&pool, &a_up),
+        "a recovered upstream that clears the switch margin reclaims leadership"
+    );
+}
+
 /// Poll `cond` until it's true or `timeout` elapses (panicking on timeout).
 async fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = std::time::Instant::now();

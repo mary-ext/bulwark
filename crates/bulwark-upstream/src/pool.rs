@@ -359,8 +359,9 @@ impl Upstream {
         (at > now).then(|| at - now)
     }
 
-    /// Sort key for live selection, ascending: healthy-and-sampled upstreams
-    /// first (ordered by latency), then healthy-but-unsampled, then down ones.
+    /// Sort key for live selection, ascending. Four tiers, best first:
+    /// healthy-sampled-clean, healthy-sampled-with-a-recent-hard-failure,
+    /// healthy-but-unsampled, then down.
     ///
     /// An unsampled upstream sorts *after* every proven-healthy one rather than
     /// as "fastest": we don't yet know its latency, so it must not preempt a
@@ -372,22 +373,47 @@ impl Upstream {
     /// threshold is crossed, so a never-sampled upstream still outranks a downed
     /// one. At cold start every upstream is unsampled and ties here, so the
     /// stable sort preserves configured order.
-    fn sort_key(&self) -> (bool, bool, u64) {
+    ///
+    /// `recent_hard_failure` is the probation tier: an upstream that took a hard
+    /// failure but hasn't yet crossed [`failure_threshold`] into `down` still
+    /// yields the lead to a clean peer, so an isolated timeout from the fast
+    /// leader costs one query, not repeated ones until it finally trips down.
+    /// The debt clears on the next successful probe or live answer (which zero
+    /// `consecutive_failures`), and a near-term recovery probe is already
+    /// scheduled by [`fold_failure`]. This must stay in lock-step with
+    /// [`routing_latency_if_eligible`]: an upstream on probation is *also*
+    /// barred from being held as leader by hysteresis, otherwise the hold would
+    /// yank it straight back to the front and cancel this demotion.
+    ///
+    /// [`failure_threshold`]: PoolSettings::failure_threshold
+    fn sort_key(&self) -> (bool, bool, bool, u64) {
         let h = self.health.lock();
         let down = !h.up;
         let est = h.routing_latency_ms();
         let unsampled = est.is_none();
+        let recent_hard_failure = h.consecutive_failures > 0;
         let lat = est.unwrap_or(0.0).round() as u64;
-        (down, unsampled, lat)
+        (down, unsampled, recent_hard_failure, lat)
     }
 
     /// Routing latency for leadership hysteresis: `Some(ms)` only when the
-    /// upstream is both up and probe-sampled. A down or never-sampled incumbent
-    /// returns `None` so hysteresis can't pin the lead on it — the ranking falls
-    /// through to the freshly sorted best instead.
+    /// upstream is up, probe-sampled, *and* carrying no recent hard failure. A
+    /// down, never-sampled, or on-probation incumbent returns `None` so
+    /// hysteresis can't pin the lead on it — the ranking falls through to the
+    /// freshly sorted best instead.
+    ///
+    /// The `consecutive_failures == 0` clause is what makes the probation tier in
+    /// [`sort_key`](Self::sort_key) actually bite: without it, an incumbent that
+    /// just took a hard failure (but is still `up`, since it hasn't reached
+    /// [`failure_threshold`](PoolSettings::failure_threshold)) would remain
+    /// hysteresis-eligible and get yanked back to the front by
+    /// [`ordered`](UpstreamPool::ordered), cancelling the demotion. It regains
+    /// eligibility once a clean probe or live answer clears the failure count.
     fn routing_latency_if_eligible(&self) -> Option<f64> {
         let h = self.health.lock();
-        h.up.then(|| h.routing_latency_ms()).flatten()
+        (h.up && h.consecutive_failures == 0)
+            .then(|| h.routing_latency_ms())
+            .flatten()
     }
 
     /// Force this upstream's routing latency (marking it up and sampled) so a test
@@ -399,6 +425,15 @@ impl Upstream {
         h.probe_samples = h.probe_samples.max(1);
         h.up = true;
         h.consecutive_failures = 0;
+    }
+
+    /// Put this upstream on the recent-hard-failure probation tier without
+    /// marking it down, so a test can exercise the interaction between probation
+    /// and leadership hysteresis. Kept below any sane `failure_threshold` so `up`
+    /// stays true.
+    #[cfg(test)]
+    pub(crate) fn set_recent_failure_for_test(&self) {
+        self.health.lock().consecutive_failures = 1;
     }
 
     /// A snapshot of this upstream's stats for the UI.
@@ -552,8 +587,10 @@ impl UpstreamPool {
     /// Lowest routing latency wins, then leadership hysteresis is applied: the
     /// standing leader is held at the front unless the sorted best beats it by the
     /// [`switch_margin`], so near-tied upstreams don't trade the lead every probe
-    /// and churn warm connections. An incumbent that has gone down or is unsampled
-    /// is not eligible to be held, so it falls through to the freshly sorted best.
+    /// and churn warm connections. An incumbent that has gone down, is unsampled,
+    /// or is on probation for a recent hard failure (see
+    /// [`routing_latency_if_eligible`](Upstream::routing_latency_if_eligible)) is
+    /// not eligible to be held, so it falls through to the freshly sorted best.
     pub(crate) fn ordered(&self) -> Vec<Arc<Upstream>> {
         let mut v: Vec<Arc<Upstream>> = self.upstreams.clone();
         v.sort_by_key(|u| u.sort_key());
