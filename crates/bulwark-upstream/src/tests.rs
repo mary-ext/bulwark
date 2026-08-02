@@ -12,8 +12,10 @@ use hickory_proto::rr::rdata::A;
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use tokio::net::UdpSocket;
 
+use tokio::sync::mpsc::Receiver;
+
 use crate::pool::{PoolEntry, PoolSettings, Upstream, UpstreamPool};
-use crate::probe_log::{ProbeLog, ProbeOutcome};
+use crate::probe_log::{ProbeEvent, ProbeLog, ProbeOutcome};
 use crate::spec::UpstreamSpec;
 use crate::transport::{decode, encode};
 
@@ -32,6 +34,9 @@ enum Behaviour {
     Code(ResponseCode),
     /// Receive but never respond (forces the client to time out).
     Drop,
+    /// Answer the *first* query after a delay (ms) and every later one at once —
+    /// the shape of a connection that must be re-established before it can serve.
+    SlowFirst(Ipv4Addr, u64),
 }
 
 async fn spawn_mock(behaviour: Behaviour) -> Mock {
@@ -46,9 +51,9 @@ async fn spawn_mock(behaviour: Behaviour) -> Mock {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            counter.fetch_add(1, Ordering::SeqCst);
+            let seen = counter.fetch_add(1, Ordering::SeqCst) + 1;
             let query = decode(&buf[..n]).unwrap();
-            match behaviour {
+            let (ip, delay) = match behaviour {
                 Behaviour::Drop => continue,
                 Behaviour::Code(rcode) => {
                     let mut resp = query.clone();
@@ -57,23 +62,25 @@ async fn spawn_mock(behaviour: Behaviour) -> Mock {
                     resp.metadata.recursion_available = true;
                     let bytes = encode(&resp).unwrap();
                     let _ = sock.send_to(&bytes, peer).await;
+                    continue;
                 }
-                Behaviour::Answer(ip, delay) => {
-                    if delay > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay)).await;
-                    }
-                    let mut resp = query.clone();
-                    resp.metadata.message_type = MessageType::Response;
-                    resp.metadata.response_code = ResponseCode::NoError;
-                    resp.metadata.recursion_available = true;
-                    if let Some(q) = query.queries.first() {
-                        let rec = Record::from_rdata(q.name().clone(), 60, RData::A(A(ip)));
-                        resp.answers.push(rec);
-                    }
-                    let bytes = encode(&resp).unwrap();
-                    let _ = sock.send_to(&bytes, peer).await;
-                }
+                Behaviour::Answer(ip, delay) => (ip, delay),
+                // Only the connection-establishing query is slow.
+                Behaviour::SlowFirst(ip, delay) => (ip, if seen > 1 { 0 } else { delay }),
+            };
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
             }
+            let mut resp = query.clone();
+            resp.metadata.message_type = MessageType::Response;
+            resp.metadata.response_code = ResponseCode::NoError;
+            resp.metadata.recursion_available = true;
+            if let Some(q) = query.queries.first() {
+                let rec = Record::from_rdata(q.name().clone(), 60, RData::A(A(ip)));
+                resp.answers.push(rec);
+            }
+            let bytes = encode(&resp).unwrap();
+            let _ = sock.send_to(&bytes, peer).await;
         }
     });
     Mock { addr, received }
@@ -104,6 +111,17 @@ fn entry(addr: SocketAddr) -> PoolEntry {
     }
 }
 
+/// A single-upstream pool with probe telemetry wired and enabled, plus the
+/// receiving end of its sink — the setup every probe-event test needs.
+async fn pool_with_probe_log(addr: SocketAddr) -> (UpstreamPool, Receiver<ProbeEvent>) {
+    let mut pool = UpstreamPool::build(&[entry(addr)], settings()).await.unwrap();
+    let probe_log = Arc::new(ProbeLog::new(true));
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    probe_log.set_sink(tx);
+    pool.set_probe_log(probe_log);
+    (pool, rx)
+}
+
 #[tokio::test]
 async fn resolves_via_udp_and_restores_id() {
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
@@ -121,13 +139,7 @@ async fn resolves_via_udp_and_restores_id() {
 #[tokio::test]
 async fn successful_probe_emits_telemetry_event() {
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
-    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
-        .await
-        .unwrap();
-    let probe_log = Arc::new(ProbeLog::new(true));
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    probe_log.set_sink(tx);
-    pool.set_probe_log(probe_log);
+    let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
 
     pool.probe_all().await;
 
@@ -135,6 +147,12 @@ async fn successful_probe_emits_telemetry_event() {
     assert_eq!(ev.outcome, ProbeOutcome::Answer);
     assert_eq!(ev.upstream, format!("udp://{}", mock.addr));
     assert!(ev.rtt_ms.is_some());
+    assert!(ev.first_rtt_ms.is_some(), "both shots answered, so both are recorded");
+    assert_eq!(
+        mock.received.load(Ordering::SeqCst),
+        2,
+        "one probe is two queries: warm the connection, then measure on it"
+    );
     assert!(ev.ewma_ms.is_some(), "first successful probe seeds the routing EWMA");
     assert!(ev.up);
     assert_eq!(ev.consecutive_failures, 0);
@@ -150,13 +168,7 @@ async fn successful_probe_emits_telemetry_event() {
 #[tokio::test]
 async fn probe_event_captures_live_traffic_and_rank() {
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
-    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
-        .await
-        .unwrap();
-    let probe_log = Arc::new(ProbeLog::new(true));
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    probe_log.set_sink(tx);
-    pool.set_probe_log(probe_log);
+    let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
 
     // A real query records a live RTT and stamps the selection rank; the next
     // probe should carry both alongside the routing EWMA.
@@ -178,24 +190,50 @@ async fn probe_event_captures_live_traffic_and_rank() {
 async fn failed_probe_emits_failure_event() {
     // The mock receives but never answers, so the probe times out.
     let mock = spawn_mock(Behaviour::Drop).await;
-    let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
-        .await
-        .unwrap();
-    let probe_log = Arc::new(ProbeLog::new(true));
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    probe_log.set_sink(tx);
-    pool.set_probe_log(probe_log);
+    let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
 
     pool.probe_all().await;
 
     let ev = rx.try_recv().expect("a probe event was emitted");
     assert_eq!(ev.outcome, ProbeOutcome::Timeout);
     assert!(ev.rtt_ms.is_none(), "a failed probe has no RTT");
+    assert!(ev.first_rtt_ms.is_none(), "the failed shot has no RTT either");
+    assert_eq!(
+        mock.received.load(Ordering::SeqCst),
+        1,
+        "a first shot that fails is the whole probe — no second shot is sent"
+    );
     assert!(ev.ewma_ms.is_none(), "no successful probe yet → no routing latency");
     assert!(ev.detail.is_some());
     // failure_threshold is 1 in test settings, so one failed probe marks it down.
     assert!(!ev.up);
     assert_eq!(ev.consecutive_failures, 1);
+}
+
+#[tokio::test]
+async fn probe_routes_on_the_second_shot_not_the_connection_setup() {
+    // The mock stalls its first answer and serves the rest at once — the shape of
+    // an upstream whose connection has idled out and must be re-established.
+    //
+    // Routing on that first shot is what let the ranking track connection warmth
+    // instead of upstream speed (see `probe_once`).
+    const SETUP_MS: u64 = 200;
+    let mock = spawn_mock(Behaviour::SlowFirst(Ipv4Addr::new(1, 2, 3, 4), SETUP_MS)).await;
+    let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
+
+    pool.probe_all().await;
+
+    let ev = rx.try_recv().expect("a probe event was emitted");
+    assert_eq!(ev.outcome, ProbeOutcome::Answer);
+    let first = ev.first_rtt_ms.expect("the setup shot answered");
+    let rtt = ev.rtt_ms.expect("the measured shot answered");
+    assert!(first >= SETUP_MS as f64, "the first shot pays the setup cost: {first}ms");
+    assert!(rtt < SETUP_MS as f64 / 2.0, "the routing figure skips it: {rtt}ms");
+    assert_eq!(
+        ev.ewma_ms,
+        Some(rtt),
+        "the first successful probe seeds the routing EWMA from the second shot"
+    );
 }
 
 #[tokio::test]
@@ -483,6 +521,9 @@ async fn per_upstream_probe_fires_once_then_defers() {
     // The pool spawns one probe task per upstream. A never-sampled upstream is
     // due within the (jittered) startup spread, so the task probes it once —
     // then, now healthy, it's deferred a full window and isn't re-probed soon.
+    //
+    // One probe is two queries: the first warms the connection and the second is
+    // the one that's timed (see `probe_once`), so the mock sees them in pairs.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
     let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -492,21 +533,21 @@ async fn per_upstream_probe_fires_once_then_defers() {
     pool.start_probing();
 
     wait_for(
-        || mock.received.load(Ordering::SeqCst) >= 1,
+        || mock.received.load(Ordering::SeqCst) >= 2,
         Duration::from_secs(4),
     )
     .await;
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
-        1,
-        "a never-sampled upstream is probed once on start"
+        2,
+        "a never-sampled upstream is probed once on start (two shots)"
     );
 
     // Now healthy → next probe is ~a minute out, so nothing fires meanwhile.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
-        1,
+        2,
         "a freshly-probed (healthy) upstream is not re-probed within the window"
     );
 }

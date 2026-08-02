@@ -68,7 +68,9 @@ impl Default for PoolSettings {
 /// marks an upstream down at once (see [`Upstream::record_live_failure`]), so
 /// this cadence only gates recovery of *idle* upstreams — which tolerates a
 /// slower beat. The idle-close window on the transports is shorter than this, so
-/// a connection still reclaims in the gap between probes.
+/// a connection still reclaims in the gap between probes — which is why
+/// [`probe_once`] fires two shots and routes on the second: at this cadence the
+/// first shot of an idle upstream measures a handshake, not the resolver.
 const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(180);
 
 /// First retry delay after an upstream goes down. A downed upstream gets no live
@@ -770,47 +772,84 @@ async fn probe_loop(up: Arc<Upstream>, settings: PoolSettings, probe_log: Arc<Pr
     }
 }
 
+/// The result of one shot of the two-shot probe: either a round-trip, or the
+/// outcome label and error behind a non-answer.
+enum Shot {
+    Answered(Duration),
+    Failed(ProbeOutcome, UpstreamError),
+}
+
+/// Send the probe query once and classify what came back.
+///
+/// The probe is a fixed, universally-answerable query (`NS .`), so unlike an
+/// arbitrary live query, *any* non-answer to it (SERVFAIL as much as REFUSED)
+/// genuinely indicts the resolver — a failed probe.
+async fn probe_shot(up: &Upstream, query: &Message, timeout: Duration) -> Shot {
+    let start = Instant::now();
+    match tokio::time::timeout(timeout, up.transport.query(query)).await {
+        Ok(Ok(resp)) => match classify(&resp) {
+            Verdict::Answer => Shot::Answered(start.elapsed()),
+            Verdict::Reject => Shot::Failed(ProbeOutcome::Reject, rcode_err(&resp)),
+            Verdict::SoftFail => Shot::Failed(ProbeOutcome::SoftFail, rcode_err(&resp)),
+        },
+        Ok(Err(e)) => Shot::Failed(ProbeOutcome::Error, e),
+        Err(_) => Shot::Failed(ProbeOutcome::Timeout, UpstreamError::Timeout),
+    }
+}
+
 /// Probe a single upstream once, fold the outcome into its health, and — when a
 /// sink is attached — persist the measurement and resulting health as a
 /// [`ProbeEvent`]. Building the event is gated on [`ProbeLog::is_enabled`], so a
 /// pool without telemetry wired pays nothing here beyond a relaxed atomic load.
+///
+/// The probe fires the same query **twice** and routes on the second round-trip.
+/// [`UPSTREAM_IDLE_TIMEOUT`] is far shorter than [`HEALTHY_PROBE_WINDOW`], so a
+/// single-shot probe of an idle upstream always paid a fresh QUIC/TLS handshake
+/// — while the leader, kept warm by live traffic, did not. Ranking on that
+/// measured connection warmth rather than upstream speed, and warmth follows
+/// whichever upstream already holds the lead, so the signal fed back into itself
+/// and pinned the leader in place. The first shot re-establishes the connection
+/// (or reuses a live one); the second runs on it either way, so every upstream is
+/// measured warm regardless of whether it is carrying traffic.
+///
+/// Raising the idle window past the probe window would not fix this: public
+/// resolvers close idle connections on their own schedule, so some upstreams
+/// would stay warm and others would not, leaving an unevenly biased signal.
+///
+/// A failing first shot ends the probe: no second shot is sent, so a dead
+/// upstream still costs one timeout rather than two. Health is otherwise driven
+/// by whichever shot failed, which does give a probe two chances to fail where it
+/// once had one. The second shot runs on a connection the first just proved
+/// working, so its failure rate is far below the first's — but a probe failure is
+/// now a slightly stronger claim than before, and `failure_threshold` should be
+/// read in that light.
+///
+/// [`UPSTREAM_IDLE_TIMEOUT`]: crate::transport::UPSTREAM_IDLE_TIMEOUT
 async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, probe_log: &ProbeLog) {
-    let start = Instant::now();
+    // Route on the second shot, but keep the first: their difference is the
+    // connection-setup cost, which the telemetry records for later analysis.
+    let (first_rtt_ms, shot) = match probe_shot(up, query, settings.query_timeout).await {
+        Shot::Answered(first) => (
+            Some(first.as_secs_f64() * 1000.0),
+            probe_shot(up, query, settings.query_timeout).await,
+        ),
+        failed => (None, failed),
+    };
+
     // Each arm records health (under one lock, returning the resulting snapshot)
     // and surfaces the non-answer error, if any. The error is kept as a value and
     // only stringified for the event below, so a disabled probe log allocates
     // nothing here.
-    let (outcome, rtt_ms, snap, err) =
-        match tokio::time::timeout(settings.query_timeout, up.transport.query(query)).await {
-            // The probe is a fixed, universally-answerable query (`NS .`), so
-            // unlike an arbitrary live query, *any* non-answer to it (SERVFAIL as
-            // much as REFUSED) genuinely indicts the resolver — failed probe.
-            Ok(Ok(resp)) => match classify(&resp) {
-                Verdict::Answer => {
-                    let rtt = start.elapsed();
-                    let snap = up.record_probe_success(rtt, settings.ewma_alpha);
-                    (ProbeOutcome::Answer, Some(rtt.as_secs_f64() * 1000.0), snap, None)
-                }
-                verdict => {
-                    let err = rcode_err(&resp);
-                    let snap = up.record_probe_failure(&err, settings.failure_threshold);
-                    let outcome = match verdict {
-                        Verdict::Reject => ProbeOutcome::Reject,
-                        _ => ProbeOutcome::SoftFail,
-                    };
-                    (outcome, None, snap, Some(err))
-                }
-            },
-            Ok(Err(e)) => {
-                let snap = up.record_probe_failure(&e, settings.failure_threshold);
-                (ProbeOutcome::Error, None, snap, Some(e))
-            }
-            Err(_) => {
-                let err = UpstreamError::Timeout;
-                let snap = up.record_probe_failure(&err, settings.failure_threshold);
-                (ProbeOutcome::Timeout, None, snap, Some(err))
-            }
-        };
+    let (outcome, rtt_ms, snap, err) = match shot {
+        Shot::Answered(rtt) => {
+            let snap = up.record_probe_success(rtt, settings.ewma_alpha);
+            (ProbeOutcome::Answer, Some(rtt.as_secs_f64() * 1000.0), snap, None)
+        }
+        Shot::Failed(outcome, e) => {
+            let snap = up.record_probe_failure(&e, settings.failure_threshold);
+            (outcome, None, snap, Some(e))
+        }
+    };
 
     // Build and persist the event only when telemetry is on; this gate skips the
     // field clones and the error-to-string entirely when off. `push` re-checks
@@ -824,6 +863,7 @@ async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, pro
             kind: up.spec.kind,
             outcome,
             rtt_ms,
+            first_rtt_ms,
             ewma_ms: snap.ewma_ms,
             up: snap.up,
             consecutive_failures: snap.consecutive_failures,

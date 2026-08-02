@@ -14,8 +14,9 @@
 use bulwark_upstream::{ProbeErrorKind, ProbeEvent, ProbeOutcome, TransportKind};
 use turso::{params::Params, Builder, Connection, Value};
 
-/// The schema. `rtt_ms`, `ewma_ms`, `detail`, `error_kind`, `live_ewma_ms`, and
-/// `rank` are NULL when they don't apply (a failed probe has no RTT; an upstream
+/// The schema. `rtt_ms`, `first_rtt_ms`, `ewma_ms`, `detail`, `error_kind`,
+/// `live_ewma_ms`, and `rank` are NULL when they don't apply (a failed probe has
+/// no RTT; a probe whose first shot failed has no first RTT either; an upstream
 /// with no successful probe yet has no EWMA; a clean answer has no detail/error
 /// kind; an upstream with no live traffic has no live EWMA; an unranked one has
 /// no rank). `up` and `lead_held` are precomputed boolean flags; `live_queries`/
@@ -29,6 +30,7 @@ const SCHEMA: &str = "
         kind                 TEXT NOT NULL,
         outcome              TEXT NOT NULL,
         rtt_ms               REAL,
+        first_rtt_ms         REAL,
         ewma_ms              REAL,
         up                   INTEGER NOT NULL,
         consecutive_failures INTEGER NOT NULL,
@@ -48,25 +50,27 @@ const SCHEMA: &str = "
 // restart the log keeps growing above existing rows. Plain `INSERT` so a
 // (never-expected) id collision surfaces as an error rather than an overwrite.
 const INSERT_SQL: &str = "INSERT INTO probes
-    (time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, consecutive_failures, detail, \
-     error_kind, live_ewma_ms, live_queries, live_failures, rank, lead_held)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    (time_ms, upstream, name, kind, outcome, rtt_ms, first_rtt_ms, ewma_ms, up, \
+     consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, live_failures, rank, \
+     lead_held)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
 /// The columns the reader/writer depend on, in row order. Shared by the export
 /// and `recent` reads and the schema-compatibility probe so they can't drift.
-const COLUMNS: &str = "time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
+const COLUMNS: &str = "time_ms, upstream, name, kind, outcome, rtt_ms, first_rtt_ms, ewma_ms, up, \
     consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, live_failures, \
     rank, lead_held";
 
-/// Resolves every column the reader/writer depends on without returning rows, to
-/// detect an incompatible pre-existing schema (see [`QueryStore`]). An older DB
-/// missing the newer columns fails here, which routes [`ProbeStore::open`] to
-/// recreate it — acceptable for opt-in diagnostics.
+/// Columns added after the table's first release, applied to a pre-existing DB
+/// before the compatibility probe runs. Each is `ALTER TABLE … ADD COLUMN`, whose
+/// error on an already-current table is expected and ignored — that is what makes
+/// this idempotent. Without it, an added column would fail [`SCHEMA_PROBE`] and
+/// route [`ProbeStore::open`] to wipe the file; the log's whole value is the
+/// months of history that would destroy.
 ///
-/// [`QueryStore`]: crate::store::QueryStore
-const SCHEMA_PROBE: &str = "SELECT id, time_ms, upstream, name, kind, outcome, rtt_ms, \
-    ewma_ms, up, consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, \
-    live_failures, rank, lead_held FROM probes LIMIT 0";
+/// Only additive, nullable columns belong here. A change the reader can't take
+/// (a dropped or retyped column) should still fall through to the recreate path.
+const MIGRATIONS: &[&str] = &["ALTER TABLE probes ADD COLUMN first_rtt_ms REAL"];
 
 pub struct ProbeStore {
     /// All writes funnel through one connection so there is a single writer.
@@ -96,8 +100,15 @@ impl ProbeStore {
         let db = Builder::new_local(path).build().await?;
         let write = db.connect()?;
         write.execute_batch(SCHEMA).await?;
-        // Probe that a pre-existing table actually has our columns.
-        write.query(SCHEMA_PROBE, ()).await?;
+        // Bring an older table up to the current columns. Each statement errors
+        // if it has already been applied, which is the idempotency check.
+        for sql in MIGRATIONS {
+            let _ = write.execute(*sql, ()).await;
+        }
+        // Probe that the table really resolves every column the reader needs,
+        // built from the same list the reads use so the two can't drift.
+        let compat = format!("SELECT id, {COLUMNS} FROM probes LIMIT 0");
+        write.query(&compat, ()).await?;
         let read = db.connect()?;
         Ok(Self {
             write: tokio::sync::Mutex::new(write),
@@ -201,6 +212,7 @@ fn insert_params(e: &ProbeEvent) -> Params {
         Value::Text(e.kind.as_str().into()),
         Value::Text(e.outcome.as_str().into()),
         e.rtt_ms.map(Value::Real).unwrap_or(Value::Null),
+        e.first_rtt_ms.map(Value::Real).unwrap_or(Value::Null),
         e.ewma_ms.map(Value::Real).unwrap_or(Value::Null),
         Value::Integer(e.up as i64),
         Value::Integer(e.consecutive_failures as i64),
@@ -226,16 +238,17 @@ fn row_to_event(row: &turso::Row) -> turso::Result<ProbeEvent> {
         kind: TransportKind::from_label(&row.get::<String>(3)?),
         outcome: ProbeOutcome::from_label(&row.get::<String>(4)?),
         rtt_ms: opt_real(row.get_value(5)?),
-        ewma_ms: opt_real(row.get_value(6)?),
-        up: row.get::<i64>(7)? != 0,
-        consecutive_failures: row.get::<i64>(8)? as u32,
-        detail: opt_text(row.get_value(9)?),
-        error_kind: opt_text(row.get_value(10)?).map(|s| ProbeErrorKind::from_label(&s)),
-        live_ewma_ms: opt_real(row.get_value(11)?),
-        live_queries: row.get::<i64>(12)? as u64,
-        live_failures: row.get::<i64>(13)? as u64,
-        rank: opt_int(row.get_value(14)?).map(|i| i as u16),
-        lead_held: row.get::<i64>(15)? != 0,
+        first_rtt_ms: opt_real(row.get_value(6)?),
+        ewma_ms: opt_real(row.get_value(7)?),
+        up: row.get::<i64>(8)? != 0,
+        consecutive_failures: row.get::<i64>(9)? as u32,
+        detail: opt_text(row.get_value(10)?),
+        error_kind: opt_text(row.get_value(11)?).map(|s| ProbeErrorKind::from_label(&s)),
+        live_ewma_ms: opt_real(row.get_value(12)?),
+        live_queries: row.get::<i64>(13)? as u64,
+        live_failures: row.get::<i64>(14)? as u64,
+        rank: opt_int(row.get_value(15)?).map(|i| i as u16),
+        lead_held: row.get::<i64>(16)? != 0,
     })
 }
 
@@ -284,6 +297,8 @@ mod tests {
             kind: TransportKind::Udp,
             outcome,
             rtt_ms: rtt,
+            // The first shot pays the handshake the second one skips.
+            first_rtt_ms: rtt.map(|r| r + 30.0),
             ewma_ms: rtt,
             up: answered,
             consecutive_failures: if answered { 0 } else { 1 },
@@ -316,12 +331,15 @@ mod tests {
         // structured error kind.
         let timeout = all.iter().find(|e| e.outcome == ProbeOutcome::Timeout).unwrap();
         assert!(timeout.rtt_ms.is_none());
+        assert!(timeout.first_rtt_ms.is_none());
         assert!(!timeout.up);
         assert_eq!(timeout.detail.as_deref(), Some("Timeout"));
         assert_eq!(timeout.error_kind, Some(ProbeErrorKind::Timeout));
         // A clean answer keeps its RTT/EWMA and has no detail/error kind.
         let answer = &all[0];
         assert_eq!(answer.rtt_ms, Some(15.0));
+        // Both shots round-trip, so analysis can recover the setup cost.
+        assert_eq!(answer.first_rtt_ms, Some(45.0));
         assert_eq!(answer.kind, TransportKind::Udp);
         assert!(answer.detail.is_none());
         assert!(answer.error_kind.is_none());
@@ -331,6 +349,53 @@ mod tests {
         assert_eq!(answer.live_failures, 2);
         assert_eq!(answer.rank, Some(0));
         assert!(!answer.lead_held);
+    }
+
+    #[tokio::test]
+    async fn added_column_migrates_without_discarding_history() {
+        // A probe DB written before `first_rtt_ms` existed must survive the
+        // upgrade. The log's whole value is its months of history, so an added
+        // column has to migrate in place rather than fall through to the
+        // wipe-and-recreate path that `open` keeps for genuinely unreadable DBs.
+        let dir = std::env::temp_dir().join(format!("bulwark-probe-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("probes.db");
+        let path_str = path.to_str().unwrap();
+        reset_db_files(path_str);
+
+        // Build the pre-migration table by hand, minus the new column.
+        let old_schema = SCHEMA.replace("first_rtt_ms         REAL,\n", "");
+        assert!(!old_schema.contains("first_rtt_ms"), "old schema lacks the column");
+        let db = Builder::new_local(path_str).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute_batch(&old_schema).await.unwrap();
+        conn.execute(
+            "INSERT INTO probes (time_ms, upstream, name, kind, outcome, rtt_ms, ewma_ms, up, \
+             consecutive_failures, live_queries, live_failures, lead_held) \
+             VALUES (7, 'udp://1.1.1.1:53', 'cloudflare', 'udp', 'answer', 12.0, 12.0, 1, 0, 5, 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        drop(db);
+
+        // Reopening with the current code migrates rather than recreating.
+        let store = ProbeStore::open(path_str).await.unwrap();
+        let all = store.recent(None, 100).await.unwrap();
+        assert_eq!(all.len(), 1, "the pre-migration row survived the upgrade");
+        assert_eq!(all[0].time_ms, 7);
+        assert_eq!(all[0].rtt_ms, Some(12.0));
+        assert!(all[0].first_rtt_ms.is_none(), "rows predating the column read as NULL");
+
+        // New rows carry the column, and a second open is a no-op.
+        store.insert_batch(&[event(8, ProbeOutcome::Answer, Some(20.0))]).await.unwrap();
+        drop(store);
+        let store = ProbeStore::open(path_str).await.unwrap();
+        let all = store.recent(None, 100).await.unwrap();
+        assert_eq!(all.len(), 2, "reopening an already-migrated DB keeps both rows");
+        assert_eq!(all[0].first_rtt_ms, Some(50.0));
+        reset_db_files(path_str);
     }
 
     #[tokio::test]

@@ -163,7 +163,19 @@ pub struct ProbeEvent {
     pub kind: TransportKind,
     pub outcome: ProbeOutcome,
     /// Measured round-trip of this probe, present only on a successful answer.
+    /// The routing signal: the upstream's answer latency on an already-open
+    /// connection, with setup excluded. A probe fires two shots and this is the
+    /// second — see [`crate::pool`] for why.
     pub rtt_ms: Option<f64>,
+    /// Round-trip of the probe's *first* shot, present only when that shot
+    /// answered. It arrives at an arbitrary point in the upstream's idle cycle,
+    /// so it pays a full QUIC/TLS handshake when the connection has timed out
+    /// since the last query, and nothing extra when one is still open.
+    ///
+    /// `first_rtt_ms - rtt_ms` is therefore the connection-setup cost — what the
+    /// first query of a browsing burst pays. Recorded for analysis only; never an
+    /// input to selection.
+    pub first_rtt_ms: Option<f64>,
     /// The smoothed routing latency *after* folding this sample in — i.e. the
     /// figure selection would rank by. `None` until the first successful probe.
     pub ewma_ms: Option<f64>,
@@ -348,6 +360,7 @@ mod tests {
             kind: TransportKind::Udp,
             outcome: ProbeOutcome::Answer,
             rtt_ms: Some(12.0),
+            first_rtt_ms: Some(48.0),
             ewma_ms: Some(12.0),
             up: true,
             consecutive_failures: 0,
