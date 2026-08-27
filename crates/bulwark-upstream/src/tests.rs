@@ -18,24 +18,15 @@ use crate::pool::{PoolEntry, PoolSettings, Upstream, UpstreamPool};
 use crate::probe_log::{ProbeEvent, ProbeLog, ProbeOutcome};
 use crate::spec::UpstreamSpec;
 use crate::transport::{decode, encode};
-
-/// A controllable mock DNS server.
 struct Mock {
     addr: SocketAddr,
     received: Arc<AtomicU64>,
 }
-
-/// Behaviour of the mock for each request.
 #[derive(Clone, Copy)]
 enum Behaviour {
-    /// Answer with the given A record after an optional delay (ms).
     Answer(Ipv4Addr, u64),
-    /// Reply immediately with the given response code and no answer records.
     Code(ResponseCode),
-    /// Receive but never respond (forces the client to time out).
     Drop,
-    /// Answer the *first* query after a delay (ms) and every later one at once —
-    /// the shape of a connection that must be re-established before it can serve.
     SlowFirst(Ipv4Addr, u64),
 }
 
@@ -65,7 +56,6 @@ async fn spawn_mock(behaviour: Behaviour) -> Mock {
                     continue;
                 }
                 Behaviour::Answer(ip, delay) => (ip, delay),
-                // Only the connection-establishing query is slow.
                 Behaviour::SlowFirst(ip, delay) => (ip, if seen > 1 { 0 } else { delay }),
             };
             if delay > 0 {
@@ -110,11 +100,10 @@ fn entry(addr: SocketAddr) -> PoolEntry {
         name: None,
     }
 }
-
-/// A single-upstream pool with probe telemetry wired and enabled, plus the
-/// receiving end of its sink — the setup every probe-event test needs.
 async fn pool_with_probe_log(addr: SocketAddr) -> (UpstreamPool, Receiver<ProbeEvent>) {
-    let mut pool = UpstreamPool::build(&[entry(addr)], settings()).await.unwrap();
+    let mut pool = UpstreamPool::build(&[entry(addr)], settings())
+        .await
+        .unwrap();
     let probe_log = Arc::new(ProbeLog::new(true));
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     probe_log.set_sink(tx);
@@ -147,18 +136,26 @@ async fn successful_probe_emits_telemetry_event() {
     assert_eq!(ev.outcome, ProbeOutcome::Answer);
     assert_eq!(ev.upstream, format!("udp://{}", mock.addr));
     assert!(ev.rtt_ms.is_some());
-    assert!(ev.first_rtt_ms.is_some(), "both shots answered, so both are recorded");
+    assert!(
+        ev.first_rtt_ms.is_some(),
+        "both shots answered, so both are recorded"
+    );
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
         2,
         "one probe is two queries: warm the connection, then measure on it"
     );
-    assert!(ev.ewma_ms.is_some(), "first successful probe seeds the routing EWMA");
+    assert!(
+        ev.ewma_ms.is_some(),
+        "first successful probe seeds the routing EWMA"
+    );
     assert!(ev.up);
     assert_eq!(ev.consecutive_failures, 0);
     assert!(ev.detail.is_none(), "a clean answer carries no detail");
-    assert!(ev.error_kind.is_none(), "a clean answer carries no error kind");
-    // No live traffic and no selection have happened yet, so those fields are blank.
+    assert!(
+        ev.error_kind.is_none(),
+        "a clean answer carries no error kind"
+    );
     assert!(ev.live_ewma_ms.is_none(), "no live queries → no live EWMA");
     assert_eq!(ev.live_queries, 0);
     assert!(ev.rank.is_none(), "no selection has run yet");
@@ -169,9 +166,6 @@ async fn successful_probe_emits_telemetry_event() {
 async fn probe_event_captures_live_traffic_and_rank() {
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
     let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
-
-    // A real query records a live RTT and stamps the selection rank; the next
-    // probe should carry both alongside the routing EWMA.
     pool.resolve(&make_query("a.test.")).await.unwrap();
     pool.probe_all().await;
 
@@ -183,12 +177,14 @@ async fn probe_event_captures_live_traffic_and_rank() {
     assert_eq!(ev.live_queries, 1);
     assert_eq!(ev.live_failures, 0);
     assert_eq!(ev.rank, Some(0), "the sole upstream ranks first");
-    assert!(!ev.lead_held, "a raw-fastest leader isn't a hysteresis hold");
+    assert!(
+        !ev.lead_held,
+        "a raw-fastest leader isn't a hysteresis hold"
+    );
 }
 
 #[tokio::test]
 async fn failed_probe_emits_failure_event() {
-    // The mock receives but never answers, so the probe times out.
     let mock = spawn_mock(Behaviour::Drop).await;
     let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
 
@@ -197,26 +193,26 @@ async fn failed_probe_emits_failure_event() {
     let ev = rx.try_recv().expect("a probe event was emitted");
     assert_eq!(ev.outcome, ProbeOutcome::Timeout);
     assert!(ev.rtt_ms.is_none(), "a failed probe has no RTT");
-    assert!(ev.first_rtt_ms.is_none(), "the failed shot has no RTT either");
+    assert!(
+        ev.first_rtt_ms.is_none(),
+        "the failed shot has no RTT either"
+    );
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
         1,
         "a first shot that fails is the whole probe — no second shot is sent"
     );
-    assert!(ev.ewma_ms.is_none(), "no successful probe yet → no routing latency");
+    assert!(
+        ev.ewma_ms.is_none(),
+        "no successful probe yet → no routing latency"
+    );
     assert!(ev.detail.is_some());
-    // failure_threshold is 1 in test settings, so one failed probe marks it down.
     assert!(!ev.up);
     assert_eq!(ev.consecutive_failures, 1);
 }
 
 #[tokio::test]
 async fn probe_routes_on_the_second_shot_not_the_connection_setup() {
-    // The mock stalls its first answer and serves the rest at once — the shape of
-    // an upstream whose connection has idled out and must be re-established.
-    //
-    // Routing on that first shot is what let the ranking track connection warmth
-    // instead of upstream speed (see `probe_once`).
     const SETUP_MS: u64 = 200;
     let mock = spawn_mock(Behaviour::SlowFirst(Ipv4Addr::new(1, 2, 3, 4), SETUP_MS)).await;
     let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
@@ -227,8 +223,14 @@ async fn probe_routes_on_the_second_shot_not_the_connection_setup() {
     assert_eq!(ev.outcome, ProbeOutcome::Answer);
     let first = ev.first_rtt_ms.expect("the setup shot answered");
     let rtt = ev.rtt_ms.expect("the measured shot answered");
-    assert!(first >= SETUP_MS as f64, "the first shot pays the setup cost: {first}ms");
-    assert!(rtt < SETUP_MS as f64 / 2.0, "the routing figure skips it: {rtt}ms");
+    assert!(
+        first >= SETUP_MS as f64,
+        "the first shot pays the setup cost: {first}ms"
+    );
+    assert!(
+        rtt < SETUP_MS as f64 / 2.0,
+        "the routing figure skips it: {rtt}ms"
+    );
     assert_eq!(
         ev.ewma_ms,
         Some(rtt),
@@ -242,26 +244,18 @@ async fn udp_socket_idle_closes_then_redials() {
     use crate::transport::Transport;
 
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
-    // A short idle window so the test drives the close/redial cycle in <1s.
     let t = UdpTransport::with_idle_timeout(mock.addr, Duration::from_millis(150));
-
-    // First query dials the persistent socket; its reader is alive afterwards.
     let r1 = t.query(&make_query("example.com.")).await.unwrap();
     assert_eq!(r1.answers.len(), 1);
     assert!(
         !t.cached_conn_is_dead().await,
         "socket should be live immediately after a query"
     );
-
-    // Go quiet past the idle window: the reader self-closes, freeing its 64 KiB
-    // buffer and ending the task, and marks the cached connection dead.
     tokio::time::sleep(Duration::from_millis(350)).await;
     assert!(
         t.cached_conn_is_dead().await,
         "socket should idle-close after the idle window elapses with no traffic"
     );
-
-    // A fresh query transparently re-dials and still resolves correctly.
     let r2 = t.query(&make_query("example.com.")).await.unwrap();
     assert_eq!(r2.answers.len(), 1);
     assert!(
@@ -273,7 +267,6 @@ async fn udp_socket_idle_closes_then_redials() {
 
 #[tokio::test]
 async fn single_flight_coalesces_identical_queries() {
-    // Slow answer so concurrent callers all join the in-flight request.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(9, 9, 9, 9), 150)).await;
     let pool = Arc::new(
         UpstreamPool::build(&[entry(mock.addr)], settings())
@@ -291,7 +284,6 @@ async fn single_flight_coalesces_identical_queries() {
     for h in handles {
         assert!(h.await.unwrap());
     }
-    // Despite 16 concurrent callers, only ONE request hit the upstream.
     assert_eq!(mock.received.load(Ordering::SeqCst), 1);
 }
 
@@ -299,7 +291,6 @@ async fn single_flight_coalesces_identical_queries() {
 async fn sequential_failover_to_healthy_upstream() {
     let dead = spawn_mock(Behaviour::Drop).await;
     let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(5, 5, 5, 5), 0)).await;
-    // Dead listed first; the pool must fail over to the good one.
     let pool = UpstreamPool::build(&[entry(dead.addr), entry(good.addr)], settings())
         .await
         .unwrap();
@@ -311,29 +302,22 @@ async fn sequential_failover_to_healthy_upstream() {
 
 #[tokio::test]
 async fn dead_from_start_upstream_is_demoted() {
-    // An upstream that has *never* succeeded must still be marked down and sorted
-    // last once it crosses the failure threshold — the bug was that a
-    // never-successful upstream (samples == 0) stayed "up" forever and kept being
-    // tried first, waiting out its timeout on every query.
     let dead = spawn_mock(Behaviour::Drop).await;
     let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(4, 4, 4, 4), 0)).await;
     let pool = UpstreamPool::build(&[entry(dead.addr), entry(good.addr)], settings())
         .await
         .unwrap();
-
-    // First query: dead times out, fails over to good.
     let r1 = pool.resolve(&make_query("a.test.")).await.unwrap();
     assert_eq!(r1.upstream, format!("udp://{}", good.addr));
-
-    // Dead is now reported down (previously it showed up because samples == 0).
     let stats = pool.stats();
     let dead_stat = stats
         .iter()
         .find(|s| s.spec.contains(&dead.addr.to_string()))
         .unwrap();
-    assert!(!dead_stat.up, "a dead-from-start upstream must be marked down");
-
-    // Subsequent queries skip the demoted upstream entirely.
+    assert!(
+        !dead_stat.up,
+        "a dead-from-start upstream must be marked down"
+    );
     let before = dead.received.load(Ordering::SeqCst);
     let r2 = pool.resolve(&make_query("b.test.")).await.unwrap();
     assert_eq!(r2.upstream, format!("udp://{}", good.addr));
@@ -348,7 +332,6 @@ async fn dead_from_start_upstream_is_demoted() {
 async fn prefers_fastest_upstream_after_probing() {
     let slow = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 120)).await;
     let fast = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;
-    // Slow is listed first, but probing should make the pool prefer the fast one.
     let pool = UpstreamPool::build(&[entry(slow.addr), entry(fast.addr)], settings())
         .await
         .unwrap();
@@ -360,8 +343,6 @@ async fn prefers_fastest_upstream_after_probing() {
     for _ in 0..3 {
         pool.resolve(&make_query("speed.test.")).await.unwrap();
     }
-
-    // The fast upstream should have taken the real queries.
     assert_eq!(slow.received.load(Ordering::SeqCst), baseline_slow);
     assert_eq!(fast.received.load(Ordering::SeqCst), baseline_fast + 3);
 
@@ -375,21 +356,12 @@ async fn prefers_fastest_upstream_after_probing() {
 
 #[tokio::test]
 async fn known_leader_preferred_over_freshly_added_unknown() {
-    // A proven, sampled upstream must keep live traffic when a brand-new,
-    // never-sampled upstream is added ahead of it on reload. Previously the new
-    // upstream sorted as latency 0 ("fastest") and stole the next query — costing
-    // a full timeout if it happened to be a black hole.
     let known = spawn_mock(Behaviour::Answer(Ipv4Addr::new(5, 5, 5, 5), 0)).await;
     let old = UpstreamPool::build(&[entry(known.addr)], settings())
         .await
         .unwrap();
-    // Routing latency is the probe RTT, so a probe (not a live query) is what
-    // makes the known upstream count as "sampled".
     old.probe_all().await;
     let known_after_warmup = known.received.load(Ordering::SeqCst);
-
-    // Reload: a new upstream is listed FIRST, the known one second. The new pool
-    // adopts the known upstream's sampled health; the added one stays unsampled.
     let added = spawn_mock(Behaviour::Answer(Ipv4Addr::new(9, 9, 9, 9), 0)).await;
     let new = UpstreamPool::build(&[entry(added.addr), entry(known.addr)], settings())
         .await
@@ -415,42 +387,30 @@ async fn known_leader_preferred_over_freshly_added_unknown() {
 
 #[tokio::test]
 async fn leadership_is_sticky_within_the_switch_margin() {
-    // Selection is lowest-latency-wins, but a challenger only *takes* the lead once
-    // it clears the switch margin — so near-tied upstreams don't trade leadership
-    // (and churn warm connections) over sub-margin probe noise.
     let a = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 0)).await;
     let b = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;
     let pool = UpstreamPool::build(&[entry(a.addr), entry(b.addr)], settings())
         .await
         .unwrap();
-    // Sample both so each has a routing latency; we then drive the EWMAs directly.
     pool.probe_all().await;
     let a_up = pool.upstreams()[0].clone();
     let b_up = pool.upstreams()[1].clone();
     let leads = |pool: &UpstreamPool, who: &Arc<Upstream>| Arc::ptr_eq(&pool.ordered()[0], who);
-
-    // A is clearly fastest → it leads.
     a_up.set_routing_latency_for_test(15.0);
     b_up.set_routing_latency_for_test(24.0);
     assert!(leads(&pool, &a_up));
-
-    // A drifts to just behind B, but inside the margin → incumbent A is held.
     a_up.set_routing_latency_for_test(24.0);
     b_up.set_routing_latency_for_test(23.0);
     assert!(
         leads(&pool, &a_up),
         "incumbent held while the challenger leads by less than the switch margin"
     );
-
-    // B pulls materially ahead, clearing the margin → leadership moves to B.
     a_up.set_routing_latency_for_test(24.0);
     b_up.set_routing_latency_for_test(15.0);
     assert!(
         leads(&pool, &b_up),
         "a challenger past the switch margin takes leadership"
     );
-
-    // B is now the sticky incumbent: A nibbling back inside the margin doesn't flip it.
     a_up.set_routing_latency_for_test(14.0);
     b_up.set_routing_latency_for_test(15.0);
     assert!(
@@ -461,10 +421,6 @@ async fn leadership_is_sticky_within_the_switch_margin() {
 
 #[tokio::test]
 async fn recent_hard_failure_yields_leadership_then_reclaims_on_recovery() {
-    // A fast leader that takes a single hard failure (but hasn't yet crossed the
-    // down threshold) must yield the lead to a clean, slightly-slower peer — the
-    // probation tier overriding leadership hysteresis. Once its failure clears it
-    // is eligible to lead again, but only on the usual switch-margin terms.
     let a = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 1, 1, 1), 0)).await;
     let b = spawn_mock(Behaviour::Answer(Ipv4Addr::new(2, 2, 2, 2), 0)).await;
     let pool = UpstreamPool::build(&[entry(a.addr), entry(b.addr)], settings())
@@ -474,56 +430,39 @@ async fn recent_hard_failure_yields_leadership_then_reclaims_on_recovery() {
     let a_up = pool.upstreams()[0].clone();
     let b_up = pool.upstreams()[1].clone();
     let leads = |pool: &UpstreamPool, who: &Arc<Upstream>| Arc::ptr_eq(&pool.ordered()[0], who);
-
-    // A is the sampled, clean leader; B is clean but slightly slower (within the
-    // switch margin, so ordinarily A would be held).
     a_up.set_routing_latency_for_test(15.0);
     b_up.set_routing_latency_for_test(17.0);
     assert!(leads(&pool, &a_up), "clean fast upstream leads");
-
-    // A takes one hard failure without going down. Even though it's still faster
-    // and inside the margin, probation demotes it below clean B.
     a_up.set_recent_failure_for_test();
     b_up.set_routing_latency_for_test(17.0); // re-assert B clean; A stays 15ms
     assert!(
         leads(&pool, &b_up),
         "an upstream on probation must not be held as leader over a clean peer"
     );
-
-    // A's failure clears (a successful probe/live answer would do this). It's now
-    // clean again, but only 2ms faster than incumbent B — under the 5ms floor —
-    // so hysteresis keeps B. No ping-pong back to A.
     a_up.set_routing_latency_for_test(15.0); // clears consecutive_failures
     assert!(
         leads(&pool, &b_up),
         "a recovered-but-near-tied upstream doesn't reclaim; the incumbent is held"
     );
-
-    // A pulls materially ahead (past the switch margin) → it reclaims the lead.
     a_up.set_routing_latency_for_test(5.0);
     assert!(
         leads(&pool, &a_up),
         "a recovered upstream that clears the switch margin reclaims leadership"
     );
 }
-
-/// Poll `cond` until it's true or `timeout` elapses (panicking on timeout).
 async fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) {
     let start = std::time::Instant::now();
     while !cond() {
-        assert!(start.elapsed() < timeout, "condition not met within {timeout:?}");
+        assert!(
+            start.elapsed() < timeout,
+            "condition not met within {timeout:?}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
 #[tokio::test]
 async fn per_upstream_probe_fires_once_then_defers() {
-    // The pool spawns one probe task per upstream. A never-sampled upstream is
-    // due within the (jittered) startup spread, so the task probes it once —
-    // then, now healthy, it's deferred a full window and isn't re-probed soon.
-    //
-    // One probe is two queries: the first warms the connection and the second is
-    // the one that's timed (see `probe_once`), so the mock sees them in pairs.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
     let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -542,8 +481,6 @@ async fn per_upstream_probe_fires_once_then_defers() {
         2,
         "a never-sampled upstream is probed once on start (two shots)"
     );
-
-    // Now healthy → next probe is ~a minute out, so nothing fires meanwhile.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         mock.received.load(Ordering::SeqCst),
@@ -554,9 +491,6 @@ async fn per_upstream_probe_fires_once_then_defers() {
 
 #[tokio::test]
 async fn reload_carries_upstream_stats() {
-    // Simulate a config reload: build a pool, accumulate some stats, then build a
-    // replacement and have it adopt the old pool's health. The unchanged upstream
-    // keeps its tallies; a brand-new upstream starts blank.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(6, 6, 6, 6), 0)).await;
     let old = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -564,8 +498,6 @@ async fn reload_carries_upstream_stats() {
     old.resolve(&make_query("stats.test.")).await.unwrap();
     let old_stat = old.stats().into_iter().next().unwrap();
     assert_eq!(old_stat.total_queries, 1);
-
-    // New pool: same upstream plus an added one (a different mock address).
     let added = spawn_mock(Behaviour::Answer(Ipv4Addr::new(1, 2, 3, 4), 0)).await;
     let new = UpstreamPool::build(&[entry(mock.addr), entry(added.addr)], settings())
         .await
@@ -593,8 +525,6 @@ async fn reload_carries_upstream_stats() {
 
 #[tokio::test]
 async fn reload_matches_upstreams_by_endpoint_not_spelling() {
-    // `entry()` spells the upstream `udp://127.0.0.1:PORT`; re-spell it bare on
-    // "reload" as `127.0.0.1:PORT`. It's the same endpoint, so stats carry over.
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(3, 3, 3, 3), 0)).await;
     let old = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -617,10 +547,6 @@ async fn reload_matches_upstreams_by_endpoint_not_spelling() {
 
 #[tokio::test]
 async fn probing_runs_regardless_of_live_traffic() {
-    // The probe RTT is the routing signal, so a healthy upstream is probed on
-    // cadence even right after serving live traffic. (The old "a live query
-    // defers the probe" behavior is gone: it would let a busy upstream's routing
-    // estimate go stale, since live latency no longer feeds selection.)
     let mock = spawn_mock(Behaviour::Answer(Ipv4Addr::new(7, 7, 7, 7), 0)).await;
     let mut pool = UpstreamPool::build(&[entry(mock.addr)], settings())
         .await
@@ -630,7 +556,6 @@ async fn probing_runs_regardless_of_live_traffic() {
     let after_query = mock.received.load(Ordering::SeqCst);
 
     pool.start_probing();
-    // A probe must fire despite the recent live query (wait_for panics on timeout).
     wait_for(
         || mock.received.load(Ordering::SeqCst) > after_query,
         Duration::from_secs(4),
@@ -650,12 +575,8 @@ async fn all_upstreams_down_errors() {
 
 #[tokio::test]
 async fn fails_over_past_a_fast_servfail() {
-    // A fast SERVFAIL must not satisfy the query: the pool has to fail over to a
-    // resolver that actually answers, and the SERVFAIL upstream must not be
-    // recorded as a (fast) success that would make it the leader.
     let servfail = spawn_mock(Behaviour::Code(ResponseCode::ServFail)).await;
     let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(7, 7, 7, 7), 0)).await;
-    // SERVFAIL listed first; both unsampled so it's tried first.
     let pool = UpstreamPool::build(&[entry(servfail.addr), entry(good.addr)], settings())
         .await
         .unwrap();
@@ -665,9 +586,6 @@ async fn fails_over_past_a_fast_servfail() {
     assert_eq!(resp.message.answers.len(), 1);
     assert_eq!(resp.upstream, format!("udp://{}", good.addr));
     assert!(servfail.received.load(Ordering::SeqCst) >= 1);
-
-    // The SERVFAIL upstream stays up (a SERVFAIL is plausibly the query's fault)
-    // but never recorded a latency, so it can't have become the leader.
     let sf_stat = pool
         .stats()
         .into_iter()
@@ -682,8 +600,6 @@ async fn fails_over_past_a_fast_servfail() {
 
 #[tokio::test]
 async fn refused_upstream_is_marked_down() {
-    // REFUSED is an upstream-level rejection, so unlike SERVFAIL it counts
-    // against health (failure_threshold is 1 here) and the pool fails over.
     let refused = spawn_mock(Behaviour::Code(ResponseCode::Refused)).await;
     let good = spawn_mock(Behaviour::Answer(Ipv4Addr::new(8, 8, 8, 8), 0)).await;
     let pool = UpstreamPool::build(&[entry(refused.addr), entry(good.addr)], settings())
@@ -703,8 +619,6 @@ async fn refused_upstream_is_marked_down() {
 
 #[tokio::test]
 async fn all_servfail_returns_the_servfail() {
-    // If every upstream SERVFAILs, the client should get that real response
-    // rather than an opaque "all upstreams failed" error.
     let servfail = spawn_mock(Behaviour::Code(ResponseCode::ServFail)).await;
     let pool = UpstreamPool::build(&[entry(servfail.addr)], settings())
         .await
@@ -720,12 +634,6 @@ fn spec_parsing_smoke() {
     assert!(UpstreamSpec::parse("https://dns.google/dns-query").is_ok());
     assert!(UpstreamSpec::parse("garbage://x").is_err());
 }
-
-// ---------------------------------------------------------------------------
-// Live tests against real public resolvers. Excluded by default; run with
-//   cargo test -p bulwark-upstream -- --ignored
-// to exercise the encrypted transports end-to-end.
-// ---------------------------------------------------------------------------
 
 fn live_settings() -> PoolSettings {
     PoolSettings {

@@ -1,16 +1,4 @@
-//! Parsing of individual filter-list lines into [`Rule`]s.
-//!
-//! Supports three line shapes:
-//! * **Hosts-file** lines: `0.0.0.0 ads.example.com` (block) or
-//!   `1.2.3.4 host.example.com` (rewrite). One line may list several hosts.
-//! * **AdBlock-style** DNS rules: `||example.org^`, `@@||example.org^`,
-//!   `*.tracker.com`, with the DNS-relevant modifiers
-//!   (`$important`, `$badfilter`, `$dnstype`, `$dnsrewrite`, `$client`,
-//!   `$ctag`, `$denyallow`).
-//! * **Regex** rules: `/^ads?\..*/`.
-//!
-//! Plain bare-domain lines (`example.org`) are treated as `||example.org^`
-//! (block the domain and its subdomains), matching how blocklists are used.
+//! Hosts-file and AdGuard rule parsing.
 
 use std::net::IpAddr;
 
@@ -18,17 +6,13 @@ use regex::{Regex, RegexBuilder};
 
 use crate::rule::*;
 
-/// Maximum source length of a `/regex/` rule. Rust's `regex` engine matches in
-/// linear time (no catastrophic backtracking), but a pathological source can
-/// still blow up *compile* time/memory, so over-long regexes are rejected.
+/// Maximum source length of a regex rule.
 const MAX_REGEX_LEN: usize = 1000;
 
-/// Per-regex compiled-size cap (bytes). Bounds the memory a single rule's
-/// compiled program may use, so one hostile list entry can't exhaust memory.
+/// Maximum compiled size of one regex.
 const REGEX_SIZE_LIMIT: usize = 256 * 1024;
 
-/// Compile `src` (which already carries any needed flags like `(?i)`) with the
-/// shared size cap, mapping failures to a [`ParseError::Regex`].
+/// Compiles a regex under the shared size limit.
 fn compile_regex(src: &str) -> Result<Regex, ParseError> {
     RegexBuilder::new(src)
         .size_limit(REGEX_SIZE_LIMIT)
@@ -84,13 +68,7 @@ fn norm_domain(d: &str) -> String {
     d.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// If `s` is an IP literal — bare (`1.2.3.4`, `1234::cdef`) or bracketed
-/// (`[1234::cdef]`) — return its canonical [`IpAddr`] string. IP rules are
-/// stored under this canonical key so they match the resolved addresses the
-/// response-side filter checks (also via `IpAddr::to_string()`). A bare v6
-/// literal is the *only* way to block a v6 address — [`is_dns_hostname`] rejects
-/// the colons — matching AdGuard Home, which accepts bare-IP blocklist lines for
-/// both families.
+/// Canonicalizes bare or bracketed IP literals.
 fn ip_literal(s: &str) -> Option<String> {
     let bare = s
         .strip_prefix('[')
@@ -99,12 +77,7 @@ fn ip_literal(s: &str) -> Option<String> {
     bare.parse::<IpAddr>().ok().map(|ip| ip.to_string())
 }
 
-/// Does `line` carry an AdGuard/ABP **cosmetic** marker — element hiding (`##`,
-/// `#@#`), extended-CSS (`#?#`), CSS injection (`#$#`), scriptlets (`#%#`), their
-/// `@`-exception variants, or HTML filtering (`$$`, `$@$`)? Such rules act on
-/// page content and can never match a DNS hostname, so they're skipped rather
-/// than mis-parsed into a bogus domain. The marker shape is `#`, optional `@`,
-/// optional one of `? $ %`, then `#`. Mirrors urlfilter's cosmetic-marker set.
+/// Detects AdGuard/ABP cosmetic and HTML-filtering markers.
 fn is_cosmetic(line: &str) -> bool {
     let b = line.as_bytes();
     let n = b.len();
@@ -130,11 +103,7 @@ fn is_cosmetic(line: &str) -> bool {
     false
 }
 
-/// Is `d` a plausible DNS hostname (ASCII labels of letters/digits/`-`/`_`,
-/// dot-separated, within length limits)? Used to reject non-DNS junk — URL-path
-/// rules, cosmetic selectors, lines with spaces — that would otherwise be stored
-/// as a bogus domain pattern. Punycode (`xn--…`) and underscore service labels
-/// (`_dmarc`) pass; slashes, spaces, `#`, `:` and empty labels don't.
+/// Checks whether a string is a plausible ASCII DNS hostname.
 fn is_dns_hostname(d: &str) -> bool {
     !d.is_empty()
         && d.len() <= 253
@@ -153,12 +122,10 @@ pub fn parse_line(line: &str) -> Result<Parsed, ParseError> {
     if line.is_empty() {
         return Ok(Parsed::Ignored);
     }
-    // Comments and AdBlock list headers.
     if line.starts_with('!') || line.starts_with('#') || line.starts_with('[') {
         return Ok(Parsed::Ignored);
     }
 
-    // Try hosts-file format first (starts with an IP + whitespace + host(s)).
     if let Some(rules) = try_parse_hosts(line) {
         return Ok(if rules.is_empty() {
             Parsed::Ignored
@@ -167,10 +134,6 @@ pub fn parse_line(line: &str) -> Result<Parsed, ParseError> {
         });
     }
 
-    // Cosmetic / HTML-filtering rules act on page content, never on DNS names —
-    // skip them rather than mis-parse `example.com##.ad` into a bogus domain.
-    // Checked after hosts parsing so a `##`-style inline comment on a hosts line
-    // isn't mistaken for a cosmetic marker.
     if is_cosmetic(line) {
         return Ok(Parsed::Unsupported(line.to_string()));
     }
@@ -183,7 +146,6 @@ fn try_parse_hosts(line: &str) -> Option<Vec<BuildRule>> {
     let mut parts = line.split_whitespace();
     let first = parts.next()?;
     let ip: IpAddr = first.parse().ok()?;
-    // Collect hostnames until an inline comment begins.
     let mut hosts = Vec::new();
     for tok in parts {
         if tok.starts_with('#') {
@@ -263,7 +225,6 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
         return Err(ParseError::Invalid("empty pattern".into()));
     }
 
-    // Build the canonical signature (for $badfilter pairing) before consuming.
     let signature = make_signature(action, pattern_str, mods_str);
 
     let (pattern, index_tokens) = parse_pattern(pattern_str)?;
@@ -293,8 +254,6 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
                         .filter(|s| !s.is_empty())
                         .map(norm_domain)
                         .collect();
-                    // An empty `$denyallow=` would otherwise become a no-op that
-                    // silently changes the rule's meaning; reject it instead.
                     if domains.is_empty() {
                         return Err(ParseError::Invalid(
                             "$denyallow requires at least one domain".into(),
@@ -308,8 +267,6 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
                         action = Action::Rewrite;
                     }
                 }
-                // HTTP/cosmetic-only modifiers are irrelevant to DNS filtering;
-                // skip the whole rule rather than match it incorrectly.
                 _ => return Ok(Parsed::Unsupported(line.to_string())),
             }
         }
@@ -336,9 +293,7 @@ fn parse_adblock(line: &str) -> Result<Parsed, ParseError> {
     Ok(Parsed::Rules(vec![rule]))
 }
 
-/// Canonical signature: `@@`? + lowercased pattern + sorted modifiers (minus
-/// `badfilter`). A `$badfilter` rule shares its signature with the rule it
-/// cancels.
+/// Builds a canonical signature for deduplication and `$badfilter`.
 fn make_signature(action: Action, pattern: &str, mods: Option<&str>) -> String {
     let prefix = if action == Action::Allow { "@@" } else { "" };
     let mut parts: Vec<String> = mods
@@ -358,10 +313,8 @@ fn make_signature(action: Action, pattern: &str, mods: Option<&str>) -> String {
     )
 }
 
-/// Parse a pattern into a [`Pattern`] plus the safe reverse-index tokens (only
-/// non-empty for wildcard patterns).
+/// Parses a pattern and its safe reverse-index tokens.
 fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
-    // Regex rule (always falls back to a linear scan — no safe literal tokens).
     if p.starts_with('/') && p.ends_with('/') && p.len() >= 2 {
         let inner = &p[1..p.len() - 1];
         if inner.len() > MAX_REGEX_LEN {
@@ -400,9 +353,6 @@ fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
         return Ok((Pattern::Wildcard(re), tokens));
     }
 
-    // An IP literal (v4 or v6, bare or bracketed) is an exact-host rule, not a
-    // domain — block by resolved address, with anchors ignored as meaningless.
-    // This must come before `is_dns_hostname`, which rejects the v6 colons.
     if let Some(ip) = ip_literal(s) {
         return Ok((Pattern::Exact(ip), Vec::new()));
     }
@@ -415,16 +365,13 @@ fn parse_pattern(p: &str) -> Result<(Pattern, Vec<u32>), ParseError> {
         return Err(ParseError::Invalid(format!("not a DNS hostname: {domain}")));
     }
     if start_anchor {
-        // `|example.com|` — exact host match.
         Ok((Pattern::Exact(domain), Vec::new()))
     } else {
-        // `||example.com^` or bare `example.com` — domain + subdomains.
         Ok((Pattern::Subdomain(domain), Vec::new()))
     }
 }
 
-/// Convert an AdBlock wildcard pattern into an anchored, case-insensitive regex
-/// matched against the (lowercased) query hostname.
+/// Compiles an AdBlock wildcard pattern to a hostname regex.
 fn build_wildcard_regex(
     body: &str,
     subdomain_anchor: bool,
@@ -433,7 +380,6 @@ fn build_wildcard_regex(
 ) -> Result<Regex, ParseError> {
     let mut re = String::from("(?i)");
     if subdomain_anchor {
-        // Start of hostname or at a label boundary.
         re.push_str("(?:^|\\.)");
     } else if start_anchor {
         re.push('^');
@@ -441,7 +387,6 @@ fn build_wildcard_regex(
     for ch in body.chars() {
         match ch {
             '*' => re.push_str(".*"),
-            // `^` separator: a domain-name separator or end of string.
             '^' => re.push_str("(?:[^a-z0-9._-]|$)"),
             c if "\\.+?()[]{}|$".contains(c) => {
                 re.push('\\');
@@ -465,8 +410,6 @@ fn parse_dnstype(value: &str) -> Result<DnsTypeFilter, ParseError> {
             f.include.push(t.to_ascii_uppercase());
         }
     }
-    // An empty `$dnstype=` (or one with only separators) must not degrade to a
-    // match-everything rule; reject it.
     if f.include.is_empty() && f.exclude.is_empty() {
         return Err(ParseError::Invalid(
             "$dnstype requires at least one record type".into(),
@@ -482,7 +425,6 @@ fn parse_client(value: &str) -> Result<ClientFilter, ParseError> {
             Some(rest) => (true, rest),
             None => (false, raw),
         };
-        // Strip surrounding quotes used for names with special chars.
         let spec = spec.trim_matches('"').trim_matches('\'');
         let m = if let Ok(net) = spec.parse::<ipnet::IpNet>() {
             ClientMatch::Net(net)
@@ -524,7 +466,6 @@ fn parse_ctag(value: &str) -> Result<CtagFilter, ParseError> {
 
 fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
     let v = value.trim();
-    // Keyword response codes (short form).
     match v.to_ascii_uppercase().as_str() {
         "NOERROR" => return Ok(RewriteData::Rcode(RewriteRcode::NoError)),
         "NXDOMAIN" => return Ok(RewriteData::Rcode(RewriteRcode::NxDomain)),
@@ -532,11 +473,9 @@ fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
         "SERVFAIL" => return Ok(RewriteData::Rcode(RewriteRcode::ServFail)),
         _ => {}
     }
-    // Short-form bare IP.
     if let Ok(ip) = v.parse::<IpAddr>() {
         return Ok(ip_rewrite(ip));
     }
-    // Full form: `RCODE;TYPE;VALUE` (e.g. `NOERROR;A;1.2.3.4`).
     let segs: Vec<&str> = v.splitn(3, ';').collect();
     if segs.len() == 3 {
         let rtype = segs[1].to_ascii_uppercase();
@@ -558,7 +497,6 @@ fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
             "TXT" => return Ok(RewriteData::Txt(data.trim_matches('"').to_string())),
             "PTR" => return Ok(RewriteData::Ptr(norm_domain(data))),
             "MX" => {
-                // `<preference> <exchange>`, e.g. `10 mail.example.com`.
                 let mut it = data.split_whitespace();
                 let preference: u16 = it
                     .next()
@@ -575,7 +513,6 @@ fn parse_dnsrewrite(value: &str) -> Result<RewriteData, ParseError> {
             _ => {}
         }
     }
-    // Bare CNAME target (a hostname).
     if v.contains('.') && !v.contains(';') {
         return Ok(RewriteData::Cname(norm_domain(v)));
     }

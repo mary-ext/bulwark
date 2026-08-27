@@ -25,8 +25,6 @@ fn bare_domain_treated_as_subdomain_block() {
 
 #[test]
 fn redundant_child_pruned_verdict_preserved() {
-    // The child block is subsumed by the broader parent subdomain block and is
-    // removed, but every query it covered is still blocked — by the parent.
     let e = compile_one("||doubleclick.net^\n||ads.doubleclick.net^");
     assert_eq!(e.len(), 1, "redundant child should be pruned");
     assert!(e.check("doubleclick.net", "A", &ci()).is_blocked());
@@ -36,8 +34,6 @@ fn redundant_child_pruned_verdict_preserved() {
 
 #[test]
 fn exact_host_under_subdomain_pruned() {
-    // A hosts (exact) entry for a host already covered by a subdomain block is
-    // redundant and pruned; the host stays blocked via the subdomain rule.
     let e = compile_one("||example.com^\n0.0.0.0 ads.example.com");
     assert_eq!(e.len(), 1);
     assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
@@ -45,16 +41,15 @@ fn exact_host_under_subdomain_pruned() {
 
 #[test]
 fn unrelated_and_exact_only_rules_not_pruned() {
-    // No subsuming subdomain ancestor -> nothing is pruned.
     assert_eq!(compile_one("||a.com^\n||b.com^").len(), 2);
-    // Two exact hosts: an exact rule never subsumes, so both survive.
-    assert_eq!(compile_one("0.0.0.0 example.com\n0.0.0.0 ads.example.com").len(), 2);
+    assert_eq!(
+        compile_one("0.0.0.0 example.com\n0.0.0.0 ads.example.com").len(),
+        2
+    );
 }
 
 #[test]
 fn allow_wildcard_overrides_domain_block() {
-    // An allow regex is in the override scan group, evaluated even when a domain
-    // block already matched — so it still un-blocks its target.
     let e = compile_one("||example.com^\n@@/^sub\\.example\\.com$/");
     assert!(e.check("other.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("sub.example.com", "A", &ci()).is_blocked());
@@ -62,7 +57,6 @@ fn allow_wildcard_overrides_domain_block() {
 
 #[test]
 fn important_wildcard_overrides_domain_allow() {
-    // An $important block regex (override group) beats a domain allow.
     let e = compile_one("@@||example.com^\n/tracker\\.example\\.com/$important");
     assert!(e.check("tracker.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
@@ -70,8 +64,6 @@ fn important_wildcard_overrides_domain_allow() {
 
 #[test]
 fn block_only_wildcard_matches_without_domain_rule() {
-    // A plain block regex is in the block-only group, scanned only when nothing
-    // else matched — it must still block when it is the sole match.
     let e = compile_one("/^ads[0-9]+\\.example\\.net$/");
     assert!(e.check("ads123.example.net", "A", &ci()).is_blocked());
     assert!(!e.check("safe.example.net", "A", &ci()).is_blocked());
@@ -79,8 +71,6 @@ fn block_only_wildcard_matches_without_domain_rule() {
 
 #[test]
 fn special_children_kept_despite_blocked_parent() {
-    // A blocked parent must NOT prune children that can behave differently:
-    // an exception, an $important block, or a type/client-narrowed rule.
     let e = compile_one(
         "||example.com^\n\
          @@||ok.example.com^\n\
@@ -97,14 +87,12 @@ fn exception_unblocks() {
     let e = compile_one("||example.com^\n@@||good.example.com^");
     assert!(e.check("bad.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("good.example.com", "A", &ci()).is_blocked());
-    // exception applies to subdomains of the exception too
     assert!(!e.check("x.good.example.com", "A", &ci()).is_blocked());
 }
 
 #[test]
 fn important_beats_exception() {
     let e = compile_one("@@||example.com^\n||tracker.example.com^$important");
-    // exception covers everything, but the important block wins on the subdomain
     assert!(e.check("tracker.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("other.example.com", "A", &ci()).is_blocked());
 }
@@ -128,7 +116,6 @@ fn hosts_format_blocking() {
     let e = compile_one(text);
     assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
     assert!(e.check("tracker.test", "A", &ci()).is_blocked());
-    // hosts entries are exact: subdomains are not blocked
     assert!(!e.check("sub.ads.example.com", "A", &ci()).is_blocked());
 }
 
@@ -144,28 +131,21 @@ fn hosts_noise_and_localhost_skipped() {
 
 #[test]
 fn bare_ip_literals_block_exactly() {
-    // Bare IP lines (v4 and v6) compile to exact-address blocks — the rule form
-    // AdGuard Home uses for response-side IP blocking. The v6 line is only
-    // possible because IP literals bypass the DNS-hostname check.
     let e = compile_one("1.2.3.4\n1234::cdef\n");
     assert!(e.check("1.2.3.4", "A", &ci()).is_blocked());
     assert!(e.check("1234::cdef", "AAAA", &ci()).is_blocked());
-    // Exact match only: a different address in the same family is not blocked.
     assert!(!e.check("1.2.3.5", "A", &ci()).is_blocked());
     assert!(!e.check("1234::cdee", "AAAA", &ci()).is_blocked());
 }
 
 #[test]
 fn v6_literal_is_canonicalized() {
-    // The rule's non-canonical v6 form must still match the canonical string the
-    // resolver produces via `Ipv6Addr::to_string()` (compressed, lowercase).
     let e = compile_one("2001:0DB8:0000:0000:0000:0000:0000:0001");
     assert!(e.check("2001:db8::1", "AAAA", &ci()).is_blocked());
 }
 
 #[test]
 fn bracketed_and_anchored_v6_rule() {
-    // `||[v6]^` (bracketed, anchored) is accepted and matches the bare address.
     let e = compile_one("||[2606:4700::1111]^");
     assert!(e.check("2606:4700::1111", "AAAA", &ci()).is_blocked());
 }
@@ -342,7 +322,6 @@ fn comments_and_blank_lines_ignored() {
 
 #[test]
 fn unsupported_http_modifier_skipped() {
-    // $third-party is HTTP-only; the rule must not be loaded.
     let mut c = Compiler::new();
     let stats = c.add_list(0, "t", "||example.com^$third-party");
     assert_eq!(stats.rules, 0);
@@ -368,13 +347,11 @@ fn multi_list_stats_and_priority() {
 
 #[test]
 fn duplicate_rules_are_deduplicated() {
-    // The same domain across several lists should collapse to one rule.
     let mut c = Compiler::new();
     c.add_list(1, "a", "||ads.example.com^\n0.0.0.0 dup.test");
     c.add_list(2, "b", "||ads.example.com^\n0.0.0.0 dup.test");
     c.add_list(3, "c", "||ads.example.com^");
     let (engine, _) = c.build();
-    // Three identical block rules + two identical host rules -> 2 active rules.
     assert_eq!(engine.len(), 2);
     assert!(engine.check("ads.example.com", "A", &ci()).is_blocked());
     assert!(engine.check("dup.test", "A", &ci()).is_blocked());
@@ -382,7 +359,6 @@ fn duplicate_rules_are_deduplicated() {
 
 #[test]
 fn regexset_fallback_matches_multiple_regex_rules() {
-    // Several regex rules land in the fallback RegexSet; all must still match.
     let e = compile_one("/^ads?\\./\n/tracker/\n/^[0-9]+cdn/");
     assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
     assert!(e.check("x.tracker.net", "A", &ci()).is_blocked());
@@ -392,7 +368,6 @@ fn regexset_fallback_matches_multiple_regex_rules() {
 
 #[test]
 fn wildcard_reverse_index_correctness() {
-    // Mix of wildcard rules; the token index must not change results vs a scan.
     let e = compile_one(
         "||*.doubleclick.net^\n*.ads.example.com\n||cdn-*.tracker.io^\n/^evil[0-9]+\\./",
     );
@@ -400,15 +375,12 @@ fn wildcard_reverse_index_correctness() {
     assert!(e.check("a.b.ads.example.com", "A", &ci()).is_blocked());
     assert!(e.check("cdn-1.tracker.io", "A", &ci()).is_blocked());
     assert!(e.check("evil42.example.org", "A", &ci()).is_blocked()); // regex (fallback)
-                                                                     // Non-matches.
     assert!(!e.check("doubleclick.net.evil.com", "A", &ci()).is_blocked());
     assert!(!e.check("safe.example.org", "A", &ci()).is_blocked());
 }
 
 #[test]
 fn many_wildcards_match_fast() {
-    // 20k wildcard rules; the reverse index should keep lookups quick while
-    // remaining correct (a naive scan would check all 20k every query).
     let mut text = String::new();
     for i in 0..20_000 {
         text.push_str(&format!("||*.evilcdn{i}.example^\n"));
@@ -420,9 +392,6 @@ fn many_wildcards_match_fast() {
         assert!(e.check(&host, "A", &ci()).is_blocked());
     }
     let elapsed = start.elapsed();
-    // With the token index each lookup checks ~1 regex. A linear scan over 20k
-    // rules would be ~20k regex evals per query (minutes); the index keeps this
-    // well under the budget even in a debug build.
     assert!(
         elapsed.as_secs() < 10,
         "wildcard lookups too slow: {elapsed:?}"
@@ -432,7 +401,6 @@ fn many_wildcards_match_fast() {
 
 #[test]
 fn large_list_matches_fast() {
-    // Sanity: build 50k rules and ensure lookups are correct & quick.
     let mut text = String::new();
     for i in 0..50_000 {
         text.push_str(&format!("||evil{i}.example.com^\n"));
@@ -444,7 +412,6 @@ fn large_list_matches_fast() {
         let _ = e.check(&format!("evil{}.example.com", i % 50_000), "A", &ci());
     }
     let elapsed = start.elapsed();
-    // Should be well under a second for 10k lookups.
     assert!(elapsed.as_secs() < 2, "lookups too slow: {elapsed:?}");
     assert!(e.check("evil42.example.com", "A", &ci()).is_blocked());
     assert!(!e.check("safe.example.com", "A", &ci()).is_blocked());
@@ -452,8 +419,6 @@ fn large_list_matches_fast() {
 
 #[test]
 fn empty_scoped_modifier_drops_rule_not_match_all() {
-    // An empty `$client=` must NOT become a match-everything rule; the whole rule
-    // is dropped, so the domain is not blocked for anyone.
     for rule in [
         "||corp.example^$client=",
         "||corp.example^$ctag=",
@@ -471,7 +436,6 @@ fn empty_scoped_modifier_drops_rule_not_match_all() {
             "empty modifier must not match-all: {rule:?}"
         );
     }
-    // The non-empty form still works.
     let e = compile_one("||corp.example^$client=10.0.0.1");
     let target = ClientInfo {
         ip: Some("10.0.0.1".parse().unwrap()),
@@ -487,7 +451,6 @@ fn empty_scoped_modifier_drops_rule_not_match_all() {
 
 #[test]
 fn cosmetic_rules_are_skipped() {
-    // Cosmetic markers must not be parsed into a bogus domain rule.
     for rule in [
         "example.com##.ad-banner",
         "example.com#@#.ad",
@@ -503,7 +466,6 @@ fn cosmetic_rules_are_skipped() {
             "cosmetic rule must not block the domain: {rule:?}"
         );
     }
-    // A hosts line with a `##`-style inline comment is NOT mistaken for cosmetic.
     let e = compile_one("0.0.0.0 ads.example.com ## inline note");
     assert!(e.check("ads.example.com", "A", &ci()).is_blocked());
 }
@@ -518,26 +480,21 @@ fn non_dns_hostname_patterns_rejected() {
         let e = compile_one(rule);
         assert_eq!(e.len(), 0, "non-DNS pattern should be rejected: {rule:?}");
     }
-    // Punycode and underscore service labels remain valid.
     assert_eq!(compile_one("||xn--80ak6aa92e.com^").len(), 1);
     assert_eq!(compile_one("||_dmarc.example.com^").len(), 1);
 }
 
 #[test]
 fn oversized_regex_rule_rejected() {
-    // A pathologically long regex source is dropped rather than compiled.
     let long = "a".repeat(2000);
     let e = compile_one(&format!("/{long}/"));
     assert_eq!(e.len(), 0, "over-long regex rule should be dropped");
-    // A normal regex still compiles and matches.
     let e = compile_one(r"/^ads\d+\./");
     assert!(e.check("ads42.example.com", "A", &ci()).is_blocked());
 }
 
 #[test]
 fn many_regex_fallback_rules_match_across_chunks() {
-    // More than one RegexSet chunk worth of tokenless regex rules: every rule
-    // must still match through the chunked fused-matching path.
     let mut text = String::new();
     for i in 0..600 {
         text.push_str(&format!("/^ads{i}\\./\n"));

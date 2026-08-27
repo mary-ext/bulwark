@@ -1,4 +1,4 @@
-//! Throwaway-ish micro-benchmark for the filter engine at scale.
+//! Large filter-engine microbenchmark.
 //!
 //! Run with: `cargo run --release --example bench_filter -p bulwark`
 
@@ -7,7 +7,6 @@ use std::time::Instant;
 use bulwark_filter::{compile_one, ClientInfo};
 
 fn main() {
-    // ~200k mixed rules: mostly ||domain^ and hosts, a few thousand wildcards.
     let mut text = String::new();
     for i in 0..180_000 {
         text.push_str(&format!("||ads{i}.example{}.com^\n", i % 997));
@@ -25,8 +24,6 @@ fn main() {
 
     let ci = ClientInfo::default();
     let n = 1_000_000u32;
-
-    // Matching queries (block).
     let t1 = Instant::now();
     let mut hits = 0u64;
     for i in 0..n {
@@ -37,8 +34,6 @@ fn main() {
     }
     let d = t1.elapsed();
     println!("match:    {n} lookups hits={hits} {d:?} ({:?}/q)", d / n);
-
-    // Non-matching queries (the overwhelmingly common case for a resolver).
     let t2 = Instant::now();
     for i in 0..n {
         let host = format!("legit{}.good-domain.example", i);

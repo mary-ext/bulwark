@@ -1,4 +1,4 @@
-//! Synthesis of blocked / rewritten / error DNS responses.
+//! Blocked, rewritten, and error response synthesis.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -10,7 +10,7 @@ use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, PTR, SOA, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 
-/// Build a response shell echoing the query's id, question, and EDNS.
+/// Builds a response shell from the query.
 fn base(query: &Message) -> Message {
     let mut m = Message::new(
         query.metadata.id,
@@ -44,7 +44,6 @@ fn qname(query: &Message) -> Name {
         .unwrap_or_else(Name::root)
 }
 
-/// Push an A/AAAA record matching the query type, or leave NODATA otherwise.
 fn push_ip(msg: &mut Message, name: Name, ttl: u32, v4: Ipv4Addr, v6: Ipv6Addr) {
     match qtype_of(&name, msg) {
         RecordType::A => msg
@@ -53,7 +52,6 @@ fn push_ip(msg: &mut Message, name: Name, ttl: u32, v4: Ipv4Addr, v6: Ipv6Addr) 
         RecordType::AAAA => msg
             .answers
             .push(Record::from_rdata(name, ttl, RData::AAAA(AAAA(v6)))),
-        // Any other type: NODATA (NOERROR, empty answer).
         _ => {}
     }
 }
@@ -65,22 +63,16 @@ fn qtype_of(_name: &Name, msg: &Message) -> RecordType {
         .unwrap_or(RecordType::A)
 }
 
-/// A synthetic SOA for the authority section so clients negative-cache a blocked
-/// response for `blocked_ttl` (RFC 2308: the negative TTL is `min(SOA.minimum,
-/// record TTL)`). Without it, NXDOMAIN/NODATA blocks aren't cached and the same
-/// blocked name is re-queried (and re-logged) on every lookup.
+/// Builds an SOA for negative caching (RFC 2308).
 fn negative_soa(name: Name, ttl: u32) -> Record {
-    // The SOA mname/rname are constant, so parse them once instead of on every
-    // blocked query (Name::from_str is ~300ns each — pure per-request waste at
-    // the rate an adblocker serves NXDOMAIN/NODATA). Cloning the cached Name is
-    // far cheaper than re-parsing the string.
     static MNAME: LazyLock<Name> = LazyLock::new(|| {
-        Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap_or_else(|_| Name::root())
+        Name::from_str("fake-for-negative-caching.bulwark.invalid.")
+            .unwrap_or_else(|_| Name::root())
     });
-    static RNAME: LazyLock<Name> =
-        LazyLock::new(|| Name::from_str("hostmaster.bulwark.invalid.").unwrap_or_else(|_| Name::root()));
-    // blocked_ttl is small in practice; clamp to a positive i32 for the
-    // refresh/retry/expire fields just in case.
+    static RNAME: LazyLock<Name> = LazyLock::new(|| {
+        Name::from_str("hostmaster.bulwark.invalid.").unwrap_or_else(|_| Name::root())
+    });
+    // SOA timers are signed in hickory.
     let secs = ttl.min(i32::MAX as u32) as i32;
     let soa = SOA::new(
         MNAME.clone(),
@@ -123,13 +115,14 @@ pub fn block_response(
     m
 }
 
-/// The result of synthesizing a rewrite. `Cname` indicates the pipeline should
-/// resolve the target and append its addresses.
+/// Result of rewrite synthesis.
 pub enum Rewritten {
-    /// A complete response is ready.
     Done(Message),
     /// A CNAME was inserted; resolve `target` and append A/AAAA answers.
-    ResolveCname { message: Message, target: Name },
+    ResolveCname {
+        message: Message,
+        target: Name,
+    },
 }
 
 /// Synthesize a response for a `$dnsrewrite` / hosts rewrite.
@@ -212,7 +205,7 @@ pub fn rewrite_response(query: &Message, data: &RewriteData, ttl: u32) -> Rewrit
     }
 }
 
-/// A simple error response with the given response code.
+/// Builds an error response.
 pub fn error_response(query: &Message, rcode: ResponseCode) -> Message {
     let mut m = base(query);
     m.metadata.response_code = rcode;
@@ -258,10 +251,9 @@ mod tests {
             );
             assert_eq!(r.authorities.len(), 1, "{mode:?} should carry an SOA");
             match &r.authorities[0].data {
-                RData::SOA(soa) => assert_eq!(
-                    soa.minimum, 42,
-                    "SOA minimum drives the negative-cache TTL"
-                ),
+                RData::SOA(soa) => {
+                    assert_eq!(soa.minimum, 42, "SOA minimum drives the negative-cache TTL")
+                }
                 other => panic!("expected SOA authority, got {other:?}"),
             }
             assert_eq!(r.authorities[0].ttl, 42);
@@ -283,7 +275,6 @@ mod tests {
 
     #[test]
     fn null_ip_block_aaaa_for_a_query_is_nodata() {
-        // A null-IP block for an HTTPS query yields NODATA.
         let r = block_response(
             &query("a.com.", RecordType::HTTPS),
             BlockingMode::NullIp,

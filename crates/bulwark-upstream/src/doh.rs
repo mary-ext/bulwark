@@ -1,21 +1,4 @@
-//! DNS-over-HTTPS (RFC 8484), POST `application/dns-message`.
-//!
-//! Uses `reqwest` with connection pooling. The upstream host is resolved via the
-//! bootstrap resolver and pinned on the client so we never go through the system
-//! resolver (which could loop back into Bulwark).
-//!
-//! HTTP version selection:
-//! * `https://` negotiates HTTP/1.1 + HTTP/2 over ALPN, and auto-upgrades to
-//!   HTTP/3 once the server advertises it via an `Alt-Svc: h3=...` header. The
-//!   advertisement is cached (honouring its `ma=` max-age) so subsequent queries
-//!   go straight over HTTP/3. reqwest has no built-in Alt-Svc cache, so we keep a
-//!   small one here.
-//! * `h3://` pins the transport to HTTP/3 from the first packet, skipping
-//!   discovery (`UpstreamSpec::force_http3`).
-//!
-//! To avoid relying on per-request version negotiation, HTTP/3 uses a separate
-//! reqwest client built with `http3_prior_knowledge()`; the h1/h2 client is used
-//! for everything else.
+//! DNS-over-HTTPS with Alt-Svc HTTP/3 discovery.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -32,12 +15,10 @@ use crate::transport::{decode, encode, matches_query, Transport, UPSTREAM_IDLE_T
 
 const DNS_MESSAGE: &str = "application/dns-message";
 
-/// Maximum DoH response body we'll buffer (a DNS message is at most 64 KiB).
+/// Maximum buffered DoH response size.
 const MAX_DOH_BODY: usize = 64 * 1024;
 
-/// How long bootstrap-resolved IPs (and the clients pinned to them) are reused
-/// before re-resolving, so upstream IP rotation or a transient bad bootstrap
-/// answer self-heals instead of sticking until the process restarts.
+/// Lifetime of bootstrap-pinned addresses.
 const DOH_PIN_TTL: Duration = Duration::from_secs(300);
 
 /// Default Alt-Svc lifetime when the advertisement omits `ma=` (RFC 7838 §3.1).
@@ -55,10 +36,6 @@ enum AltSvcH3 {
 }
 
 /// HTTP/3 strategy for a DoH upstream.
-///
-/// Modeled as an enum so the Alt-Svc discovery cache (`h3_until`) only exists
-/// when it can actually be used — a forced-HTTP/3 transport never negotiates, so
-/// it carries no discovery state at all.
 enum H3Mode {
     /// Pinned to HTTP/3 (`force_http3`): no Alt-Svc discovery, no fallback.
     Forced,
@@ -71,15 +48,11 @@ pub struct DohTransport {
     spec: UpstreamSpec,
     bootstrap: SharedBootstrap,
     url: String,
-    /// Bootstrap-resolved addresses for the upstream host, pinned on the clients.
-    /// Cached with the time of resolution and refreshed after [`DOH_PIN_TTL`].
+    /// Bootstrap-pinned upstream addresses.
     ips: Mutex<Option<(Instant, Vec<IpAddr>)>>,
-    /// HTTP/1.1 + HTTP/2 client (also the discovery path for Alt-Svc). Rebuilt
-    /// when the pinned IPs are refreshed. `reqwest::Client` is Arc-backed, so a
-    /// clone is cheap.
+    /// HTTP/1.1 and HTTP/2 client.
     client_h12: Mutex<Option<(Instant, reqwest::Client)>>,
-    /// HTTP/3-only client (`http3_prior_knowledge`), built lazily, refreshed like
-    /// `client_h12`.
+    /// Lazy HTTP/3-only client.
     client_h3: Mutex<Option<(Instant, reqwest::Client)>>,
     h3: H3Mode,
     desc: String,
@@ -107,8 +80,7 @@ impl DohTransport {
         }
     }
 
-    /// Bootstrap-resolve the upstream host, reusing the cached result until it
-    /// ages past [`DOH_PIN_TTL`], then re-resolving.
+    /// Returns cached bootstrap addresses or refreshes them.
     async fn ips(&self) -> Result<Vec<IpAddr>> {
         if let Some((at, ips)) = self.ips.lock().as_ref() {
             if at.elapsed() < DOH_PIN_TTL {
@@ -125,34 +97,19 @@ impl DohTransport {
         let host = self.spec.host.to_string();
         let mut builder = reqwest::Client::builder()
             .https_only(true)
-            // Drop pooled connections after the shared idle window so a quiet box
-            // doesn't keep a TLS/QUIC session resident. The h2 keep-alive below only
-            // pings while a request is in flight (we don't set keep_alive_while_idle),
-            // so an idle connection genuinely ages out of the pool here.
             .pool_idle_timeout(UPSTREAM_IDLE_TIMEOUT)
             .user_agent("bulwark");
         if force_h3 {
             builder = builder.http3_prior_knowledge();
         } else {
-            // Negotiate h1/h2 via ALPN (don't force "prior knowledge", which is
-            // for cleartext h2c and breaks over TLS).
             builder = builder.http2_keep_alive_interval(Duration::from_secs(30));
         }
-        // Pin the resolved addresses for the host:port in a single call.
-        // `resolve()` in a loop would not accumulate: reqwest keys the override
-        // by host and *overwrites* on each call, so only the last IP would
-        // survive. Given bootstrap's A-then-AAAA order that last IP is the IPv6
-        // address, pinning the client to IPv6 only — which stalls on hosts
-        // without working IPv6 egress (e.g. an IPv4-only container) even though
-        // DoT/DoQ to the same upstream succeed over IPv4. `resolve_to_addrs`
-        // keeps the whole set so the connector can fall back across families.
+        // Preserve all bootstrap addresses for cross-family fallback.
         let addrs: Vec<SocketAddr> = ips
             .iter()
             .map(|ip| SocketAddr::new(*ip, self.spec.port))
             .collect();
         builder = builder.resolve_to_addrs(&host, &addrs);
-        // Additive test/benchmark trust anchors (feature-gated, absent from the
-        // shipped binary). Lets the DoH client trust a local mock's private CA.
         #[cfg(feature = "test-trust-roots")]
         for der in crate::tlsconf::test_roots::extra_roots() {
             if let Ok(cert) = reqwest::Certificate::from_der(&der) {
@@ -188,8 +145,7 @@ impl DohTransport {
         Ok(client)
     }
 
-    /// Whether a previously advertised HTTP/3 alternative is still within its
-    /// max-age. Always false in forced mode (it never negotiates).
+    /// Whether an advertised HTTP/3 alternative is still fresh.
     fn h3_fresh(&self) -> bool {
         match &self.h3 {
             H3Mode::Auto { until } => matches!(*until.lock(), Some(t) if t > Instant::now()),
@@ -197,8 +153,7 @@ impl DohTransport {
         }
     }
 
-    /// Record (or clear) an HTTP/3 alternative learned from a response. No-op in
-    /// forced mode, which has no discovery state.
+    /// Updates the learned HTTP/3 alternative.
     fn learn_alt_svc(&self, decision: AltSvcH3) {
         let H3Mode::Auto { until } = &self.h3 else {
             return;
@@ -211,14 +166,10 @@ impl DohTransport {
     }
 
     async fn query_inner(&self, query: &Message) -> Result<Message> {
-        // RFC 8484 recommends id 0 on the wire for cacheability; restore the
-        // caller's id on the response. Patch the id directly into the encoded
-        // header rather than cloning the whole `Message` to zero it.
         let original_id = query.metadata.id;
         let mut body = encode(query)?;
         body[..2].copy_from_slice(&[0, 0]);
 
-        // Pinned to HTTP/3: no discovery, no fallback.
         if matches!(self.h3, H3Mode::Forced) {
             let client = self.h3().await?;
             return self
@@ -226,8 +177,6 @@ impl DohTransport {
                 .await;
         }
 
-        // Auto-upgrade: prefer HTTP/3 while a fresh advertisement stands, but fall
-        // back to h1/h2 (and forget the advertisement) if the h3 attempt fails.
         if self.h3_fresh() {
             let client = self.h3().await?;
             match self
@@ -242,19 +191,12 @@ impl DohTransport {
             }
         }
 
-        // h1/h2 path: also the discovery path for future HTTP/3 upgrades.
         let client = self.h12().await?;
         self.exchange(&client, &body, query, original_id, true, false)
             .await
     }
 
-    /// Send one DoH request over `client`, optionally learning HTTP/3 availability
-    /// from the response's `Alt-Svc` header.
-    ///
-    /// `http3` must be set when `client` is the HTTP/3 client: reqwest's
-    /// `http3_prior_knowledge()` still routes a request over TCP (h1/h2) unless
-    /// the request explicitly opts into `Version::HTTP_3`, so without this an
-    /// `h3://` upstream would silently never use QUIC.
+    /// Sends one DoH request and optionally learns Alt-Svc.
     async fn exchange(
         &self,
         client: &reqwest::Client,
@@ -291,10 +233,7 @@ impl DohTransport {
             }
         }
 
-        // Cap the body: a DNS message is at most 64 KiB, so a hostile upstream
-        // must not be able to stream an unbounded body into memory. Reject by the
-        // declared Content-Length and again while accumulating chunks (covers a
-        // chunked response with no declared length).
+        // Enforce the cap for declared and chunked bodies.
         if resp
             .content_length()
             .is_some_and(|n| n as usize > MAX_DOH_BODY)
@@ -313,9 +252,6 @@ impl DohTransport {
             body.extend_from_slice(&chunk);
         }
         let mut msg = decode(&body)?;
-        // The response carries id 0 (RFC 8484); restore the caller's id, then
-        // verify the response answers our question before trusting it — otherwise
-        // a buggy or hostile server could get its answer cached under our key.
         msg.metadata.id = original_id;
         if !matches_query(expect, &msg) {
             return Err(UpstreamError::Http(
@@ -326,21 +262,16 @@ impl DohTransport {
     }
 }
 
-/// Parse an `Alt-Svc` header value for an HTTP/3 alternative.
-///
-/// Examples: `h3=":443"; ma=2592000,h3-29=":443"; ma=2592000` advertises HTTP/3;
-/// `clear` retracts all alternatives.
+/// Parses an HTTP/3 alternative from an Alt-Svc header.
 fn parse_alt_svc_h3(value: &str) -> AltSvcH3 {
     let value = value.trim();
     if value.eq_ignore_ascii_case("clear") {
         return AltSvcH3::Clear;
     }
-    // Each comma-separated entry is `protocol-id=authority; param=value; ...`.
     for entry in value.split(',') {
         let mut params = entry.split(';').map(str::trim);
         let Some(proto) = params.next() else { continue };
         let id = proto.split('=').next().unwrap_or("").trim();
-        // `h3` plus draft variants such as `h3-29`.
         if id == "h3" || id.starts_with("h3-") {
             let ma = params
                 .find_map(|p| p.strip_prefix("ma="))
@@ -377,7 +308,6 @@ mod tests {
 
     #[test]
     fn alt_svc_h3_among_others() {
-        // h2 listed first, h3 second; we still find the h3 alternative.
         assert_eq!(
             parse_alt_svc_h3("h2=\":443\"; ma=3600, h3-29=\":443\"; ma=600"),
             AltSvcH3::Found(Duration::from_secs(600))

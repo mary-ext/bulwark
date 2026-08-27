@@ -1,4 +1,4 @@
-//! Shared application state and the config → engine build/apply logic.
+//! Application state and configuration application.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,26 +59,18 @@ pub struct AppState {
     pub config: Arc<RwLock<Config>>,
     pub paths: Arc<Paths>,
     pub sessions: Arc<SessionSigner>,
-    /// Disk-backed query-log store, read by the API and written by the
-    /// background writer task.
+    /// Disk-backed query log.
     pub store: Arc<crate::store::QueryStore>,
-    /// Probe-telemetry sink, shared with every upstream pool built across config
-    /// reloads so the wiring survives a reload. Detached (a no-op) unless probe
-    /// persistence was enabled at startup.
+    /// Probe sink shared across pool reloads.
     pub probe_log: Arc<ProbeLog>,
-    /// Disk-backed probe-telemetry store, read by the API (export) and cleared by
-    /// the API; written by the background probe writer.
+    /// Disk-backed probe telemetry.
     pub probe_store: Arc<crate::probe_store::ProbeStore>,
-    /// Serializes config read-modify-write updates. Held across a handler's
-    /// clone → mutate → [`apply_config`] sequence so concurrent edits can't lose
-    /// each other's writes or allocate the same list id twice.
+    /// Serializes configuration read-modify-write operations.
     pub update_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AppState {
-    /// Begin a serialized config update: take the update lock, then clone the
-    /// current config to mutate. Hold the returned guard until [`apply_config`]
-    /// completes — the whole read-modify-write must happen under it.
+    /// Starts a serialized configuration update.
     pub async fn begin_update(&self) -> (Config, tokio::sync::OwnedMutexGuard<()>) {
         let guard = self.update_lock.clone().lock_owned().await;
         let cfg = self.config.read().await.clone();
@@ -98,7 +90,6 @@ pub fn compile_filters(
     paths: &Paths,
 ) -> (bulwark_filter::FilterEngine, Vec<(u32, usize)>) {
     let mut c = Compiler::new();
-    // Custom user rules are list id 0.
     c.add_list(0, "Custom rules", &cfg.filtering.custom_rules);
     for l in &cfg.filtering.lists {
         if l.enabled {
@@ -111,9 +102,7 @@ pub fn compile_filters(
     (engine, counts)
 }
 
-/// Build the upstream pool from the enabled configured upstreams. On a config
-/// reload, pass the outgoing pool as `prev` so per-upstream health/stats are
-/// carried over for upstreams whose spec is unchanged.
+/// Builds the enabled upstream pool, preserving compatible prior health.
 pub async fn build_pool(
     cfg: &Config,
     prev: Option<&UpstreamPool>,
@@ -135,23 +124,16 @@ pub async fn build_pool(
     let mut pool = UpstreamPool::build(&entries, settings)
         .await
         .context("building upstream pool")?;
-    // Inherit stats + probe schedule from the previous pool (unchanged upstreams)
-    // before probing starts, so a reload neither wipes the UI's per-upstream
-    // numbers nor re-probes servers we already know.
     if let Some(prev) = prev {
         pool.adopt_health_from(prev);
     }
-    // Share the (possibly detached) probe-telemetry sink with this pool's probe
-    // tasks before they start. Must precede `start_probing`.
+    // Install the sink before starting probe tasks.
     pool.set_probe_log(probe_log);
-    // Each upstream drives its own probe schedule; the tasks stop when this pool
-    // is dropped (e.g. replaced on the next config reload).
     pool.start_probing();
     Ok(pool)
 }
 
-/// Build a fresh [`EngineState`] from the current config. On reload, `prev` is
-/// the outgoing pool whose health is carried forward (see [`build_pool`]).
+/// Builds engine state, optionally preserving prior pool health.
 pub async fn build_engine_state(
     cfg: &Config,
     paths: &Paths,
@@ -193,7 +175,6 @@ pub async fn build_engine(
         cfg.cache.max_ttl_secs,
         cfg.cache.optimistic_max_age_secs,
     );
-    // Only retain per-answer log summaries on cache entries while logging is on.
     cache.set_store_summaries(cfg.query_log.enabled);
     let log = Arc::new(QueryLog::new(
         cfg.query_log.enabled,
@@ -212,7 +193,6 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
     new_cfg.upstreams.normalize();
     new_cfg.validate().context("config validation")?;
 
-    // Refresh per-list rule counts so the UI reflects reality.
     let (_engine, counts) = compile_filters(&new_cfg, &state.paths);
     for l in new_cfg.filtering.lists.iter_mut() {
         if let Some((_, n)) = counts.iter().find(|(id, _)| *id == l.id) {
@@ -220,14 +200,8 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         }
     }
 
-    // Build the new engine state first (this can fail on a bad upstream/filter),
-    // then persist to disk BEFORE swapping any live state. If the save fails we
-    // return the error with the running engine and stored config untouched, so a
-    // disk problem can't leave the engine running a config the API reported as
-    // failed (and that isn't on disk for the next restart).
+    // Build and persist before changing live state.
     let engine_state = {
-        // Hold the outgoing pool just long enough to inherit its health; it's
-        // still the live one until `swap_state` below.
         let prev_pool = state.engine.pool();
         build_engine_state(
             &new_cfg,
@@ -240,7 +214,6 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
     new_cfg.save(&state.paths.config).context("saving config")?;
     state.engine.swap_state(engine_state);
 
-    // Reconfigure persistent components.
     state.engine.cache().reconfigure(
         new_cfg.cache.enabled,
         new_cfg.cache.size,
@@ -252,20 +225,15 @@ pub async fn apply_config(state: &AppState, mut new_cfg: Config) -> anyhow::Resu
         .engine
         .cache()
         .set_store_summaries(new_cfg.query_log.enabled);
-    state
-        .engine
-        .log()
-        .reconfigure(
-            new_cfg.query_log.enabled,
-            new_cfg.privacy.anonymize_client_ips,
-        );
+    state.engine.log().reconfigure(
+        new_cfg.query_log.enabled,
+        new_cfg.privacy.anonymize_client_ips,
+    );
     state.engine.stats().reconfigure(
         new_cfg.stats.enabled,
         new_cfg.stats.retention_days,
         new_cfg.privacy.anonymize_client_ips,
     );
-    // Probe-telemetry persistence toggles live (the sink is already wired); only
-    // the disk/in-memory `persist` choice is fixed at startup.
     state.probe_log.reconfigure(new_cfg.upstream_log.enabled);
 
     *state.config.write().await = new_cfg;
@@ -278,9 +246,7 @@ pub fn ensure_dirs(paths: &Paths) -> anyhow::Result<()> {
         .with_context(|| format!("creating data dir {}", paths.data_dir.display()))?;
     std::fs::create_dir_all(&paths.lists_dir)
         .with_context(|| format!("creating lists dir {}", paths.lists_dir.display()))?;
-    // The data dir holds the admin password hash (config), browsing history
-    // (query log), and the DNS cache — restrict it to the owner so other local
-    // users can't read any of it. 0700 on the dir protects every file within.
+    // Protect stored credentials and query history.
     restrict_to_owner(&paths.data_dir);
     restrict_to_owner(&paths.lists_dir);
     Ok(())

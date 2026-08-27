@@ -1,28 +1,11 @@
-//! The compiled matching engine.
-//!
-//! The engine is **span-backed**: rather than keeping a parsed `Rule` struct per
-//! line (each pulling several heap allocations and storing the domain up to three
-//! times), it concatenates the kept source lines and the normalised domains into
-//! two flat arenas and represents every rule as a fixed [`RuleRecord`] of `u32`
-//! offsets. Lookup is by domain *hash*, not by domain string: exact and
-//! subdomain rules live in `HashMap<u64, Range>` indices whose values point into
-//! flat hit vectors, so there are no per-domain string keys and no per-entry
-//! `Vec`. A query hashes the name (and each suffix), probes the maps, and
-//! *verifies* each candidate's stored domain span against the query to reject the
-//! rare hash collision — correctness comes from the span check, never the hash.
-//! Wildcard/regex rules are bucketed by token (see [`crate::token`]) and scanned
-//! via fused `RegexSet`s exactly as before, their compiled programs held in a
-//! side arena.
+//! Span-backed compiled filtering engine.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
-use crate::rule::{Action, BuildRule, ClientInfo, Pattern, RewriteData, RuleMods, Rule};
+use crate::rule::{Action, BuildRule, ClientInfo, Pattern, RewriteData, Rule, RuleMods};
 
-/// A pass-through hasher for keys that are *already* well-distributed hashes
-/// (FNV token hashes for `scan_index`, FNV-1a domain hashes for the domain
-/// indices). Running them through a general-purpose hasher again is wasted work
-/// on every probe; this just forwards the integer.
+/// Pass-through hasher for pre-hashed integer keys.
 #[derive(Default)]
 struct IdentityHasher(u64);
 
@@ -40,8 +23,6 @@ impl std::hash::Hasher for IdentityHasher {
         self.0 = i;
     }
     fn write(&mut self, bytes: &[u8]) {
-        // The maps only ever use integer keys (routed through `write_u32`/
-        // `write_u64`); this arm exists only to satisfy the trait.
         for &b in bytes {
             self.0 = self.0.rotate_left(8) ^ b as u64;
         }
@@ -61,28 +42,21 @@ mod kind {
     pub const REGEX: u8 = 3;
 }
 
-/// A compiled rule, as a fixed-size record of offsets into the engine's arenas.
-/// No heap allocation of its own; the common plain-block rule is fully described
-/// by this ~20-byte record plus its slices of the shared text arenas. Field
-/// widths are sized to their domains: arena offsets and the (potentially large)
-/// mods index stay `u32`, but a source line fits `u16`, a domain ≤253 bytes fits
-/// `u8`, and list ids fit `u16`.
+/// Fixed-size rule record indexing shared arenas.
 #[derive(Debug, Clone)]
 struct RuleRecord {
-    /// Span start of the original source line in `raw_arena` (display / logging).
+    /// Source-line offset in `raw_arena`.
     raw_start: u32,
     /// For exact/subdomain rules: span start of the normalised domain in
     /// `domain_arena`. For wildcard/regex rules: index into `regexes`.
     dom_or_re: u32,
     /// Index into `mods`, or [`NO_MODS`].
     mods_idx: u32,
-    /// Length of the source line span. Saturated at `u16::MAX` — only a
-    /// pathological (>64 KiB) line would clip, and only its log display.
+    /// Source-line length, saturated at `u16::MAX`.
     raw_len: u16,
     /// Which loaded list this rule came from.
     list_id: u16,
-    /// For exact/subdomain rules: domain byte length (DNS names are ≤253). Zero
-    /// for wildcard/regex.
+    /// Domain length, or zero for wildcard/regex rules.
     dom_len: u8,
     action: Action,
     /// One of the [`kind`] tags.
@@ -114,9 +88,7 @@ impl Verdict {
     }
 }
 
-/// A hash-keyed domain index: `domain hash -> (start, len)` range into a flat
-/// hit vector of rule ids. Replaces a `HashMap<String, Vec<u32>>`, dropping the
-/// per-domain key string and the per-entry `Vec` allocation.
+/// Maps domain hashes to ranges in a flat rule-id vector.
 #[derive(Debug, Default)]
 struct DomainIndex {
     map: HashMap<u64, (u32, u32), BuildIdentityHasher>,
@@ -124,8 +96,7 @@ struct DomainIndex {
 }
 
 impl DomainIndex {
-    /// Build from `(hash, rule_id)` pairs. Pairs sharing a hash are grouped into
-    /// one contiguous run in `hits`.
+    /// Groups `(hash, rule_id)` pairs into contiguous hit ranges.
     fn build(mut pairs: Vec<(u64, u32)>) -> Self {
         pairs.sort_unstable_by_key(|p| p.0);
         let mut map: HashMap<u64, (u32, u32), BuildIdentityHasher> =
@@ -159,11 +130,7 @@ impl DomainIndex {
     }
 }
 
-/// The scan structures for one group of wildcard/regex rules: a token reverse
-/// index (only rules sharing a query token are checked) plus the tokenless rules
-/// grouped into fused `RegexSet` chunks (scanned on every query), with a per-rule
-/// fallback for any chunk that exceeds the size limit. Rules are split into two
-/// such groups — see [`FilterEngine::override_scan`] / [`block_scan`].
+/// Token-indexed and fallback wildcard/regex scans.
 #[derive(Debug, Default)]
 struct ScanGroup {
     scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher>,
@@ -180,15 +147,16 @@ impl ScanGroup {
 
     fn rule_count(&self) -> usize {
         self.scan_index.values().map(|v| v.len()).sum::<usize>()
-            + self.fallback_sets.iter().map(|(_, ids)| ids.len()).sum::<usize>()
+            + self
+                .fallback_sets
+                .iter()
+                .map(|(_, ids)| ids.len())
+                .sum::<usize>()
             + self.fallback_individual.len()
     }
 }
 
-/// Build a [`ScanGroup`] from `(rule id, safe tokens)` pairs: bucket each rule
-/// under its rarest token, and fuse the tokenless remainder into bounded
-/// `RegexSet` chunks. Factored out so the override and block-only groups build
-/// identically.
+/// Builds a scan group using each rule's rarest safe token.
 fn build_scan_group(
     meta: Vec<(u32, Vec<u32>)>,
     records: &[RuleRecord],
@@ -198,8 +166,6 @@ fn build_scan_group(
     let mut scan_index: HashMap<u32, Vec<u32>, BuildIdentityHasher> = HashMap::default();
     let mut scan_fallback: Vec<u32> = Vec::new();
     if token_index {
-        // Bucket each rule under its rarest token so a query only checks rules
-        // that share a token with it.
         let mut token_freq: HashMap<u32, u32, ahash::RandomState> = HashMap::default();
         for (_, toks) in &meta {
             for &t in toks {
@@ -217,9 +183,6 @@ fn build_scan_group(
             }
         }
     } else {
-        // No token index: every rule is always-scanned (fused into RegexSets).
-        // Used for the small override group so a query that skips the block group
-        // need not be tokenized at all.
         scan_fallback.extend(meta.iter().map(|(id, _)| *id));
     }
 
@@ -265,51 +228,33 @@ fn build_scan_group(
 /// A compiled, read-only set of filtering rules.
 #[derive(Debug, Default)]
 pub struct FilterEngine {
-    /// Fixed-size rule records (no per-rule heap allocation).
     rules: Vec<RuleRecord>,
     /// All kept source lines, concatenated. `RuleRecord::raw_*` index into this.
     raw_arena: Box<str>,
-    /// All normalised exact/subdomain domains, concatenated. The domain indices'
-    /// span verification and `MatchInfo` both read from here.
+    /// Concatenated normalized domains.
     domain_arena: Box<str>,
-    /// Modifier clusters, referenced by `RuleRecord::mods_idx`. Plain rules carry
-    /// no modifiers, so this stays small in practice.
+    /// Modifier clusters referenced by rule records.
     mods: Vec<RuleMods>,
     /// Compiled wildcard/regex programs, referenced by `RuleRecord::dom_or_re`.
     regexes: Vec<regex::Regex>,
-    /// Hasher used to turn a domain (or query suffix) into the `u64` key for the
-    /// exact/subdomain indices. Stored so build and query hash identically; a
-    /// fast (ahash) hash matters because every query hashes the name and each of
-    /// its suffixes. The 64-bit output is well-distributed, so the indices key it
-    /// through an identity hasher.
+    /// Shared domain hasher for build and lookup.
     dhash: ahash::RandomState,
     /// Exact-match domain index (`hosts` entries, fully-anchored rules).
     exact: DomainIndex,
     /// Subdomain-match domain index (`||domain^`, bare domains) — matches the
     /// domain and any subdomain.
     subdomain: DomainIndex,
-    /// Wildcard/regex rules that can *override* a domain match — i.e. allow
-    /// (`@@`) or `$important` rules, whose priority can exceed a plain domain
-    /// block. These are scanned on every query, since they could change the
-    /// verdict even when a domain rule already matched.
+    /// Wildcard/regex rules that can override domain matches.
     override_scan: ScanGroup,
-    /// Wildcard/regex rules that are plain blocks/rewrites (priority 1). They can
-    /// only ever *tie* a domain match, never outrank it, so they are scanned only
-    /// when no domain or override rule has matched — letting the common
-    /// blocked-domain query skip this (the larger) group entirely.
+    /// Plain wildcard/regex blocks scanned after higher-priority rules.
     block_scan: ScanGroup,
-    /// True if any rule carries a `$client=` or `$ctag=` modifier, i.e. its
-    /// verdict can depend on *which* client is asking.
+    /// Whether any verdict depends on the client.
     has_client_dependent_rules: bool,
-    /// A stable hash of the rule set's *content*. See the field's prior docs:
-    /// deterministic across reloads, perturbed by any rule add/remove/edit, used
-    /// by the response cache to invalidate memoised verdicts.
+    /// Stable rule-set content hash.
     content_hash: u64,
 }
 
-/// Fallback rules are grouped into `RegexSet` chunks of at most this many
-/// patterns, so each set stays within its size limit and matching stays a
-/// bounded number of fused passes.
+/// Maximum patterns per fallback `RegexSet`.
 const FALLBACK_CHUNK: usize = 256;
 
 /// Compiled-size cap for each fallback `RegexSet` chunk (bytes).
@@ -324,10 +269,7 @@ fn is_subdomain_of(domain: &str, base: &str) -> bool {
 }
 
 impl FilterEngine {
-    /// Build an engine from already-prepared rules (ids are the record index).
-    /// Rules disabled by a `$badfilter` should be filtered out by the caller; see
-    /// [`crate::list::Compiler`]. The build-time [`BuildRule`] data is consumed
-    /// here and replaced by the compact span-backed representation.
+    /// Builds an engine from rules prepared by [`crate::list::Compiler`].
     pub fn from_rules(rules: Vec<BuildRule>) -> Self {
         let mut raw_arena = String::new();
         let mut domain_arena = String::new();
@@ -338,15 +280,11 @@ impl FilterEngine {
         let dhash = ahash::RandomState::new();
         let mut exact_pairs: Vec<(u64, u32)> = Vec::new();
         let mut sub_pairs: Vec<(u64, u32)> = Vec::new();
-        // (rule id, safe interior tokens) for wildcard/regex rules, split by
-        // whether the rule can override a domain match (allow / `$important`).
         let mut override_meta: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut block_meta: Vec<(u32, Vec<u32>)> = Vec::new();
 
         let mut has_client_dependent_rules = false;
 
-        // Deterministic content hash over the retained rule fields (fixed-key
-        // `DefaultHasher`, so the same rules always hash the same across reloads).
         let mut ch = std::collections::hash_map::DefaultHasher::new();
 
         for (i, br) in rules.into_iter().enumerate() {
@@ -408,14 +346,22 @@ impl FilterEngine {
                 Pattern::Wildcard(re) => {
                     let idx = regexes.len() as u32;
                     regexes.push(re);
-                    let meta = if override_capable { &mut override_meta } else { &mut block_meta };
+                    let meta = if override_capable {
+                        &mut override_meta
+                    } else {
+                        &mut block_meta
+                    };
                     meta.push((id, index_tokens));
                     (kind::WILDCARD, idx, 0)
                 }
                 Pattern::Regex(re) => {
                     let idx = regexes.len() as u32;
                     regexes.push(re);
-                    let meta = if override_capable { &mut override_meta } else { &mut block_meta };
+                    let meta = if override_capable {
+                        &mut override_meta
+                    } else {
+                        &mut block_meta
+                    };
                     meta.push((id, index_tokens));
                     (kind::REGEX, idx, 0)
                 }
@@ -434,10 +380,6 @@ impl FilterEngine {
         }
         let content_hash = ch.finish();
 
-        // Build the two wildcard/regex scan groups. The block group token-indexes
-        // (it's the large one). The override group does NOT — it is small and
-        // always scanned, and keeping it token-free means a blocked-domain query,
-        // which skips the block group, is never tokenized.
         let override_scan = build_scan_group(override_meta, &records, &regexes, false);
         let block_scan = build_scan_group(block_meta, &records, &regexes, true);
 
@@ -482,10 +424,7 @@ impl FilterEngine {
         (r.mods_idx != NO_MODS).then(|| &self.mods[r.mods_idx as usize])
     }
 
-    /// Confirm a hash-bucket candidate genuinely matches `domain`, rejecting the
-    /// rare 64-bit hash collision. Exact rules must equal the domain; subdomain
-    /// rules must be a suffix of it; wildcard/regex rules were already confirmed
-    /// by their regex match when collected.
+    /// Verifies a hash-bucket candidate against its stored domain.
     #[inline]
     fn domain_matches(&self, r: &RuleRecord, domain: &str) -> bool {
         match r.kind {
@@ -495,8 +434,7 @@ impl FilterEngine {
         }
     }
 
-    /// Priority score (higher wins): `$important` adds a large bonus; among equal
-    /// importance allow beats block, and rewrites sit alongside blocks.
+    /// Returns the rule's winner-selection priority.
     #[inline]
     fn priority(&self, r: &RuleRecord) -> u32 {
         let mut score = match r.action {
@@ -509,14 +447,12 @@ impl FilterEngine {
         score
     }
 
-    /// Whether any rule's verdict can depend on the querying client (`$client=`
-    /// or `$ctag=`).
+    /// Whether any verdict can depend on the client.
     pub fn has_client_dependent_rules(&self) -> bool {
         self.has_client_dependent_rules
     }
 
-    /// A stable hash of the rule set's content, used as a generation stamp for
-    /// memoised response verdicts.
+    /// Stable rule-set generation hash.
     pub fn content_hash(&self) -> u64 {
         self.content_hash
     }
@@ -530,10 +466,7 @@ impl FilterEngine {
         self.rules.is_empty()
     }
 
-    /// Approximate retained-heap breakdown, in bytes, for tuning. Counts the
-    /// large flat allocations (records, arenas, index tables + hit vectors); the
-    /// long tail (mods/regex heap, scan index) is lumped under `other`. Intended
-    /// for the `memprobe` example, not production use.
+    /// Approximate retained-heap breakdown for tuning.
     #[doc(hidden)]
     pub fn mem_report(&self) -> [(&'static str, usize); 5] {
         let rec = self.rules.capacity() * std::mem::size_of::<RuleRecord>();
@@ -553,12 +486,7 @@ impl FilterEngine {
         ]
     }
 
-    /// Wildcard/regex scan-structure sizes, for tuning the regex hot path.
-    /// `scan_index` rules are only checked when a query shares their token;
-    /// `fallback_set` patterns + `fallback_individual` rules are scanned on
-    /// *every* query, so they dominate regex-path latency. Returns
-    /// (token-indexed rules, fallback_set chunks, fallback_set patterns,
-    /// always-scanned-individual rules).
+    /// Wildcard/regex scan sizes for tuning.
     #[doc(hidden)]
     pub fn scan_report(&self) -> [(&'static str, usize); 2] {
         [
@@ -567,11 +495,7 @@ impl FilterEngine {
         ]
     }
 
-    /// Gather exact + subdomain candidates by domain hash. Pushes raw bucket hits
-    /// *without* verifying the span — verification is folded into the
-    /// winner-selection loop in `check`, which loads the record anyway, so a
-    /// candidate costs one record load, not two. The hash narrows; the span check
-    /// rejects the (astronomically rare) collision.
+    /// Collects exact and subdomain candidates by hash.
     fn collect_domain(&self, domain: &str, out: &mut Vec<u32>) {
         if !self.exact.is_empty() {
             out.extend_from_slice(self.exact.get(self.dhash.hash_one(domain)));
@@ -588,10 +512,7 @@ impl FilterEngine {
         }
     }
 
-    /// Gather the wildcard/regex rules in `group` that match `domain` (fused
-    /// `RegexSet` chunks + per-rule fallback + token-indexed probes). `tokens`
-    /// are the query's precomputed token hashes — computed once in `check` and
-    /// shared across both groups so a query is never tokenized twice.
+    /// Collects matching wildcard and regex rules.
     fn scan_group(&self, group: &ScanGroup, domain: &str, tokens: &[u32], out: &mut Vec<u32>) {
         let check = |id: u32, out: &mut Vec<u32>| {
             let r = &self.rules[id as usize];
@@ -620,9 +541,7 @@ impl FilterEngine {
         }
     }
 
-    /// Pick the highest-priority applicable rule among `ids`, updating the running
-    /// `best`/`best_prio`. At equal priority the earlier candidate wins (domain
-    /// candidates are gathered before wildcard ones), so attribution is stable.
+    /// Updates the highest-priority applicable candidate.
     fn consider(
         &self,
         ids: &[u32],
@@ -645,9 +564,14 @@ impl FilterEngine {
         }
     }
 
-    /// Is `r` applicable to this query (modifiers, client, denyallow)?
-    fn applicable(&self, r: &RuleRecord, domain: &str, rtype: &str, client: &ClientInfo<'_>) -> bool {
-        // Plain rules (no modifiers) always apply — the common, fast path.
+    /// Checks rule modifiers against a query.
+    fn applicable(
+        &self,
+        r: &RuleRecord,
+        domain: &str,
+        rtype: &str,
+        client: &ClientInfo<'_>,
+    ) -> bool {
         let Some(m) = self.mods_of(r) else {
             return true;
         };
@@ -666,7 +590,6 @@ impl FilterEngine {
                 return false;
             }
         }
-        // `$denyallow`: the (blocking) rule does *not* apply to these domains.
         if matches!(r.action, Action::Block | Action::Rewrite)
             && m.denyallow.iter().any(|base| is_subdomain_of(domain, base))
         {
@@ -686,43 +609,49 @@ impl FilterEngine {
             domain
         };
 
-        // Reuse per-thread scratch buffers to avoid allocating on every query.
         thread_local! {
             static CANDIDATES: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
             static TOKENS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
         }
 
-        let best_id = CANDIDATES.with(|ccell| TOKENS.with(|tcell| {
-            let mut candidates = ccell.borrow_mut();
-            let mut best: Option<u32> = None;
-            let mut best_prio = 0u32;
+        let best_id = CANDIDATES.with(|ccell| {
+            TOKENS.with(|tcell| {
+                let mut candidates = ccell.borrow_mut();
+                let mut best: Option<u32> = None;
+                let mut best_prio = 0u32;
 
-            // Phase 1: domain rules + override-capable wildcards (allow /
-            // `$important`). The override group has no token index, so this phase
-            // needs no tokenization — a blocked-domain query stops here.
-            candidates.clear();
-            self.collect_domain(domain, &mut candidates);
-            self.scan_group(&self.override_scan, domain, &[], &mut candidates);
-            self.consider(&candidates, domain, rtype, client, &mut best, &mut best_prio);
-
-            // Phase 2: block-only wildcards (priority 1). They can never outrank
-            // an existing match — any applicable match already has priority >= 1
-            // and ties go to the earlier (domain) candidate — so scan them only
-            // when nothing has matched yet, and tokenize the query only here. This
-            // lets the common blocked-domain query skip both the larger scan group
-            // and tokenization entirely.
-            if best.is_none() && !self.block_scan.is_empty() {
-                let mut tokens = tcell.borrow_mut();
-                tokens.clear();
-                if !self.block_scan.scan_index.is_empty() {
-                    crate::token::for_each_query_token(domain, |t| tokens.push(t));
-                }
                 candidates.clear();
-                self.scan_group(&self.block_scan, domain, &tokens, &mut candidates);
-                self.consider(&candidates, domain, rtype, client, &mut best, &mut best_prio);
-            }
-            best
-        }));
+                self.collect_domain(domain, &mut candidates);
+                self.scan_group(&self.override_scan, domain, &[], &mut candidates);
+                self.consider(
+                    &candidates,
+                    domain,
+                    rtype,
+                    client,
+                    &mut best,
+                    &mut best_prio,
+                );
+
+                if best.is_none() && !self.block_scan.is_empty() {
+                    let mut tokens = tcell.borrow_mut();
+                    tokens.clear();
+                    if !self.block_scan.scan_index.is_empty() {
+                        crate::token::for_each_query_token(domain, |t| tokens.push(t));
+                    }
+                    candidates.clear();
+                    self.scan_group(&self.block_scan, domain, &tokens, &mut candidates);
+                    self.consider(
+                        &candidates,
+                        domain,
+                        rtype,
+                        client,
+                        &mut best,
+                        &mut best_prio,
+                    );
+                }
+                best
+            })
+        });
 
         match best_id {
             None => Verdict::Allow { rule: None },

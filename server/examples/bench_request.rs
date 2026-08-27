@@ -1,25 +1,7 @@
-//! Whole-request-chain benchmark + profiler.
+//! Full request-chain benchmark and profiler.
 //!
-//! Drives the full engine pipeline (client id → filter → cache → upstream →
-//! stats/log) against **real** filter lists (AdGuard SDNS Filter + OISD Big)
-//! and an in-process mock UDP upstream, so the numbers reflect a realistic
-//! resolver under realistic rule volume — without depending on the public
-//! internet at query time.
-//!
-//! Run with:
-//!   cargo run --release --example bench_request -p bulwark
-//!
-//! The filter lists are downloaded once into `target/bench-data/` (override the
-//! directory with `BENCH_DATA_DIR`). If the network is unavailable, a synthetic
-//! fallback list is used so the benchmark still runs.
-//!
-//! Knobs (env):
-//!   BENCH_N                 per-scenario iterations          (default 20000)
-//!   BENCH_UPSTREAM_DELAY_US simulated upstream RTT, µs       (default 0)
-//!   BENCH_CONCURRENCY       concurrent in-flight queries     (default 64)
-//!   BENCH_DATA_DIR          where to cache the lists
+//! Run with `cargo run --release --example bench_request -p bulwark`.
 
-// Mirror the server's global allocator so the bench reflects production.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -53,16 +35,10 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-// ---------------------------------------------------------------------------
-// Filter list loading (download-once + cache).
-// ---------------------------------------------------------------------------
-
 fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("BENCH_DATA_DIR") {
         return PathBuf::from(d);
     }
-    // CARGO_MANIFEST_DIR is .../bulwark/server when run via `cargo run`; when run
-    // as a bare binary it is unset and cwd is the workspace root.
     let base = std::env::var("CARGO_MANIFEST_DIR")
         .map(|m| PathBuf::from(m).join(".."))
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -91,8 +67,6 @@ async fn fetch_list(url: &str, name: &str) -> Option<String> {
     let _ = std::fs::write(&path, &text);
     Some(text)
 }
-
-/// Compile the real lists exactly the way the server does (dedup + $badfilter).
 async fn build_filter() -> (FilterEngine, Vec<String>) {
     let mut compiler = Compiler::new();
     let mut got_real = false;
@@ -117,14 +91,9 @@ async fn build_filter() -> (FilterEngine, Vec<String>) {
     let t0 = Instant::now();
     let (engine, _stats) = compiler.build();
     println!("  compiled {} rules in {:?}", engine.len(), t0.elapsed());
-
-    // Harvest real blocked domains from the engine's own rule set so the
-    // "blocked" workload hits actual list entries.
     let blocked = sample_blocked_domains();
     (engine, blocked)
 }
-
-/// Re-read the cached list files and extract plain blockable domains.
 fn sample_blocked_domains() -> Vec<String> {
     let dir = data_dir();
     let mut out = Vec::new();
@@ -133,7 +102,6 @@ fn sample_blocked_domains() -> Vec<String> {
             for line in text.lines() {
                 let line = line.trim();
                 if let Some(d) = parse_blockable(line) {
-                    // Keep only names the DNS parser accepts as queries.
                     if Name::from_str(&format!("{d}.")).is_ok() {
                         out.push(d);
                         if out.len() >= 50_000 {
@@ -145,15 +113,12 @@ fn sample_blocked_domains() -> Vec<String> {
         }
     }
     if out.is_empty() {
-        // Synthetic fallback domains.
         for i in 0..20_000 {
             out.push(format!("ads{i}.example{}.com", i % 997));
         }
     }
     out
 }
-
-/// Extract a simple `||domain^` or `0.0.0.0 domain` blockable domain.
 fn parse_blockable(line: &str) -> Option<String> {
     if line.is_empty() || line.starts_with('!') || line.starts_with('#') {
         return None;
@@ -177,8 +142,6 @@ fn parse_blockable(line: &str) -> Option<String> {
     }
     None
 }
-
-/// A handful of real popular domains, used as the "allowed / forwarded" set.
 const POPULAR: &[&str] = &[
     "google.com",
     "youtube.com",
@@ -201,10 +164,6 @@ const POPULAR: &[&str] = &[
     "wordpress.org",
     "debian.org",
 ];
-
-/// A representative set of configured clients (~16 CIDR/host entries) so the
-/// client-matcher microbench exercises a realistic longest-prefix scan rather
-/// than an empty matcher that returns on the first check.
 fn sample_clients() -> Vec<ClientConfig> {
     let mut clients: Vec<ClientConfig> = (0..15)
         .map(|i| ClientConfig {
@@ -215,8 +174,6 @@ fn sample_clients() -> Vec<ClientConfig> {
             filtering_enabled: true,
         })
         .collect();
-    // The IP the microbench probes (192.168.1.50) matches this entry, so the
-    // scan walks every CIDR before settling on the longest-prefix match.
     clients.push(ClientConfig {
         id: "home".into(),
         name: "home-lan".into(),
@@ -226,13 +183,6 @@ fn sample_clients() -> Vec<ClientConfig> {
     });
     clients
 }
-
-// ---------------------------------------------------------------------------
-// Mock upstream.
-// ---------------------------------------------------------------------------
-
-/// Spawn a mock UDP resolver. Names starting with `nx-` get NXDOMAIN (so the
-/// negative-cache path is exercised); everything else gets `A 1.2.3.4`.
 async fn mock_upstream(delay: Duration) -> (SocketAddr, Arc<AtomicU64>) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -273,10 +223,6 @@ async fn mock_upstream(delay: Duration) -> (SocketAddr, Arc<AtomicU64>) {
     });
     (addr, count)
 }
-
-// ---------------------------------------------------------------------------
-// Engine construction.
-// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 async fn build_engine(
@@ -320,19 +266,11 @@ async fn build_engine(
     attach_drained_sink(&engine);
     engine
 }
-
-/// Attach a query-log sink with a background drainer, mirroring production where
-/// each logged entry is sent to the writer task. Without this the log's `push`
-/// would be a no-op (no sink), under-counting the per-query send cost.
 fn attach_drained_sink(engine: &Arc<Engine>) {
-    // Generous bound: the drainer keeps it near-empty, so nothing is dropped.
     let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 20);
     engine.log().set_sink(tx);
     tokio::spawn(async move { while rx.recv().await.is_some() {} });
 }
-
-/// Like `build_engine`, but with independent control over whether the query log
-/// and stats recorders are enabled — used to isolate `finalize()`'s cost.
 async fn build_engine_obs(
     filter: Arc<FilterEngine>,
     upstream: SocketAddr,
@@ -392,17 +330,9 @@ fn query(name: &str, rtype: RecordType) -> Message {
 fn local() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
-
-/// Encode a query and run it through the real listener ingress (`Ingress::parse`,
-/// the minimal fast path), so timed batches feed `handle` exactly what the server
-/// does. Done outside timed loops, so the encode/parse isn't charged to `handle`.
 fn ingress(m: Message) -> Ingress {
     Ingress::parse(&m.to_vec().unwrap()).expect("query should be decodable")
 }
-
-// ---------------------------------------------------------------------------
-// Measurement helpers.
-// ---------------------------------------------------------------------------
 
 fn report(label: &str, mut ns: Vec<u64>) {
     if ns.is_empty() {
@@ -424,12 +354,6 @@ fn report(label: &str, mut ns: Vec<u64>) {
         1e9 / mean,
     );
 }
-
-/// Time one async whole-chain scenario over `timed`, after priming code paths
-/// (and, where intended, the cache) with the separate `warm` batch. `warm`
-/// messages are NOT timed: warming the *timed* set would turn ~10% of a
-/// miss-labelled scenario into cache hits and understate the path. Pass an empty
-/// `warm` when the engine was already primed externally.
 async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Ingress>, timed: Vec<Ingress>) {
     for ing in warm {
         let _ = engine.handle(ing, local()).await;
@@ -442,28 +366,18 @@ async fn scenario(engine: &Arc<Engine>, label: &str, warm: Vec<Ingress>, timed: 
     }
     report(label, ns);
 }
-
-/// Split a batch into a warmup slice (first ~10%, cloned) and the full timed
-/// batch — the right shape for hit/warm-cache scenarios where re-timing the
-/// warmed messages is correct (they are cache hits either way).
 fn warm_then_time(msgs: Vec<Ingress>) -> (Vec<Ingress>, Vec<Ingress>) {
-    let warm = msgs.iter().take((msgs.len() / 10).max(1)).cloned().collect();
+    let warm = msgs
+        .iter()
+        .take((msgs.len() / 10).max(1))
+        .cloned()
+        .collect();
     (warm, msgs)
 }
 
 fn many(domains: impl Iterator<Item = String>, rtype: RecordType) -> Vec<Ingress> {
     domains.map(|d| ingress(query(&d, rtype))).collect()
 }
-
-// ---------------------------------------------------------------------------
-// Phase 0: A/B of the optimized hot-path steps (deterministic, low-variance).
-//
-// Isolates exactly the CPU work changed in `Engine::handle`, so the before/after
-// delta is not drowned out by upstream I/O or scheduler noise. Reports best-of-N
-// (minimum = least perturbed by background load).
-// ---------------------------------------------------------------------------
-
-/// Run `f` `trials` times over `n` iterations; return the best (lowest) ns/op.
 fn best_ns_per_op(trials: u32, n: usize, mut f: impl FnMut(usize) -> usize) -> u128 {
     let mut best = u128::MAX;
     for _ in 0..trials {
@@ -477,8 +391,6 @@ fn best_ns_per_op(trials: u32, n: usize, mut f: impl FnMut(usize) -> usize) -> u
     }
     best
 }
-
-/// Local copy of the engine's new `rcode_label` (private there) for the A/B.
 fn rcode_label(code: ResponseCode) -> String {
     let s = match code {
         ResponseCode::NoError => "NOERROR",
@@ -500,10 +412,6 @@ fn phase0_ab(blocked: &[String]) {
         .take(5_000)
         .map(|d| query(d, RecordType::A))
         .collect();
-
-    // --- Name + cache-key derivation, per query ---
-    // OLD: lowercase the name for `domain`, then QueryKey::from_message re-walks
-    //      the wire name and lowercases it a *second* time.
     let old = best_ns_per_op(5, n, |i| {
         let m = &msgs[i % msgs.len()];
         let q = m.queries.first().unwrap();
@@ -512,7 +420,6 @@ fn phase0_ab(blocked: &[String]) {
         let key = QueryKey::from_message(m).unwrap();
         domain.len() + key.name.len()
     });
-    // NEW: normalize once; `domain` is a borrow; the key reuses that string.
     let new = best_ns_per_op(5, n, |i| {
         let m = &msgs[i % msgs.len()];
         let q = m.queries.first().unwrap();
@@ -533,8 +440,6 @@ fn phase0_ab(blocked: &[String]) {
         "  name+key derivation         old={old:>4} ns/op   new={new:>4} ns/op   ({:+.0}%)",
         (new as f64 - old as f64) / old as f64 * 100.0
     );
-
-    // --- Response-code label, per query (runs on every response) ---
     let codes = [
         ResponseCode::NoError,
         ResponseCode::NXDomain,
@@ -549,10 +454,6 @@ fn phase0_ab(blocked: &[String]) {
         "  rcode label                 old={old_r:>4} ns/op   new={new_r:>4} ns/op   ({:+.0}%)",
         (new_r as f64 - old_r as f64) / old_r as f64 * 100.0
     );
-
-    // --- Record-type label, per query (runs on every query: filter + log) ---
-    // OLD: RecordType::to_string() heap-allocates. NEW: a borrowed &'static str
-    // for the common types.
     let rtypes = [
         RecordType::A,
         RecordType::AAAA,
@@ -566,8 +467,6 @@ fn phase0_ab(blocked: &[String]) {
         (new_t as f64 - old_t as f64) / old_t as f64 * 100.0
     );
 }
-
-/// Local copy of the engine's new `rtype_label` (private there) for the A/B.
 fn rtype_label(rt: RecordType) -> &'static str {
     match rt {
         RecordType::A => "A",
@@ -578,28 +477,17 @@ fn rtype_label(rt: RecordType) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 1: per-stage micro-profile (isolates each step's CPU cost).
-// ---------------------------------------------------------------------------
-
 fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
     println!("\n== Phase 1: per-stage CPU cost (single-threaded, ns/op) ==");
     let n = 500_000usize;
     let ci = ClientInfo::default();
-    // Two matchers: the empty default (unknown-IP fast path — the common case
-    // when no named clients are configured) and a populated one (~16 CIDRs) so
-    // the longest-prefix scan cost is represented for setups that name clients.
     let empty_matcher = ClientMatcher::default();
     let populated_matcher = ClientMatcher::build(&sample_clients());
     let ip: IpAddr = "192.168.1.50".parse().unwrap();
-
-    // Build a representative set of query names.
     let hits: Vec<&str> = blocked.iter().take(10_000).map(|s| s.as_str()).collect();
     let misses: Vec<String> = (0..10_000)
         .map(|i| format!("node{i}.cdn-{}.example", i % 31))
         .collect();
-
-    // (a) Name normalization as handle() does it (to_ascii + lowercase).
     let names: Vec<Name> = hits
         .iter()
         .map(|h| Name::from_str(&format!("{h}.")).unwrap())
@@ -617,8 +505,6 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         "name normalize (ascii+lc)",
         t.elapsed().as_nanos() / n as u128
     );
-
-    // (b) QueryKey::from_message.
     let msgs: Vec<Message> = hits.iter().map(|h| query(h, RecordType::A)).collect();
     let t = Instant::now();
     let mut acc = 0usize;
@@ -632,11 +518,6 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         "QueryKey::from_message",
         t.elapsed().as_nanos() / n as u128
     );
-
-    // (c) Client identification. The real identify() returns a ResolvedClient
-    // without stringifying the IP, so the sink reads a cheap bool field rather
-    // than calling to_string() (which previously added ~40 ns of bench-only work
-    // and pessimistically inflated this line).
     let t = Instant::now();
     let mut acc = 0usize;
     for _ in 0..n {
@@ -657,8 +538,6 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         "clients.identify (16 CIDRs)",
         t.elapsed().as_nanos() / n as u128
     );
-
-    // (d) Filter check — blocked (hits real list rules).
     let t = Instant::now();
     let mut blk = 0u64;
     for i in 0..n {
@@ -671,8 +550,6 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
         "filter.check (blocked)",
         t.elapsed().as_nanos() / n as u128
     );
-
-    // (e) Filter check — no match (the common resolver case).
     let t = Instant::now();
     for i in 0..n {
         let _ = filter.check(&misses[i % misses.len()], "A", &ci);
@@ -684,10 +561,6 @@ fn phase1_stage_profile(filter: &FilterEngine, blocked: &[String]) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2: whole-chain latency per scenario.
-// ---------------------------------------------------------------------------
-
 async fn phase2_scenarios(
     filter: Arc<FilterEngine>,
     blocked: &[String],
@@ -695,8 +568,6 @@ async fn phase2_scenarios(
     n: usize,
 ) {
     println!("\n== Phase 2: whole-chain latency per scenario ==");
-
-    // Production-like engine: optimistic cache on, generous stale window.
     let engine = build_engine(
         filter.clone(),
         upstream,
@@ -706,15 +577,9 @@ async fn phase2_scenarios(
         true,
     )
     .await;
-
-    // Blocked: real list domains -> synthesized NXDOMAIN, never touches upstream.
     let bset: Vec<String> = blocked.iter().cloned().cycle().take(n).collect();
     let (warm, timed) = warm_then_time(many(bset.into_iter(), RecordType::A));
     scenario(&engine, "blocked", warm, timed).await;
-
-    // Forwarded miss: unique never-seen domains -> mock upstream + cache insert.
-    // Warm with a *distinct* set of misses so every timed query is a genuine
-    // miss — warming the timed set itself would cache ~10% of them.
     let warm_fwd = (0..(n / 10).max(1))
         .map(|i| format!("warm{i}-{}.bench-fwd.example", rand::random::<u32>()));
     let fwd = (0..n).map(|i| format!("u{i}-{}.bench-fwd.example", rand::random::<u32>()));
@@ -725,24 +590,20 @@ async fn phase2_scenarios(
         many(fwd, RecordType::A),
     )
     .await;
-
-    // Cache hit (fresh): warm one domain, then hammer it (already primed, so the
-    // timed batch needs no further warmup).
     let _ = engine
         .handle(ingress(query("cache-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "cache-hot.example".to_string());
-    scenario(&engine, "cache hit (fresh)", Vec::new(), many(hot, RecordType::A)).await;
-
-    // Allowlisted / popular: forwarded, exercises the full miss-then-cache mix
-    // across a small working set (mostly cache hits after warmup).
+    scenario(
+        &engine,
+        "cache hit (fresh)",
+        Vec::new(),
+        many(hot, RecordType::A),
+    )
+    .await;
     let pop = (0..n).map(|i| POPULAR[i % POPULAR.len()].to_string());
     let (warm, timed) = warm_then_time(many(pop, RecordType::A));
     scenario(&engine, "popular set (warm cache)", warm, timed).await;
-
-    // Negative cache: nx- domains -> NXDOMAIN, cached negatively after first.
-    // Only 64 unique names, so warm all 64 to measure the steady negative-hit
-    // path (the first occurrence of each would otherwise be a miss).
     let nx_warm = (0..64).map(|i| format!("nx-{}.bench.example", i));
     let nx = (0..n).map(|i| format!("nx-{}.bench.example", i % 64));
     scenario(
@@ -752,8 +613,6 @@ async fn phase2_scenarios(
         many(nx, RecordType::A),
     )
     .await;
-
-    // Filtering disabled: skips the filter stage entirely.
     let nofilter = build_engine(
         filter.clone(),
         upstream,
@@ -774,9 +633,6 @@ async fn phase2_scenarios(
         many(nf, RecordType::A),
     )
     .await;
-
-    // Optimistic stale serve: a dead upstream means background refresh never
-    // succeeds, so every lookup serves the stale entry (isolates that path).
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let stale_engine = build_engine(
         filter.clone(),
@@ -787,7 +643,6 @@ async fn phase2_scenarios(
         true,
     )
     .await;
-    // Insert a fresh entry directly, then let it age past its 1s TTL.
     let key = QueryKey::from_message(&query("stale-hot.example.", RecordType::A)).unwrap();
     let mut warm = query("stale-hot.example.", RecordType::A);
     warm.metadata.message_type = MessageType::Response;
@@ -809,70 +664,67 @@ async fn phase2_scenarios(
     .await;
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2b: finalize() cost — cache-hit path with observability on vs off.
-//
-// `finalize()` runs on *every* query and, when stats/log are enabled, builds
-// answer summaries, stringifies the client IP, reads the wall clock, locks a
-// stats shard, and pushes a log entry. The "fully off" run early-returns before
-// any of that, so on - off ≈ the finalize cost paid per cached query in prod.
-// ---------------------------------------------------------------------------
-
 async fn phase2b_finalize(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) {
     println!("\n== Phase 2b: finalize() cost on the cache-hit path (obs on vs off) ==");
-
-    // stats + log ON (production default).
     let on = build_engine_obs(filter.clone(), upstream, true, true).await;
     let _ = on
         .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&on, "cache hit (stats+log on)", Vec::new(), many(hot, RecordType::A)).await;
-
-    // stats + log OFF (finalize early-returns the response untouched).
+    scenario(
+        &on,
+        "cache hit (stats+log on)",
+        Vec::new(),
+        many(hot, RecordType::A),
+    )
+    .await;
     let off = build_engine_obs(filter.clone(), upstream, false, false).await;
     let _ = off
         .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&off, "cache hit (obs off)", Vec::new(), many(hot, RecordType::A)).await;
-
-    // stats only / log only, to attribute the cost between the two recorders.
+    scenario(
+        &off,
+        "cache hit (obs off)",
+        Vec::new(),
+        many(hot, RecordType::A),
+    )
+    .await;
     let stats_only = build_engine_obs(filter.clone(), upstream, true, false).await;
     let _ = stats_only
         .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&stats_only, "cache hit (stats only)", Vec::new(), many(hot, RecordType::A)).await;
+    scenario(
+        &stats_only,
+        "cache hit (stats only)",
+        Vec::new(),
+        many(hot, RecordType::A),
+    )
+    .await;
 
     let log_only = build_engine_obs(filter.clone(), upstream, false, true).await;
     let _ = log_only
         .handle(ingress(query("fin-hot.example.", RecordType::A)), local())
         .await;
     let hot = (0..n).map(|_| "fin-hot.example".to_string());
-    scenario(&log_only, "cache hit (log only)", Vec::new(), many(hot, RecordType::A)).await;
+    scenario(
+        &log_only,
+        "cache hit (log only)",
+        Vec::new(),
+        many(hot, RecordType::A),
+    )
+    .await;
 }
-
-// ---------------------------------------------------------------------------
-// Phase 2c: finalize() component micro-costs (deterministic, best-of-5).
-//
-// Isolates the individual allocators/syscalls inside finalize()+build() so we
-// know which ones are worth eliminating.
-// ---------------------------------------------------------------------------
 
 fn phase2c_finalize_components() {
     println!("\n== Phase 2c: finalize() component micro-costs (best-of-5) ==");
     let n = 1_000_000usize;
-
-    // A representative A response: two answer records, like a real reply.
     let name = Name::from_str("cache-hot.example.").unwrap();
     let recs = [
         Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(1, 2, 3, 4)))),
         Record::from_rdata(name.clone(), 300, RData::A(A(Ipv4Addr::new(5, 6, 7, 8)))),
     ];
-
-    // (a) Answer summaries: `resp.answers.iter().map(summarize).collect()`,
-    //     where summarize = format!("{} {}", record_type, data).
     let summaries = best_ns_per_op(5, n, |_| {
         let v: Vec<String> = recs
             .iter()
@@ -881,13 +733,9 @@ fn phase2c_finalize_components() {
         v.iter().map(|s| s.len()).sum::<usize>()
     });
     println!("  answer summaries (2 recs)   {summaries:>4} ns/op");
-
-    // (b) client_ip.to_string() in LogBuilder::build.
     let ip: IpAddr = "192.168.1.50".parse().unwrap();
     let ip_cost = best_ns_per_op(5, n, |_| ip.to_string().len());
     println!("  client_ip.to_string()       {ip_cost:>4} ns/op");
-
-    // (c) now_ms(): a SystemTime::now() syscall per query.
     let now_cost = best_ns_per_op(5, n, |_| {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -895,12 +743,6 @@ fn phase2c_finalize_components() {
             .unwrap_or(0)
     });
     println!("  now_ms() (SystemTime::now)  {now_cost:>4} ns/op");
-
-    // (d) What a wire-byte cache would replace, per cache hit:
-    //   - the Message clone done in adjust_ttls()  (cache hit, in handle)
-    //   - the Message::to_vec() re-encode          (server, AFTER handle — not
-    //     captured by Phase 2, which times handle() only)
-    // vs. what it would cost instead: a flat Vec<u8> clone + in-place TTL patch.
     let mut resp = Message::new(0x1234, MessageType::Response, OpCode::Query);
     let mut q = Query::query(name.clone(), RecordType::A);
     q.set_query_class(DNSClass::IN);
@@ -920,25 +762,9 @@ fn phase2c_finalize_components() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2d: query-log build + push cost (deterministic).
-//
-// Isolates exactly the per-query log work — constructing a QueryLogEntry (its
-// string allocations) and handing it to the writer over the unbounded channel
-// (a node alloc + atomic enqueue; the entry is moved, not cloned). A background
-// task drains the channel so it doesn't grow unbounded, matching production.
-// Same-run A/B (build-only vs build+send), so it is immune to the cross-run
-// thermal drift that makes Phase 2 means hard to compare.
-//
-// The writer's own work (the SQLite insert transaction) runs on a background
-// task, off the query's hot path entirely, so it is not measured here.
-// ---------------------------------------------------------------------------
-
 fn phase2d_log_microbench() {
     println!("\n== Phase 2d: query-log build + channel send (best-of-5) ==");
     let n = 200_000usize;
-
-    // A representative cached A response: one answer record.
     let name = Name::from_str("cache-hot.example.").unwrap();
     let recs = [Record::from_rdata(
         name.clone(),
@@ -946,10 +772,6 @@ fn phase2d_log_microbench() {
         RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
     )];
     let ip: IpAddr = "192.168.1.50".parse().unwrap();
-
-    // Build a fresh entry exactly as `finalize()` + `LogBuilder::build()` do:
-    // client-IP string, the question string, and the formatted answer summaries
-    // are the allocations of interest.
     let make_entry = || QueryLogEntry {
         id: 0,
         time_ms: 1_700_000_000_000,
@@ -965,19 +787,11 @@ fn phase2d_log_microbench() {
             .collect(),
         elapsed_ms: 0.5,
     };
-
-    // (a) Build the entry only (allocations, no insert).
     let build = best_ns_per_op(5, n, |_| {
         let e = make_entry();
         e.client_ip.len() + e.question.len() + e.answers.iter().map(|s| s.len()).sum::<usize>()
     });
-
-    // (b) Build + send to the writer channel (the real hot-path handoff). A
-    // receiver is attached and drained *between* timed trials — outside the
-    // timer — so the unbounded channel stays bounded without charging the recv
-    // cost to the measurement.
     let log = QueryLog::new(true, false);
-    // Cap exceeds the per-trial push count, so the bench never sheds entries.
     let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 20);
     log.set_sink(tx);
     let mut buildpush = u128::MAX;
@@ -997,28 +811,12 @@ fn phase2d_log_microbench() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2e: end-to-end cache hit *including* the wire encode the server does.
-//
-// Phase 2 times handle() only; the wire-byte cache's biggest win — skipping the
-// per-response Message::to_vec re-encode — happens in the server, after handle().
-// This phase measures the full client-facing CPU two ways, same run (so it is
-// thermal-drift-immune): the real wire-byte path (send bytes as-is) vs. routing
-// the response back through a Message + to_vec. NOTE the round-trip arm also
-// *decodes* the wire (from_vec) to get a Message, which the pre-wire-byte code
-// never did (it held a Message already) — so it OVERSTATES the delta. The clean
-// per-hit saving vs. the old code is the Phase 2c figure (~231 ns: the
-// adjust_ttls clone + the to_vec re-encode, both now ~0).
-// ---------------------------------------------------------------------------
-
 async fn phase2e_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) {
     println!("\n== Phase 2e: end-to-end cache hit incl. wire encode (handle + send-ready) ==");
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let _ = engine
         .handle(ingress(query("e2e-hot.example.", RecordType::A)), local())
         .await;
-
-    // Real path: a wire-byte hit is already encoded; send it directly.
     let msgs = many((0..n).map(|_| "e2e-hot.example".to_string()), RecordType::A);
     let warm = (msgs.len() / 10).max(1);
     for m in msgs.iter().take(warm) {
@@ -1036,9 +834,6 @@ async fn phase2e_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) 
         ns.push(t.elapsed().as_nanos() as u64);
     }
     report("wire-byte (send as-is)", ns);
-
-    // Round-trip through a Message (decode + re-encode). Upper bound; overstates
-    // vs. the old code by the decode it adds — see the phase note.
     let msgs = many((0..n).map(|_| "e2e-hot.example".to_string()), RecordType::A);
     let mut ns = Vec::with_capacity(n);
     for m in msgs {
@@ -1051,10 +846,6 @@ async fn phase2e_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize) 
     report("Message round-trip (dec+enc)", ns);
 }
 
-// ---------------------------------------------------------------------------
-// Phase 3: concurrent throughput + single-flight.
-// ---------------------------------------------------------------------------
-
 async fn phase3_concurrency(
     filter: Arc<FilterEngine>,
     blocked: &[String],
@@ -1064,8 +855,6 @@ async fn phase3_concurrency(
 ) {
     println!("\n== Phase 3: concurrent mixed workload (concurrency={concurrency}) ==");
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
-
-    // Realistic mix: ~30% blocked, ~50% repeated popular (cache hits), ~20% unique forward.
     let mut msgs: Vec<Ingress> = Vec::with_capacity(total);
     for i in 0..total {
         let m = match i % 10 {
@@ -1114,9 +903,6 @@ async fn phase3_concurrency(
         "per-query latency",
         Arc::try_unwrap(lat).unwrap().into_inner(),
     );
-
-    // Single-flight: fire many identical, never-cached queries at once and
-    // confirm the pool coalesces them into one upstream request.
     let (sf_up, sf_count) = mock_upstream(Duration::from_millis(20)).await;
     let sf_engine = build_engine(
         sf_count_filter(),
@@ -1147,16 +933,6 @@ async fn phase3_concurrency(
 fn sf_count_filter() -> Arc<FilterEngine> {
     Arc::new(Compiler::new().build().0)
 }
-
-// ---------------------------------------------------------------------------
-// Phase 4: stats.record() contention — old single global mutex vs new shards.
-//
-// This isolates the statistics bottleneck from upstream I/O: every query in a
-// real resolver calls record(), so its scaling with core count is what matters.
-// `OldStats` is a faithful copy of the pre-optimization record() (one mutex,
-// string allocations performed *inside* the lock); the new side calls the real
-// sharded `bulwark_engine::stats::Stats`.
-// ---------------------------------------------------------------------------
 
 use bulwark_engine::querylog::{QueryAction, QueryLogEntry};
 use std::collections::HashMap;
@@ -1200,8 +976,6 @@ impl OldStats {
             inner: parking_lot::Mutex::new(inner),
         }
     }
-
-    // Mirror of the original record(): single lock, allocations inside it.
     fn record(&self, entry: &QueryLogEntry) {
         let mut s = self.inner.lock();
         s.total += 1;
@@ -1262,8 +1036,6 @@ fn phase4_stats_contention(blocked: &[String]) {
         .map(|n| n.get())
         .unwrap_or(4);
     let per_thread = 400_000usize;
-
-    // Shared, pre-built entries (~70% blocked, mirroring a filtering resolver).
     let entries: Arc<Vec<QueryLogEntry>> = Arc::new(
         (0..4096)
             .map(|i| entry_for(&blocked[i % blocked.len()], i % 10 < 7))
@@ -1300,9 +1072,6 @@ fn phase4_stats_contention(blocked: &[String]) {
         );
     }
 }
-
-/// Spawn `threads` OS threads, each replaying `per_thread` records, and return
-/// aggregate records/second.
 fn run_record_bench(
     threads: usize,
     per_thread: usize,
@@ -1325,23 +1094,12 @@ fn run_record_bench(
         }));
     }
     let start = Instant::now();
-    // Threads block on the barrier; start the clock and let them run.
     for h in handles {
         let _ = h.join();
     }
     let elapsed = start.elapsed();
     (threads * per_thread) as f64 / elapsed.as_secs_f64()
 }
-
-// ---------------------------------------------------------------------------
-// Phase 5: concurrent cache-hit throughput — isolates the cache mutex.
-//
-// Phase 3's tail is dominated by forwarded queries doing real upstream I/O, so
-// it can't show how the cache lock itself scales. Here every operation is a
-// warm cache hit (no filter, no upstream, no async), so the only shared state
-// is the cache's mutex + the per-hit TTL-rewrite clone. This is where moving
-// the clone out of the critical section should show up.
-// ---------------------------------------------------------------------------
 
 fn warm_cache(n_keys: usize) -> (Arc<DnsCache>, Arc<Vec<QueryKey>>) {
     let cache = Arc::new(DnsCache::new(100_000, 0, 0, 0));
@@ -1351,7 +1109,6 @@ fn warm_cache(n_keys: usize) -> (Arc<DnsCache>, Arc<Vec<QueryKey>>) {
         let mut resp = query(&name, RecordType::A);
         resp.metadata.message_type = MessageType::Response;
         resp.metadata.response_code = ResponseCode::NoError;
-        // A couple of answers, like a real A response, so the clone is not free.
         resp.answers.push(Record::from_rdata(
             Name::from_str(&name).unwrap(),
             300,
@@ -1421,36 +1178,14 @@ fn phase5_cache_contention() {
         println!("  {c:<8} {rate:>16.0} {:>9.1}x", rate / base.max(1.0));
     }
 }
-
-// ---------------------------------------------------------------------------
-// Phase 6: full per-request CPU — parse(from_vec) -> handle -> encode.
-//
-// Every other phase times handle() over a *pre-parsed* Message and drops the
-// response without encoding. The real UDP listener (crate::server) does more on
-// EVERY query: decode raw wire bytes into a Message, run handle(), then encode
-// the response back to bytes (a wire-cache hit that fits passes through; a
-// Message — blocked/forwarded/oversized — is re-encoded via to_vec). This phase
-// times that whole CPU path with no socket I/O, so the per-request figure is the
-// closest deterministic proxy for production cost. It is OPTIMISTIC only by the
-// missing recv_from/send_to syscalls and per-query tokio::spawn — which a CPU
-// bench cannot model; see the loopback/live profile for those.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Experimental: zero-alloc ingress parser A/B.
-//
-// Compares `Message::from_vec` (the full parse the listener does on EVERY query
-// today) against `wire::parse_query` (a minimal parser that extracts only the
-// hot-path fields with no Message allocation). Same-run best-of-5 — the only
-// reliable yardstick here. Prints the per-query delta, the ceiling on what a
-// zero-alloc ingress path could save on a cache hit.
-// ---------------------------------------------------------------------------
 fn parse_ab() {
     use bulwark_engine::wire;
 
     println!("\n== Ingress parse A/B: Message::from_vec vs wire::parse_query ==");
 
-    let plain = query("cache-hit.example.com.", RecordType::A).to_vec().unwrap();
+    let plain = query("cache-hit.example.com.", RecordType::A)
+        .to_vec()
+        .unwrap();
     let mut m = query("cache-hit.example.com.", RecordType::A);
     let mut e = hickory_proto::op::Edns::new();
     e.set_max_payload(1232);
@@ -1458,9 +1193,6 @@ fn parse_ab() {
     m.set_edns(e);
     let edns = m.to_vec().unwrap();
     let cases = [("no-edns", plain), ("edns+DO", edns)];
-
-    // Correctness gate: the parser must agree with hickory before we trust the
-    // timing (a parser that bailed to None would look unfairly fast).
     for (label, raw) in &cases {
         let p = wire::parse_query(raw).expect("parse_query");
         let hm = Message::from_vec(raw).unwrap();
@@ -1469,7 +1201,10 @@ fn parse_ab() {
         assert_eq!(p.qname, hq.name().to_ascii());
         assert_eq!(p.qtype, u16::from(hq.query_type()));
         assert_eq!(p.qclass, u16::from(hq.query_class()));
-        assert_eq!(p.dnssec_ok, hm.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok));
+        assert_eq!(
+            p.dnssec_ok,
+            hm.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok)
+        );
         assert_eq!(p.edns_payload, hm.edns.as_ref().map(|e| e.max_payload()));
         println!("  {label:<8} parser matches hickory");
     }
@@ -1488,17 +1223,6 @@ fn parse_ab() {
         println!("  {label:<8} from_vec={fv:>4} ns   parse_query={pq:>4} ns   saved={saved:>3} ns ({pct:.0}%)");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Integrated ingress A/B: does the win survive end-to-end?
-//
-// parse_ab() compares the parsers in isolation. This compares the *whole*
-// per-request CPU on a cache hit — ingress + handle + UDP encode — two ways on
-// the same primed engine: the new fast path (Ingress::parse -> minimal fields,
-// no Message) vs. the old behavior (Message::from_vec -> Ingress::Full). The two
-// arms are interleaved per iteration so they share one thermal window (no
-// cross-phase drift). The delta is the real cache-hit saving from this change.
-// ---------------------------------------------------------------------------
 async fn ingress_ab(n: usize) {
     use bulwark_filter::Compiler;
     println!("\n== Ingress integration A/B: full cache-hit request, Fast vs Full (interleaved) ==");
@@ -1506,31 +1230,24 @@ async fn ingress_ab(n: usize) {
     let filter = Arc::new(Compiler::new().build().0);
     let (upstream, _count) = mock_upstream(Duration::from_micros(0)).await;
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
-
-    // A typical real client query: EDNS + DO (the shape parse_query wins most on).
     let mut q = query("ingress-ab-hot.example.", RecordType::A);
     let mut e = hickory_proto::op::Edns::new();
     e.set_max_payload(1232);
     e.set_dnssec_ok(true);
     q.set_edns(e);
     let raw = q.to_vec().unwrap();
-
-    // Prime the cache so every timed query is a wire-byte hit.
     let _ = engine.handle(Ingress::parse(&raw).unwrap(), local()).await;
 
     let warm = (n / 10).max(1);
     let mut fast = Vec::with_capacity(n);
     let mut full = Vec::with_capacity(n);
     for i in 0..(n + warm) {
-        // Fast: minimal parse, no Message allocation on the hit.
         let t = Instant::now();
         let ing = Ingress::parse(&raw).unwrap();
         let max = ing.udp_max_payload();
         let out = encode_udp_response(engine.handle(ing, local()).await, max);
         let fast_ns = t.elapsed().as_nanos() as u64;
         std::hint::black_box(out.len());
-
-        // Full: the pre-change path — full hickory parse, then handle.
         let t = Instant::now();
         let ing = Ingress::Full(Message::from_vec(&raw).unwrap());
         let max = ing.udp_max_payload();
@@ -1556,18 +1273,12 @@ async fn ingress_ab(n: usize) {
         (mu as f64 - mf as f64) / mu as f64 * 100.0
     );
 }
-
-/// Encode an `EngineResponse` for UDP exactly as the listener does: a wire hit
-/// that fits is sent as-is, otherwise the message is re-encoded.
 fn encode_udp_response(resp: EngineResponse, max: usize) -> Vec<u8> {
     match resp {
         EngineResponse::Wire(b) if b.len() <= max => b,
         other => other.into_message().to_vec().unwrap_or_default(),
     }
 }
-
-/// Time parse + handle + encode over a pool of raw query byte-blobs, indexed by
-/// `i % pool.len()` so unique-per-query workloads (misses) hit a fresh blob.
 async fn full_request_scenario(engine: &Arc<Engine>, label: &str, pool: Vec<Vec<u8>>) {
     let peer = local();
     let mut ns = Vec::with_capacity(pool.len());
@@ -1592,9 +1303,6 @@ async fn phase6_full_request(
     println!("\n== Phase 6: full per-request CPU — parse + handle + encode (no socket) ==");
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let raw = |name: &str| query(name, RecordType::A).to_vec().unwrap();
-
-    // Cache hit: prime once, then time parse+handle+encode of the same query.
-    // This is the wire-byte fast path — the encode is a near-free passthrough.
     let _ = engine
         .handle(ingress(query("req-hot.example.", RecordType::A)), local())
         .await;
@@ -1602,67 +1310,57 @@ async fn phase6_full_request(
         .take(n)
         .collect();
     full_request_scenario(&engine, "cache hit (parse+handle+enc)", hit_pool).await;
-
-    // Blocked: real list domains -> synthesized NXDOMAIN+SOA, which is a Message
-    // and so pays the to_vec re-encode (incl. the authority section).
-    let blk_pool = blocked
-        .iter()
-        .cycle()
-        .take(n)
-        .map(|d| raw(d))
-        .collect();
+    let blk_pool = blocked.iter().cycle().take(n).map(|d| raw(d)).collect();
     full_request_scenario(&engine, "blocked (parse+handle+enc)", blk_pool).await;
-
-    // Forwarded miss: unique domains -> upstream + cache insert + Message encode.
     let fwd_pool = (0..n)
         .map(|i| raw(&format!("r{i}-{}.bench-req.example", rand::random::<u32>())))
         .collect();
     full_request_scenario(&engine, "forwarded (parse+handle+enc)", fwd_pool).await;
-
-    // Same-run handle-only (no parse, no encode) for blocked vs cache hit, so
-    // the block-synthesis cost is isolated in one thermal context (cross-phase
-    // subtraction is unreliable — see the "same-run A/B only" rule).
-    let blk_msgs = blocked.iter().cycle().take(n).map(|d| ingress(query(d, RecordType::A))).collect();
+    let blk_msgs = blocked
+        .iter()
+        .cycle()
+        .take(n)
+        .map(|d| ingress(query(d, RecordType::A)))
+        .collect();
     handle_only(&engine, "blocked (handle only)", blk_msgs).await;
-    let hit_msgs = std::iter::repeat_with(|| ingress(query("req-hot.example.", RecordType::A))).take(n).collect();
+    let hit_msgs = std::iter::repeat_with(|| ingress(query("req-hot.example.", RecordType::A)))
+        .take(n)
+        .collect();
     handle_only(&engine, "cache hit (handle only)", hit_msgs).await;
-
-    // Decomposition (same-run, best-of-5): attribute the blocked path's per-
-    // request cost. A blocked reply is a synthesized Message, so unlike a cache
-    // hit (wire-byte passthrough, ~0 encode) it pays a full to_vec every query.
     println!("\n  -- blocked-path decomposition (best-of-5 ns/op) --");
     let blk_bytes = raw(&blocked[0]);
-    // (a) Request parse: Message::from_vec of the inbound blocked query.
     let parse_ns = best_of_5(|| {
         let m = Message::from_vec(&blk_bytes).unwrap();
         std::hint::black_box(m.queries.len())
     });
-    println!("  {:<32} {parse_ns:>6} ns/op", "Message::from_vec (request)");
-    // (b) Blocked-response encode: to_vec of the synthesized NXDOMAIN+SOA.
+    println!(
+        "  {:<32} {parse_ns:>6} ns/op",
+        "Message::from_vec (request)"
+    );
     let blk_resp = engine
         .handle(Ingress::parse(&blk_bytes).unwrap(), local())
         .await
         .into_message();
     let blk_enc_ns = best_of_5(|| blk_resp.to_vec().unwrap().len());
-    println!("  {:<32} {blk_enc_ns:>6} ns/op", "blocked resp to_vec (SOA)");
-    // (c) For contrast: to_vec of a typical A response (the positive case the
-    // wire-byte cache lets us skip entirely on a hit).
+    println!(
+        "  {:<32} {blk_enc_ns:>6} ns/op",
+        "blocked resp to_vec (SOA)"
+    );
     let a_resp = engine
         .handle(ingress(query("req-hot.example.", RecordType::A)), local())
         .await
         .into_message();
     let a_enc_ns = best_of_5(|| a_resp.to_vec().unwrap().len());
     println!("  {:<32} {a_enc_ns:>6} ns/op", "A resp to_vec (contrast)");
-    // (d) The constant SOA names block_response re-parses on EVERY blocked
-    // NXDOMAIN/NODATA query (block.rs negative_soa). Two of these per block.
     let soa_name_ns = best_of_5(|| {
         let n = Name::from_str("fake-for-negative-caching.bulwark.invalid.").unwrap();
         n.num_labels() as usize
     });
-    println!("  {:<32} {soa_name_ns:>6} ns/op  (x2 per block, constant)", "Name::from_str (SOA mname)");
+    println!(
+        "  {:<32} {soa_name_ns:>6} ns/op  (x2 per block, constant)",
+        "Name::from_str (SOA mname)"
+    );
 }
-
-/// Time engine.handle() only (no parse, no encode) over a batch of messages.
 async fn handle_only(engine: &Arc<Engine>, label: &str, msgs: Vec<Ingress>) {
     let peer = local();
     let mut ns = Vec::with_capacity(msgs.len());
@@ -1674,10 +1372,6 @@ async fn handle_only(engine: &Arc<Engine>, label: &str, msgs: Vec<Ingress>) {
     }
     report(label, ns);
 }
-
-/// Best-of-5 timing of a tight 100k-iteration loop, in ns/op. Returns the
-/// minimum across 5 trials to suppress scheduler/thermal noise (same yardstick
-/// as Phase 2c).
 fn best_of_5(mut f: impl FnMut() -> usize) -> u128 {
     let iters = 100_000u128;
     let mut best = u128::MAX;
@@ -1692,28 +1386,28 @@ fn best_of_5(mut f: impl FnMut() -> usize) -> u128 {
     }
     best
 }
-
-/// Run a single full-request workload (parse + handle + encode) at high volume
-/// for external profilers. `scenario` ∈ {cachehit, blocked, forwarded}. Iteration
-/// count comes from BENCH_N (default 1.5M — a few seconds of samples).
-async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: SocketAddr, scenario: &str) {
+async fn profile_only(
+    filter: Arc<FilterEngine>,
+    blocked: &[String],
+    upstream: SocketAddr,
+    scenario: &str,
+) {
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let raw = |name: &str| query(name, RecordType::A).to_vec().unwrap();
     let iters = env_usize("BENCH_N", 1_500_000);
     let peer = local();
-    // Prime the cache-hit domain.
     let _ = engine
         .handle(ingress(query("req-hot.example.", RecordType::A)), peer)
         .await;
-    // Pre-build the raw query byte-blobs OUTSIDE the timed loop — a real server
-    // receives bytes off the socket, it does not synthesize them. Building them
-    // in-loop (as an earlier version did) inflated ns/req and polluted samply.
-    // Use a bounded pool indexed by `i % len` so cycling stays realistic.
     let pool_len = iters.min(100_000);
     let pool: Vec<Vec<u8>> = match scenario {
         "cachehit" => vec![raw("req-hot.example.")],
-        "blocked" => (0..pool_len).map(|i| raw(&blocked[i % blocked.len()])).collect(),
-        "forwarded" => (0..pool_len).map(|i| raw(&format!("p{i}.bench-prof.example"))).collect(),
+        "blocked" => (0..pool_len)
+            .map(|i| raw(&blocked[i % blocked.len()]))
+            .collect(),
+        "forwarded" => (0..pool_len)
+            .map(|i| raw(&format!("p{i}.bench-prof.example")))
+            .collect(),
         other => {
             eprintln!("unknown BENCH_PROFILE='{other}' (use cachehit|blocked|forwarded)");
             return;
@@ -1751,27 +1445,7 @@ async fn profile_only(filter: Arc<FilterEngine>, blocked: &[String], upstream: S
         per(enc_ns)
     );
 }
-
-// ---------------------------------------------------------------------------
-// End-to-end UDP loopback benchmark.
-//
-// Everything else in this file is a CPU micro-bench: it calls `engine.handle`
-// directly and never touches a socket or spawns a task. The biggest remaining
-// performance lever (a synchronous cache-hit fast path that skips the per-query
-// `tokio::spawn` + inflight semaphore) lives *entirely* in the listener layer
-// that those phases omit — so it is invisible to them. This arm drives a real
-// `Engine` behind a real UDP listener over loopback, capturing the full cost:
-// `recv_from`/`send_to` syscalls, the semaphore, the per-datagram spawn, and the
-// cross-thread wakeups.
-// ---------------------------------------------------------------------------
-
-/// Baseline UDP serve loop — a faithful copy of production `server::spawn_udp`
-/// (inflight semaphore + one `tokio::spawn` per datagram). The fast-path
-/// experiment will A/B a synchronous variant against this exact loop.
-fn spawn_listener_baseline(
-    engine: Arc<Engine>,
-    socket: UdpSocket,
-) -> tokio::task::JoinHandle<()> {
+fn spawn_listener_baseline(engine: Arc<Engine>, socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     let socket = Arc::new(socket);
     let inflight = Arc::new(tokio::sync::Semaphore::new(1024));
     tokio::spawn(async move {
@@ -1801,20 +1475,7 @@ fn spawn_listener_baseline(
         }
     })
 }
-
-/// Fast-path UDP serve loop — the experiment. The fresh, clean cache-hit branch
-/// of `Engine::handle` never `.await`s, so polling the returned future once
-/// inline drives it to completion synchronously; we send the response with NO
-/// `tokio::spawn`. Anything that actually awaits (cache miss → upstream, or a
-/// rewrite CNAME resolve) returns `Pending`; we migrate the same in-flight
-/// future into a spawned task (tokio's I/O resources cache readiness, so the
-/// waker swap on the next poll is safe). No engine logic is duplicated.
-fn spawn_listener_fastpath(
-    engine: Arc<Engine>,
-    socket: UdpSocket,
-) -> tokio::task::JoinHandle<()> {
-    // FAST_LOOPS recv loops share the socket — a stand-in for SO_REUSEPORT
-    // per-core sockets, to test whether inline handling scales with cores.
+fn spawn_listener_fastpath(engine: Arc<Engine>, socket: UdpSocket) -> tokio::task::JoinHandle<()> {
     let loops = env_usize("FAST_LOOPS", 1);
     let socket = Arc::new(socket);
     let inflight = Arc::new(tokio::sync::Semaphore::new(1024));
@@ -1844,26 +1505,21 @@ fn fastpath_loop(
                 continue;
             };
             let max = ing.udp_max_payload();
-            // The async block owns an engine handle so the future is `'static`
-            // and can migrate into a spawn on the (rare) Pending path.
             let eng = engine.clone();
             let mut fut: Pin<Box<dyn Future<Output = EngineResponse> + Send>> =
                 Box::pin(async move { eng.handle(ing, peer.ip()).await });
-            // Scope the (non-Send) Context so it is dropped before any await.
             let polled = {
                 let mut cx = Context::from_waker(waker);
                 fut.as_mut().poll(&mut cx)
             };
             match polled {
                 Poll::Ready(resp) => {
-                    // Synchronous completion (the cache hit): send inline.
                     let bytes = encode_udp_response(resp, max);
                     if !bytes.is_empty() {
                         let _ = socket.send_to(&bytes, peer).await;
                     }
                 }
                 Poll::Pending => {
-                    // Hit a real await (miss/cname): finish on a spawned task.
                     let Ok(permit) = inflight.clone().acquire_owned().await else {
                         return;
                     };
@@ -1881,16 +1537,18 @@ fn fastpath_loop(
         }
     })
 }
-
-/// Same-run, interleaved A/B: one client alternates between a baseline listener
-/// (spawn-per-query) and a fast-path listener (inline poll) sharing one engine,
-/// so thermal/scheduler drift cancels. Also reports saturated throughput per
-/// listener.
-async fn udp_fast_ab(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, concurrency: usize) {
+async fn udp_fast_ab(
+    filter: Arc<FilterEngine>,
+    upstream: SocketAddr,
+    n: usize,
+    concurrency: usize,
+) {
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let peer = local();
     let hot = "req-hot.example.";
-    let _ = engine.handle(ingress(query(hot, RecordType::A)), peer).await;
+    let _ = engine
+        .handle(ingress(query(hot, RecordType::A)), peer)
+        .await;
     let qbytes = query(hot, RecordType::A).to_vec().unwrap();
 
     let base_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1902,8 +1560,6 @@ async fn udp_fast_ab(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, 
 
     println!("\n== UDP fast-path A/B (loopback, warm cache hit) ==");
     println!("  baseline={base_addr}  fastpath={fast_addr}  workload='{hot}'");
-
-    // --- Interleaved closed-loop latency. ---
     let base_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     base_client.connect(base_addr).await.unwrap();
     let fast_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1930,8 +1586,6 @@ async fn udp_fast_ab(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, 
     }
     report("baseline (spawn)  RTT", base_ns);
     report("fastpath (inline) RTT", fast_ns);
-
-    // --- Saturated throughput per listener. ---
     let tput_total = n.max(200_000);
     for (label, addr) in [("baseline", base_addr), ("fastpath", fast_addr)] {
         let per_client = (tput_total / concurrency).max(1);
@@ -1962,17 +1616,13 @@ async fn udp_fast_ab(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, 
         );
     }
 }
-
-/// Drive a real UDP listener over loopback with a warm, fresh, allowed
-/// cache-hit name (the dominant DNS path). Reports closed-loop per-query latency
-/// (one query in flight) and open-loop throughput at `concurrency` parallel
-/// client sockets.
 async fn udp_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, concurrency: usize) {
     let engine = build_engine(filter, upstream, Duration::from_millis(500), 0, 3600, true).await;
     let peer = local();
-    // Warm the cache so every client query is a fresh, allowed hit.
     let hot = "req-hot.example.";
-    let _ = engine.handle(ingress(query(hot, RecordType::A)), peer).await;
+    let _ = engine
+        .handle(ingress(query(hot, RecordType::A)), peer)
+        .await;
     let qbytes = query(hot, RecordType::A).to_vec().unwrap();
 
     let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1981,8 +1631,6 @@ async fn udp_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, conc
 
     println!("\n== UDP end-to-end (loopback, warm cache hit) ==");
     println!("  listener at {server_addr}  workload='{hot}' (fresh allowed hit)");
-
-    // --- Closed-loop latency: one in-flight query at a time. ---
     {
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.connect(server_addr).await.unwrap();
@@ -2000,8 +1648,6 @@ async fn udp_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, conc
         }
         report("udp closed-loop RTT", ns);
     }
-
-    // --- Open-loop throughput: `concurrency` parallel closed-loop clients. ---
     let tput_total = n.max(200_000);
     let per_client = (tput_total / concurrency).max(1);
     let t = Instant::now();
@@ -2032,8 +1678,6 @@ async fn udp_e2e(filter: Arc<FilterEngine>, upstream: SocketAddr, n: usize, conc
     );
 }
 
-// ---------------------------------------------------------------------------
-
 #[tokio::main]
 async fn main() {
     let n = env_usize("BENCH_N", 20_000);
@@ -2042,13 +1686,10 @@ async fn main() {
 
     println!("== Bulwark per-request benchmark ==");
     println!("  iterations/scenario={n}  concurrency={concurrency}  upstream_delay={delay:?}");
-
-    // Isolated, list-free A/B for the zero-alloc ingress parser.
     if std::env::var("BENCH_PROFILE").as_deref() == Ok("parse") {
         parse_ab();
         return;
     }
-    // Integrated before/after: full cache-hit request, Fast vs Full path.
     if std::env::var("BENCH_PROFILE").as_deref() == Ok("ingress_ab") {
         ingress_ab(n).await;
         return;
@@ -2060,22 +1701,14 @@ async fn main() {
     println!("  sampled {} real blockable domains", blocked.len());
 
     let (upstream, _count) = mock_upstream(delay).await;
-
-    // End-to-end UDP loopback: real listener + real client sockets. Captures
-    // the syscall/semaphore/spawn costs the CPU-only phases omit.
     if std::env::var("BENCH_PROFILE").as_deref() == Ok("udp_e2e") {
         udp_e2e(filter, upstream, n, concurrency).await;
         return;
     }
-    // Same-run A/B of the synchronous cache-hit fast path vs spawn-per-query.
     if std::env::var("BENCH_PROFILE").as_deref() == Ok("udp_fast_ab") {
         udp_fast_ab(filter, upstream, n, concurrency).await;
         return;
     }
-
-    // Profiling mode: when BENCH_PROFILE=<scenario> is set, run ONLY that
-    // full-request workload at high volume and exit — a clean target for
-    // samply/perf with no other phases to dilute the flamegraph.
     if let Ok(scenario) = std::env::var("BENCH_PROFILE") {
         profile_only(filter, &blocked, upstream, &scenario).await;
         return;

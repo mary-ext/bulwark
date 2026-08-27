@@ -1,10 +1,10 @@
-//! Shared rustls client configuration for the encrypted transports.
+//! Rustls client configuration.
 
 use std::sync::{Arc, OnceLock};
 
 use rustls::{ClientConfig, RootCertStore};
 
-/// Install the process-wide ring crypto provider exactly once.
+/// Installs the process-wide ring crypto provider.
 fn ensure_provider() {
     static INSTALLED: OnceLock<()> = OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -17,18 +17,12 @@ fn root_store() -> RootCertStore {
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     #[cfg(feature = "test-trust-roots")]
     for cert in test_roots::extra_roots() {
-        // Additive only: this never replaces or weakens the webpki defaults, it
-        // just lets a private CA (e.g. a local mock upstream in benchmarks) be
-        // trusted in addition to them. Compiled out unless the feature is on.
         let _ = roots.add(cert);
     }
     roots
 }
 
-/// Additional, caller-supplied trust anchors. Feature-gated so this entire
-/// mechanism is absent from the shipped binary; it exists so a benchmark or test
-/// can point the real DoT/DoQ/DoH client code at a local mock that presents a
-/// self-signed cert, without disabling certificate verification.
+/// Extra trust anchors for tests and benchmarks.
 #[cfg(feature = "test-trust-roots")]
 pub mod test_roots {
     use std::sync::{Mutex, OnceLock};
@@ -40,17 +34,11 @@ pub mod test_roots {
         EXTRA.get_or_init(|| Mutex::new(Vec::new()))
     }
 
-    /// Register an extra trust anchor (a DER-encoded CA certificate).
-    ///
-    /// Must be called *before* the first use of any encrypted transport, because
-    /// the rustls client configs are built once and cached. The reqwest-based DoH
-    /// client reads these lazily per client, so it picks them up as long as the
-    /// root is registered before the first DoH query.
+    /// Registers a DER CA before encrypted transports are initialized.
     pub fn add_trust_root(der: CertificateDer<'static>) {
         store().lock().unwrap().push(der);
     }
 
-    /// Snapshot of the registered extra roots.
     pub fn extra_roots() -> Vec<CertificateDer<'static>> {
         store().lock().unwrap().clone()
     }

@@ -1,4 +1,4 @@
-//! Upstream error type.
+//! Upstream errors.
 
 use std::sync::Arc;
 
@@ -29,7 +29,6 @@ pub enum UpstreamError {
     InvalidSpec(String),
 }
 
-/// Convenience alias for fallible upstream operations.
 pub type Result<T> = std::result::Result<T, UpstreamError>;
 
 /// Shared (cloneable) error used by the single-flight machinery, where one

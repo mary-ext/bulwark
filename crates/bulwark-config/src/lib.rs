@@ -1,8 +1,4 @@
-//! Bulwark configuration model: strongly-typed, serde-(de)serializable config
-//! with sensible defaults and YAML persistence.
-//!
-//! Durations are stored as plain seconds (`*_secs`) so the YAML file and the
-//! JSON API stay simple and the web UI can edit them as numbers.
+//! Serde-backed configuration and YAML persistence.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +23,7 @@ pub enum ConfigError {
 /// Current on-disk schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The root configuration.
+/// Root configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Config {
     #[serde(default = "one")]
@@ -72,8 +68,6 @@ impl Default for Config {
     }
 }
 
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ServerConfig {
     /// Addresses to serve plain DNS on (UDP + TCP).
@@ -101,10 +95,7 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpstreamsConfig {
-    /// Freeform upstream list: one spec per line. Lines starting with `#` are
-    /// comments and blank lines are ignored — both are preserved verbatim so
-    /// you can annotate and toggle entries by commenting them out. e.g.
-    /// `https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`.
+    /// Upstream specs, one per line. Blank and `#`-prefixed lines are ignored.
     #[serde(default = "default_upstreams", deserialize_with = "de_upstreams")]
     pub servers: String,
     /// Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames.
@@ -127,9 +118,7 @@ impl Default for UpstreamsConfig {
 }
 
 impl UpstreamsConfig {
-    /// The active upstream specs: non-blank lines that aren't comments (`#`),
-    /// trimmed. Comment and blank lines in [`servers`](Self::servers) are
-    /// ignored here but preserved on disk.
+    /// Returns trimmed, active upstream specs.
     pub fn active_specs(&self) -> impl Iterator<Item = &str> {
         self.servers
             .lines()
@@ -137,10 +126,7 @@ impl UpstreamsConfig {
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
     }
 
-    /// Tidy the freeform [`servers`](Self::servers) text in place: trim each
-    /// line, drop leading/trailing blank lines, and collapse runs of blank
-    /// lines so at most one blank line (two consecutive newlines) survives. The
-    /// result always ends in a single trailing newline, or is empty.
+    /// Trims lines and collapses consecutive blank lines.
     pub fn normalize(&mut self) {
         let mut out = String::with_capacity(self.servers.len());
         let mut blanks = 0u32;
@@ -166,10 +152,7 @@ impl UpstreamsConfig {
     }
 }
 
-/// Deserialize the freeform upstream list leniently: accept a string as-is, and
-/// fall back to the default for anything else (e.g. a config written by an older
-/// build that stored a structured list). This keeps one stale field from failing
-/// the whole config load — only the upstreams reset.
+/// Resets legacy non-string upstream values to the default.
 fn de_upstreams<'de, D>(de: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -193,11 +176,7 @@ pub struct CacheConfig {
     /// Clamp upper bound for TTLs (seconds); 0 means "no upper clamp".
     #[serde(default = "default_max_ttl")]
     pub max_ttl_secs: u32,
-    /// Optimistic caching (serve-stale): the maximum number of seconds **past
-    /// expiry** that a stale entry may be served immediately while a fresh
-    /// resolve runs in the background. `0` disables serve-stale entirely; any
-    /// value `> 0` enables it and bounds how stale an answer can be (entries are
-    /// never served unbounded).
+    /// Maximum age past expiry for serve-stale; 0 disables it.
     #[serde(default)]
     pub optimistic_max_age_secs: u32,
 }
@@ -324,27 +303,16 @@ impl Default for QueryLogConfig {
     }
 }
 
-/// Persistence of upstream **probe telemetry** — the background `NS .` RTT
-/// samples and the health they drive — for maintenance and diagnostics ("when
-/// did this upstream flap down, is its latency creeping up"). Distinct from the
-/// query log: separate DB file, retention, and toggle.
-///
-/// **Off by default.** `enabled` toggles live (no restart): the writer is always
-/// wired, so flipping it on starts persisting immediately. Only `persist` (disk
-/// vs in-memory) is fixed at startup, exactly as for the query log.
+/// Upstream probe telemetry settings.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpstreamLogConfig {
-    /// Persist probe telemetry. Off by default; can be toggled at runtime.
+    /// Enables probe telemetry at runtime.
     #[serde(default)]
     pub enabled: bool,
-    /// Persist to disk so it survives restarts. When off, an in-memory database
-    /// is used for the lifetime of the process (and no file is created). Fixed at
-    /// startup — changing it takes effect on the next restart.
+    /// Persists telemetry across restarts. Applied at startup.
     #[serde(default = "btrue")]
     pub persist: bool,
-    /// How many days of probe telemetry to retain. Probes are low-volume (one
-    /// per upstream per minute), so a generous default is cheap. 0 disables
-    /// time-based pruning.
+    /// Retention in days; 0 disables time-based pruning.
     #[serde(default = "default_probe_log_retention_days")]
     pub retention_days: u32,
 }
@@ -359,14 +327,10 @@ impl Default for UpstreamLogConfig {
     }
 }
 
-/// Privacy-related toggles that span more than one subsystem.
+/// Privacy settings shared by logging and statistics.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct PrivacyConfig {
-    /// When set, client IPs are dropped entirely from the query log (the stored
-    /// and API-returned `client_ip` is blank) **and** from statistics (the
-    /// dashboard's "top clients" panel is empty while on). The IP is still used
-    /// to identify the client for filtering before logging/recording — only the
-    /// retained/displayed copy is removed.
+    /// Omits client IPs from query logs and statistics.
     #[serde(default)]
     pub anonymize_client_ips: bool,
 }
@@ -399,14 +363,10 @@ pub struct AuthConfig {
     /// Admin username.
     #[serde(default)]
     pub username: String,
-    /// Argon2 password hash; `None` until the admin sets a password (setup flow).
-    /// Skipped when absent so the redacted (`None`) value the API returns never
-    /// rides the wire, and the YAML stays clean before setup.
+    /// Argon2 password hash; absent until setup completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
-    /// HMAC secret (base64url) for signing session JWTs. Generated on first run
-    /// if absent. Redacted from the config API like `password_hash`; deleting it
-    /// from the YAML rotates the secret and invalidates all outstanding tokens.
+    /// Base64url HMAC secret for session JWTs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_secret: Option<String>,
 }
@@ -418,8 +378,6 @@ impl AuthConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-
 impl Config {
     /// Load config from a YAML file, or return defaults if it doesn't exist.
     pub fn load_or_default(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -430,9 +388,7 @@ impl Config {
         let text = std::fs::read_to_string(path)?;
         let mut cfg: Config = serde_yaml::from_str(&text)?;
         cfg.validate()?;
-        // Clients are keyed by a stable `id`. Legacy entries predating the
-        // granular client API have none and can't be addressed, so drop them
-        // rather than migrate.
+        // Legacy clients without resource ids cannot be addressed.
         let before = cfg.clients.len();
         cfg.clients.retain(|c| !c.id.is_empty());
         let dropped = before - cfg.clients.len();
@@ -453,9 +409,7 @@ impl Config {
         let yaml = serde_yaml::to_string(self)?;
         let tmp = path.with_extension("yaml.tmp");
         std::fs::write(&tmp, yaml.as_bytes())?;
-        // The config holds the admin password hash, so keep it owner-only. Set
-        // perms on the temp file before the atomic rename so the final file is
-        // never briefly world-readable.
+        // Protect credentials before the atomic rename exposes the file.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -465,7 +419,7 @@ impl Config {
         Ok(())
     }
 
-    /// Validate invariants, returning a helpful error otherwise.
+    /// Validates configuration invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.server.dns_bind.is_empty() {
             return Err(ConfigError::Invalid(
@@ -478,8 +432,6 @@ impl Config {
                 self.cache.min_ttl_secs, self.cache.max_ttl_secs
             )));
         }
-        // Require at least one active (non-comment) upstream spec so we never
-        // silently end up with nothing to resolve against.
         if self.upstreams.active_specs().next().is_none() {
             return Err(ConfigError::Invalid(
                 "at least one upstream must be configured".into(),
@@ -518,7 +470,6 @@ mod tests {
         let yaml = "version: 1\nfiltering:\n  enabled: false\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(!cfg.filtering.enabled);
-        // Unspecified sections fall back to defaults.
         assert!(cfg.cache.enabled);
         assert_eq!(cfg.server.http_bind, default_http_bind());
     }
@@ -602,8 +553,6 @@ mod tests {
 
     #[test]
     fn legacy_structured_servers_reset_without_breaking_load() {
-        // A config from an older build stored `servers` as a structured list.
-        // It must not fail the whole load — only the upstreams reset.
         let yaml = "version: 1\ncache:\n  size: 1234\nupstreams:\n  servers:\n    - spec: 1.1.1.1\n      name: Cloudflare\n      enabled: true\n";
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.cache.size, 1234);

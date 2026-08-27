@@ -1,17 +1,4 @@
-//! Statistics aggregation: counters, top-N lists, latency histogram, per-upstream
-//! response times, and an hourly time-series for charts.
-//!
-//! State is serializable (`export`/`import`) so the server can persist it across
-//! restarts with its own configurable retention.
-//!
-//! # Concurrency
-//!
-//! Recording happens on every resolved query, so it must not become a
-//! serialization point under load. Instead of one global lock, the state is
-//! split into a small number of independently-locked shards (one per CPU,
-//! rounded to a power of two). Each OS thread is pinned to a single shard, so
-//! the tokio worker threads almost never contend with one another. Reads
-//! (`snapshot`/`export`) merge the shards under their individual locks.
+//! Sharded query statistics and persistence.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -24,14 +11,7 @@ use crate::cache::CacheCounters;
 use crate::clients::ClientMatcher;
 use crate::querylog::{QueryAction, QueryLogEntry};
 
-/// Upper bound on distinct keys retained per top-N estimator, summed across
-/// shards. The estimator (Space-Saving, see [`HeavyHitters`]) keeps only this
-/// many *live* keys regardless of how many distinct domains the stream actually
-/// contains, so memory is bounded by this cap — not by traffic cardinality.
-///
-/// Sized far above any realistic top-N (the UI surfaces tens), so a genuine
-/// heavy hitter is never at risk of eviction while one-off names churn through
-/// the floor slots. Divided evenly between shards at construction.
+/// Maximum distinct keys retained across top-N estimators.
 const TOPK_KEYS: usize = 4_096;
 
 /// Latency histogram bucket upper-bounds in milliseconds (last bucket = +inf).
@@ -61,43 +41,27 @@ struct StatsInner {
     rewritten: u64,
     errors: u64,
 
-    /// Global whole-query latency histogram (bucketed by `LATENCY_BUCKETS_MS`),
-    /// kept so the snapshot can derive a tail percentile that a raw mean can't.
-    /// Errored queries are excluded — a timeout is a failure, not slow work, and
-    /// folding multi-second failures into a latency number just tracks the tail
-    /// of the network, not how fast we answer.
+    /// Whole-query latency histogram excluding errors.
     #[serde(default)]
     proc_time_hist: Vec<u64>,
 
-    // Unbounded-cardinality keys (query names, client IPs) go through the
-    // Space-Saving estimator so their footprint is capped no matter how many
-    // distinct values the stream carries. `#[serde(transparent)]` keeps the
-    // on-disk shape identical to the old plain maps, so persisted state imports
-    // unchanged.
+    // Space-Saving bounds untrusted key cardinality.
     #[serde(default)]
     resolved_domains: HeavyHitters,
     blocked_domains: HeavyHitters,
     clients: HeavyHitters,
-    // Upstreams stay an exact map: cardinality is the (tiny) number of
-    // configured upstreams, and the paired rtt_sum/rtt_count/latency_hist maps
-    // must share its exact key set — Space-Saving eviction would desync them.
+    // Upstream maps share exact keys.
     upstreams: HashMap<String, u64>,
     upstream_rtt_sum: HashMap<String, f64>,
     upstream_rtt_count: HashMap<String, u64>,
-    /// Per-upstream latency histograms (bucketed by `LATENCY_BUCKETS_MS`), kept
-    /// so the snapshot can derive approximate p50/p90/p99 per upstream.
+    /// Per-upstream latency histograms.
     #[serde(default)]
     upstream_latency_hist: HashMap<String, Vec<u64>>,
 
     #[serde(default)]
     series: Vec<Bucket>,
 
-    // The DNS cache's lifetime counters (hits/misses/stale serves/background
-    // refreshes). These live on the cache itself as cheap atomics on the hot
-    // path; they are carried *here* only so they persist in stats.json. Unlike
-    // every other field they are NOT per-shard tallies — `record`/`merge_from`
-    // leave them at zero, `export` stamps them from the live cache, and `import`
-    // hands them back so the caller can seed the cache (see [`Stats::export`]).
+    // Cache counters are stored here only for persistence.
     #[serde(default)]
     cache_hits: u64,
     #[serde(default)]
@@ -111,7 +75,7 @@ struct StatsInner {
 }
 
 impl StatsInner {
-    /// Fold another shard's state into this accumulator (used for snapshots).
+    /// Merges another shard into this snapshot accumulator.
     fn merge_from(&mut self, other: &StatsInner) {
         self.total += other.total;
         self.blocked += other.blocked;
@@ -119,8 +83,7 @@ impl StatsInner {
         self.rewritten += other.rewritten;
         self.errors += other.errors;
         if !other.proc_time_hist.is_empty() {
-            self.proc_time_hist
-                .resize(LATENCY_BUCKETS_MS.len() + 1, 0);
+            self.proc_time_hist.resize(LATENCY_BUCKETS_MS.len() + 1, 0);
             for (a, b) in self.proc_time_hist.iter_mut().zip(&other.proc_time_hist) {
                 *a += b;
             }
@@ -175,19 +138,7 @@ fn bump(map: &mut HashMap<String, u64>, key: &str, by: u64, cap: usize) {
     }
 }
 
-/// A bounded top-K frequency estimator (the Space-Saving algorithm).
-///
-/// Tracks at most `cap` distinct keys regardless of how many distinct values
-/// the stream actually carries. While under `cap` it behaves as an exact
-/// counter. Once full, a never-seen key evicts the current *minimum*-count
-/// entry and inherits its count plus the increment — so a key that is genuinely
-/// frequent always climbs back in after an eviction, while transient one-off
-/// names churn through the floor slots and never accumulate. The reported count
-/// for a surviving key is an over-estimate bounded by the evicted minimum, which
-/// is exactly what keeps the true heavy hitters ranked correctly for top-N.
-///
-/// `#[serde(transparent)]` makes it serialize as a bare `{key: count}` map, so
-/// the persisted/exported shape is identical to the plain `HashMap` it replaced.
+/// Bounded Space-Saving frequency estimator.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 struct HeavyHitters {
@@ -205,16 +156,7 @@ impl HeavyHitters {
             self.counts.insert(key.to_string(), by);
             return;
         }
-        // Full: evict the weakest entry and let the newcomer take its slot,
-        // inheriting `min + by`. This is an O(cap) min-scan, but `cap` is small
-        // (a few hundred to ~4096 per shard) and a home deployment runs on the
-        // order of one query/second — so even when high-cardinality one-shot
-        // names make eviction frequent, the scan costs microseconds well under
-        // once a second: invisible. A count→keys inverted index would make this
-        // O(log n), but only by keeping a second copy of every live key string
-        // resident (~0.5 MB at full occupancy across the estimators). On an SBC
-        // the resident memory is the figure of merit, not the scan, so we keep
-        // the flat map.
+        // New keys inherit the evicted minimum count.
         if let Some((min_key, min_val)) = self
             .counts
             .iter()
@@ -226,10 +168,7 @@ impl HeavyHitters {
         }
     }
 
-    /// Fold another estimator's counts in (used when merging shards for a
-    /// snapshot). The accumulator is transient and unbounded by design — it
-    /// exists only for the duration of a read and holds at most the union of the
-    /// shards' live keys.
+    /// Merges counts into a transient snapshot accumulator.
     fn merge_from(&mut self, other: &HeavyHitters) {
         for (k, v) in &other.counts {
             *self.counts.entry(k.clone()).or_insert(0) += v;
@@ -237,8 +176,7 @@ impl HeavyHitters {
     }
 }
 
-/// Number of shards: one per CPU, rounded up to a power of two so shard
-/// selection is a cheap mask, and clamped to a sane range.
+/// Selects a power-of-two shard count near the CPU count.
 fn shard_count() -> usize {
     let n = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -246,8 +184,7 @@ fn shard_count() -> usize {
     n.next_power_of_two().clamp(1, 64)
 }
 
-/// A stable, process-wide slot for the calling thread, used to pin each thread
-/// to one shard. Worker threads are long-lived, so this is computed once.
+/// Returns a stable shard slot for the current thread.
 fn thread_slot() -> usize {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
@@ -264,8 +201,7 @@ pub struct Stats {
     /// Per-shard distinct-key cap for the top-N maps.
     key_cap: usize,
     enabled: AtomicBool,
-    /// When set, per-client counts are not recorded, so the "top clients" view is
-    /// empty. Mirrors the query log's IP anonymization (see `privacy` config).
+    /// Disables per-client counters.
     anonymize: AtomicBool,
     max_buckets: AtomicUsize,
 }
@@ -273,9 +209,7 @@ pub struct Stats {
 impl Stats {
     pub fn new(enabled: bool, retention_days: u32, anonymize: bool) -> Self {
         let n = shard_count();
-        let shards = (0..n)
-            .map(|_| Mutex::new(StatsInner::default()))
-            .collect();
+        let shards = (0..n).map(|_| Mutex::new(StatsInner::default())).collect();
         Self {
             shards,
             mask: n - 1,
@@ -308,29 +242,15 @@ impl Stats {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Record one completed query. `upstream_rtt_ms` is the answering upstream's
-    /// own round-trip time, used for the per-upstream latency stats; it should be
-    /// `None` for queries that weren't forwarded (cached/blocked/error). The
-    /// whole-query `entry.elapsed_ms` still drives the global processing-time
-    /// stats and the query log itself.
+    /// Records a completed query and optional upstream RTT.
     pub fn record(&self, entry: &QueryLogEntry, upstream_rtt_ms: Option<f64>) {
         if !self.is_enabled() {
             return;
         }
 
-        // Prepare everything that doesn't need the lock first, and keep the
-        // critical section to cheap map probes / increments. The top-N maps take
-        // `&str` keys and only allocate when a *new* key is inserted, so the
-        // common (existing-key) path holds the lock without allocating.
         let blocked = entry.is_blocked();
         let domain = entry.question.trim_end_matches('.');
-        // Keyed by the stable client IP, never the friendly name: the name is a
-        // presentation concern resolved at snapshot time, so renaming a client
-        // doesn't split its history into a separate bucket.
         let client = entry.client_ip.as_str();
-        // Per-upstream latency is keyed off the answering upstream's own RTT, not
-        // the whole-query wall-clock. Fall back to `elapsed_ms` if a forwarded
-        // entry arrives without one (e.g. older imported data / tests).
         let up_ms = upstream_rtt_ms.unwrap_or(entry.elapsed_ms);
         let up_idx = hist_index(up_ms);
         let hour = entry.time_ms / 1000 / 3600;
@@ -350,10 +270,7 @@ impl Stats {
             s.blocked += 1;
         }
 
-        // Latency. Errored queries are excluded: a query that timed out before
-        // failing carries multi-second wall-clock, and folding that into the
-        // latency stat measures the network's failures, not how fast we answer.
-        // Failures are tracked separately as the error count / rate above.
+        // Errors have a separate signal and do not skew latency.
         if !matches!(entry.action, QueryAction::Error) {
             if s.proc_time_hist.is_empty() {
                 s.proc_time_hist = vec![0; LATENCY_BUCKETS_MS.len() + 1];
@@ -361,22 +278,16 @@ impl Stats {
             s.proc_time_hist[hist_index(entry.elapsed_ms)] += 1;
         }
 
-        // Top-N counters. A query name lands in exactly one of the two domain
-        // lists — resolved or blocked.
         if blocked {
             s.blocked_domains.bump(domain, 1, cap);
         } else {
             s.resolved_domains.bump(domain, 1, cap);
         }
-        // Skip per-client counts entirely when anonymizing, so "top clients" never
-        // retains a client IP. Stats record before the query-log push that clears
-        // the IP, so check the flag here rather than relying on an empty field.
         if !self.anonymize.load(Ordering::Relaxed) {
             s.clients.bump(client, 1, cap);
         }
         if let Some(up) = entry.upstream() {
             bump(&mut s.upstreams, up, 1, cap);
-            // Avoid cloning the upstream name on the hot (existing-key) path.
             match s.upstream_rtt_sum.get_mut(up) {
                 Some(v) => *v += up_ms,
                 None => {
@@ -399,7 +310,6 @@ impl Stats {
             }
         }
 
-        // Time series (hourly).
         match s.series.last_mut() {
             Some(b) if b.hour == hour => {
                 b.total += 1;
@@ -424,7 +334,7 @@ impl Stats {
         }
     }
 
-    /// Reset all statistics.
+    /// Resets all statistics.
     pub fn reset(&self) {
         for shard in &self.shards {
             let mut inner = shard.lock();
@@ -432,9 +342,7 @@ impl Stats {
         }
     }
 
-    /// Merge every shard into a single view. Shards are locked one at a time, so
-    /// a concurrently-recording thread may land just before or after the merge
-    /// point — acceptable for monotonic, approximate statistics.
+    /// Merges all shards into an approximate snapshot.
     fn merged(&self) -> StatsInner {
         let mut acc = StatsInner::default();
         for shard in &self.shards {
@@ -449,14 +357,9 @@ impl Stats {
         acc
     }
 
-    /// Build a snapshot for the API/UI. `clients` is the current client matcher,
-    /// used to resolve the IP-keyed client counts to friendly names at read time.
+    /// Builds an API snapshot with current client names.
     pub fn snapshot(&self, top_n: usize, clients: &ClientMatcher) -> StatsSummary {
         let s = self.merged();
-        // Surface the p95 of successful-query latency rather than a raw mean. The
-        // mean is dragged around by a handful of slow tail queries (failovers,
-        // congested upstreams); p95 ignores the top 5% so it tracks the real
-        // "are answers fast?" signal without being yanked by transient blips.
         let proc_total: u64 = s.proc_time_hist.iter().sum();
         let p95_proc = quantile(&s.proc_time_hist, proc_total, 0.95);
         let upstream_rtt = s
@@ -504,10 +407,7 @@ impl Stats {
         }
     }
 
-    /// Serialize state for persistence. The cache's lifetime counters live on the
-    /// cache (not in the sharded stats), so the caller passes a current snapshot
-    /// of them to be stamped into the persisted blob; [`Self::import`] hands them
-    /// back on load so the cache can be re-seeded.
+    /// Serializes statistics and cache counters.
     pub fn export(&self, cache: CacheCounters) -> String {
         let mut merged = self.merged();
         merged.cache_hits = cache.hits;
@@ -518,10 +418,7 @@ impl Stats {
         serde_json::to_string(&merged).unwrap_or_default()
     }
 
-    /// Load persisted state (best-effort; ignores malformed data). Everything is
-    /// loaded into a single shard; the rest are cleared. Returns the cache
-    /// counters the blob carried (zero if absent/malformed) so the caller can
-    /// seed the DNS cache, which owns the live atomics.
+    /// Restores statistics and returns persisted cache counters.
     pub fn import(&self, json: &str) -> CacheCounters {
         let Ok(loaded) = serde_json::from_str::<StatsInner>(json) else {
             return CacheCounters::default();
@@ -557,9 +454,7 @@ fn bucket_bounds(i: usize) -> (f64, f64) {
     (lower, upper)
 }
 
-/// Approximate the `q` quantile (0..=1) of a bucketed histogram by linear
-/// interpolation within the bucket that holds the target rank. Samples in the
-/// unbounded final bucket pin to its lower bound (can't interpolate to +inf).
+/// Approximates a histogram quantile by bucket interpolation.
 fn quantile(hist: &[u64], total: u64, q: f64) -> f64 {
     if total == 0 {
         return 0.0;
@@ -605,12 +500,7 @@ fn top_n_of(map: &HashMap<String, u64>, n: usize) -> Vec<TopEntry> {
     v
 }
 
-/// Build the top-N client list from IP-keyed counts, resolving each IP to its
-/// current configured name and aggregating per name. Resolution happens here (at
-/// read time) rather than at record time, so renaming a client merges its
-/// history under the new name, and removing the name reverts it to the bare IP —
-/// both retroactively, with no divergence between old and new data. IPs covered
-/// by the same named (e.g. CIDR) client collapse into one row.
+/// Resolves stored IP counts to current client names.
 fn top_clients_resolved(
     counts: &HashMap<String, u64>,
     clients: &ClientMatcher,
@@ -724,10 +614,12 @@ mod tests {
         assert_eq!(snap.total, 4);
         assert_eq!(snap.blocked, 2);
         assert_eq!(snap.cached, 1);
-        // top_resolved_domains excludes blocked names — only the resolved good.com remains.
         assert_eq!(snap.top_resolved_domains[0].name, "good.com");
         assert_eq!(snap.top_resolved_domains[0].count, 2);
-        assert!(snap.top_resolved_domains.iter().all(|t| t.name != "ads.com"));
+        assert!(snap
+            .top_resolved_domains
+            .iter()
+            .all(|t| t.name != "ads.com"));
         assert_eq!(snap.top_blocked_domains[0].count, 2);
         assert!(snap.upstream_avg_rtt_ms.contains_key("1.1.1.1"));
     }
@@ -744,19 +636,12 @@ mod tests {
         use bulwark_config::ClientConfig;
 
         let s = Stats::new(true, 30, false);
-        // Two distinct IPs in the same /24, plus an unrelated one.
         s.record(&entry_ip("10.0.0.1", forwarded("u")), None);
         s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
         s.record(&entry_ip("10.0.0.2", forwarded("u")), None);
         s.record(&entry_ip("192.168.1.5", forwarded("u")), None);
-
-        // No client config: each IP is its own row, keyed by the bare IP.
         let bare = s.snapshot(10, &ClientMatcher::default());
         assert_eq!(bare.top_clients.len(), 3);
-
-        // Name the /24 "lan": the two 10.0.0.x rows collapse under "lan"
-        // retroactively, without re-recording anything. Removing the name later
-        // (an empty matcher) reverts them to bare IPs — as the `bare` case shows.
         let m = ClientMatcher::build(&[ClientConfig {
             id: "lan".into(),
             name: "lan".into(),
@@ -821,11 +706,7 @@ mod tests {
 
     #[test]
     fn import_of_legacy_blob_without_cache_counters_is_zero() {
-        // A stats.json written before cache counters existed has no such fields;
-        // serde defaults them to zero and the cache simply starts fresh.
         let s = Stats::new(true, 30, false);
-        // A pre-cache-counters blob: all the fields that existed then, none of the
-        // new `cache_*` ones.
         let legacy = r#"{"total":5,"blocked":1,"cached":2,"rewritten":0,"errors":0,
             "blocked_domains":{},"clients":{},"upstreams":{},
             "upstream_rtt_sum":{},"upstream_rtt_count":{}}"#;
@@ -838,7 +719,6 @@ mod tests {
     #[test]
     fn per_upstream_percentiles() {
         let s = Stats::new(true, 30, false);
-        // 100 fast samples (~5ms) and a few slow ones to push the tail up.
         for _ in 0..95 {
             s.record(&entry("a.com.", forwarded("up"), 5.0), Some(5.0));
         }
@@ -850,7 +730,6 @@ mod tests {
             .upstream_latency_pct
             .get("up")
             .expect("upstream present");
-        // p50/p90 fall in the ≤5ms bucket; p99 lands in the slow tail.
         assert!(p.p50 <= 5.0, "p50 = {}", p.p50);
         assert!(p.p90 <= 5.0, "p90 = {}", p.p90);
         assert!(p.p99 > 200.0, "p99 = {}", p.p99);
@@ -858,10 +737,6 @@ mod tests {
 
     #[test]
     fn per_upstream_latency_ignores_failover_wall_clock() {
-        // Every query answered in ~5ms, but the whole-query elapsed_ms is ~1010ms
-        // because an earlier upstream timed out (1s) before failover. The answering
-        // upstream's percentiles must reflect its own 5ms RTT, not the 1s timeout
-        // it had nothing to do with.
         let s = Stats::new(true, 30, false);
         for _ in 0..100 {
             s.record(&entry("a.com.", forwarded("fast"), 1010.0), Some(5.0));
@@ -876,14 +751,11 @@ mod tests {
             "p99 = {} (should track RTT, not timeout)",
             p.p99
         );
-        // The per-upstream average tracks RTT too, not the whole-query wall-clock.
         assert!(
             snap.upstream_avg_rtt_ms["fast"] <= 5.0,
             "avg = {}",
             snap.upstream_avg_rtt_ms["fast"]
         );
-        // The global processing stat is whole-query, so when every query really
-        // did take 1010ms wall-clock, p95 reflects that (pinned to the top bucket).
         assert!(
             snap.p95_processing_ms >= 1000.0,
             "p95_proc = {}",
@@ -893,9 +765,6 @@ mod tests {
 
     #[test]
     fn errored_queries_excluded_from_processing_latency() {
-        // A burst of slow timeouts must not drag the latency stat: errors are a
-        // failure signal, not slow work. 100 fast successes + 10 multi-second
-        // errors should still report a fast p95.
         let s = Stats::new(true, 30, false);
         for _ in 0..100 {
             s.record(&entry("ok.com.", forwarded("1.1.1.1"), 3.0), Some(3.0));
@@ -925,9 +794,6 @@ mod tests {
 
     #[test]
     fn heavy_hitters_bound_memory_under_high_cardinality() {
-        // Feed far more distinct names than the cap and confirm every per-shard
-        // estimator stays at or below its key cap — memory is bounded by the cap,
-        // not by stream cardinality.
         let s = Stats::new(true, 30, false);
         for i in 0..200_000u32 {
             let name = format!("h{i}.example.");
@@ -946,19 +812,16 @@ mod tests {
 
     #[test]
     fn late_heavy_hitter_still_ranks() {
-        // The old hard cap dropped any name first seen after the cap filled, so a
-        // domain that becomes popular *late* was never counted. Space-Saving must
-        // surface it: flood the estimator with unique one-shot names to fill it,
-        // then hammer one late arrival and confirm it reaches the top list.
         let s = Stats::new(true, 30, false);
-        // Pin everything to one shard's worth of cap by overflowing generously.
         for i in 0..(TOPK_KEYS * 4) {
             let name = format!("noise{i}.example.");
             s.record(&entry(&name, forwarded("u"), 1.0), Some(1.0));
         }
-        // A latecomer queried far more than any single noise name (each seen once).
         for _ in 0..500 {
-            s.record(&entry("late-popular.example.", forwarded("u"), 1.0), Some(1.0));
+            s.record(
+                &entry("late-popular.example.", forwarded("u"), 1.0),
+                Some(1.0),
+            );
         }
         let snap = s.snapshot(10, &ClientMatcher::default());
         assert!(
@@ -972,28 +835,28 @@ mod tests {
 
     #[test]
     fn heavy_hitters_evicts_minimum_after_serde_round_trip() {
-        // Serializes as a bare {key: count} map and, once reloaded, still evicts
-        // the minimum-count entry when a new key arrives into a full estimator.
         let cap = 4;
         let mut h = HeavyHitters::default();
-        // Distinct counts so the minimum is unambiguous: b is the clear floor.
         h.bump("a", 5, cap);
         h.bump("b", 1, cap);
         h.bump("c", 3, cap);
         h.bump("hot", 10, cap); // estimator is now full
-
-        // Serializes as a bare {key: count} map (shape unchanged across versions).
         let json = serde_json::to_string(&h).unwrap();
         let bare: HashMap<String, u64> = serde_json::from_str(&json).unwrap();
         assert_eq!(bare.get("hot"), Some(&10));
         assert_eq!(bare.len(), 4);
 
         let mut reloaded: HeavyHitters = serde_json::from_str(&json).unwrap();
-        // A new key into the full estimator must evict the minimum (b), inheriting
-        // its count + 1; the higher-count keys are untouched.
         reloaded.bump("new", 1, cap);
-        assert!(!reloaded.counts.contains_key("b"), "min entry must be evicted");
-        assert_eq!(reloaded.counts.get("new"), Some(&2), "newcomer inherits min + 1");
+        assert!(
+            !reloaded.counts.contains_key("b"),
+            "min entry must be evicted"
+        );
+        assert_eq!(
+            reloaded.counts.get("new"),
+            Some(&2),
+            "newcomer inherits min + 1"
+        );
         for (k, v) in [("a", 5), ("c", 3), ("hot", 10)] {
             assert_eq!(reloaded.counts.get(k), Some(&v), "{k} must be untouched");
         }
@@ -1001,8 +864,6 @@ mod tests {
 
     #[test]
     fn aggregates_across_shards() {
-        // Spread records across many threads so multiple shards are populated,
-        // then confirm the merged snapshot is exact.
         let s = std::sync::Arc::new(Stats::new(true, 30, false));
         let mut handles = Vec::new();
         for _ in 0..16 {

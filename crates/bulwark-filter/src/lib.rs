@@ -1,5 +1,4 @@
-//! Bulwark filtering engine: parses host-file lists and the DNS-relevant subset
-//! of AdGuard rule syntax, then matches DNS queries against them.
+//! DNS filtering for hosts files and AdGuard rules.
 //!
 //! # Overview
 //!
@@ -11,7 +10,6 @@
 //!
 //! assert!(engine.check("ads.example.com", "A", &client).is_blocked());
 //! assert!(engine.check("x.ads.example.com", "A", &client).is_blocked());
-//! // The exception un-blocks a specific subdomain.
 //! assert!(!engine.check("good.ads.example.com", "A", &client).is_blocked());
 //! ```
 

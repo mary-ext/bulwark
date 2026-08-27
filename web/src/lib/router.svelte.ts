@@ -1,4 +1,4 @@
-// Hash-based route as a rune, shared by the shell, sidebar, and drawer.
+// Shared hash-based route state.
 
 import type { IconName } from "./icons";
 

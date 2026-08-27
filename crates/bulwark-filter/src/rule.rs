@@ -1,7 +1,4 @@
 //! Filtering rule model.
-//!
-//! A parsed rule captures the matching pattern, the action (block / allow /
-//! rewrite), and the DNS-relevant AdGuard modifiers we support.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -35,9 +32,7 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    /// The domain key this pattern indexes under, if it is a plain
-    /// exact/subdomain pattern (used for fast hash-map bucketing). Wildcard and
-    /// regex patterns return `None` and are scanned linearly.
+    /// Returns the indexable domain for exact and subdomain patterns.
     pub fn index_key(&self) -> Option<(&str, bool)> {
         match self {
             Pattern::Subdomain(d) => Some((d.as_str(), true)),
@@ -161,9 +156,7 @@ pub enum RewriteRcode {
     ServFail,
 }
 
-/// The optional modifier cluster of a rule. The vast majority of blocklist
-/// rules (`||domain^`, hosts entries) carry *none* of these, so we box this
-/// behind `Option<Box<RuleMods>>` on [`Rule`] to keep the common rule small.
+/// Optional DNS rule modifiers.
 #[derive(Debug, Clone, Default)]
 pub struct RuleMods {
     pub important: bool,
@@ -176,7 +169,7 @@ pub struct RuleMods {
 }
 
 impl RuleMods {
-    /// True when no modifier is set (so we can store `None` instead of boxing).
+    /// Whether no modifier is set.
     pub fn is_empty(&self) -> bool {
         !self.important
             && self.dnstype.is_none()
@@ -187,10 +180,7 @@ impl RuleMods {
     }
 }
 
-/// A fully-parsed filtering rule, as **retained** by the compiled engine. This
-/// holds only what matching and attribution need; the build-time-only fields
-/// (`signature`, `index_tokens`, `badfilter`) live on [`BuildRule`] instead, so
-/// they don't tax every retained element of the engine's rule vector.
+/// Filtering rule retained by the compiled engine.
 #[derive(Debug, Clone)]
 pub struct Rule {
     /// Stable id (index into the engine's rule vector).
@@ -205,14 +195,7 @@ pub struct Rule {
     pub list_id: u32,
 }
 
-/// A rule as produced by the parser and manipulated by the [`Compiler`]: the
-/// retained [`Rule`] plus the fields needed only during compilation
-/// (`$badfilter` pairing, de-duplication, and wildcard token indexing). These
-/// are dropped wholesale once [`FilterEngine::from_rules`] has consumed them, so
-/// they never occupy space in the running engine.
-///
-/// [`Compiler`]: crate::list::Compiler
-/// [`FilterEngine::from_rules`]: crate::engine::FilterEngine::from_rules
+/// Rule plus build-only metadata.
 #[derive(Debug, Clone)]
 pub struct BuildRule {
     pub rule: Rule,

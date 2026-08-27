@@ -1,5 +1,5 @@
 <script module lang="ts">
-  // Per-instance gradient ids so multiple sparklines don't share a <defs>.
+  // Keep gradient IDs instance-local.
   let uid = 0;
 </script>
 
@@ -14,19 +14,18 @@
     ariaLabel,
   }: {
     values: number[];
-    /** Tooltip text per point (e.g. "Mon 16:00"); index-aligned with values. */
+    /** Point-aligned tooltip labels. */
     labels?: string[];
     color?: string;
     height?: number;
     area?: boolean;
-    /** Curve interpolation + density-adaptive denoising. Off = raw polyline. */
+    /** Enable interpolation and density-aware smoothing. */
     smooth?: boolean;
     ariaLabel?: string;
   } = $props();
 
   const gid = `spark-${uid++}`;
-  // The SVG is drawn in measured pixel space (no viewBox scaling) so the stroke
-  // and hover dot stay round instead of stretching with the card width.
+  // Pixel coordinates keep strokes and dots undistorted.
   let w = $state(0);
   let hover = $state<number | null>(null);
 
@@ -37,9 +36,7 @@
   const yAt = (v: number) => height - pad - (v / max) * (height - 2 * pad);
   const r = (x: number) => Math.round(x * 10) / 10;
 
-  // Dynamic denoising: once points get denser than the canvas can resolve
-  // (target ~1 point / 3px), centred-average them so the trend stays legible.
-  // Short retention (e.g. 24 hourly buckets in ~150px) is left untouched.
+  // Average samples denser than roughly one point per three pixels.
   const win = $derived(
     smooth && n >= 8 && w > 0 ? Math.max(1, Math.round((n / w) * 3)) : 1,
   );
@@ -60,9 +57,7 @@
     });
   }
 
-  // A single bucket (e.g. a fresh instance with only the current hour) has no
-  // span to plot across, so draw it as a flat line spanning the full width
-  // instead of one degenerate vertex that renders as nothing.
+  // Render a single sample as a full-width line.
   const pts = $derived(
     n === 1
       ? [
@@ -72,9 +67,7 @@
       : plotted.map((v, i) => [r(xAt(i)), r(yAt(v))]),
   );
 
-  // Monotone cubic interpolation (Fritsch–Carlson): a smooth line that passes
-  // through every point without overshooting into invented dips/peaks — unlike
-  // a plain Bézier/Catmull-Rom, which would dip below zero between buckets.
+  // Fritsch-Carlson interpolation avoids overshoot.
   function curve(p: number[][]): string {
     const N = p.length;
     if (N < 2) return "";
@@ -115,7 +108,6 @@
     return d.trim();
   }
 
-  // Solve the curve once; line and area share the same interpolated middle.
   const mid = $derived(pts.length ? `M${pts[0][0]},${pts[0][1]} ${curve(pts)}` : "");
   const linePath = $derived(mid);
   const areaPath = $derived(
@@ -210,7 +202,7 @@
     white-space: nowrap;
     z-index: 2;
   }
-  /* Keep the tip on-canvas near the right edge by anchoring it to its left. */
+  /* Keep edge tooltips on-canvas. */
   .spark-tip.flip {
     transform: translateX(-100%);
   }

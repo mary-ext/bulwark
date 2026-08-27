@@ -1,9 +1,6 @@
-//! Bulwark server: runs the DNS engine and serves the web UI + REST API.
+//! Bulwark DNS and HTTP server.
 
-// Fast global allocator. The per-query hot path is allocation-heavy (Message
-// parse, response build, wire encode, query-log entry) and frees the log entry
-// on a different thread than it was allocated — a pattern the system allocator
-// handles poorly. jemalloc roughly halves per-request CPU here (benched).
+// The query path is allocation-heavy and frees log entries across threads.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -30,11 +27,9 @@ async fn main() -> anyhow::Result<()> {
     let paths = Arc::new(Paths::new(data_dir));
     app::ensure_dirs(&paths)?;
 
-    // Load (or create) config, applying any env overrides for binds.
     let mut config = Config::load_or_default(&paths.config).context("loading config")?;
     app::apply_env_overrides(&mut config);
-    // Ensure a session-signing secret exists; generate one on first run. Persist
-    // it (along with a freshly created config) so tokens survive restarts.
+    // Persist the initial signing secret so sessions survive restarts.
     let mut needs_save = !paths.config.exists();
     if config.auth.session_secret.is_none() {
         config.auth.session_secret = Some(auth::generate_secret());
@@ -54,26 +49,16 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(data_dir = %paths.data_dir.display(), "starting bulwark");
 
-    // The probe-telemetry sink, shared with every pool's probe tasks. The enabled
-    // toggle tracks config and can be flipped at runtime on reload; the sink +
-    // writer are always wired below so a runtime enable takes effect without a
-    // restart. Created before the engine so the startup pool already holds it.
     let probe_log = Arc::new(ProbeLog::new(config.upstream_log.enabled));
 
-    // Build the engine.
     let engine = app::build_engine(&config, &paths, probe_log.clone()).await?;
 
-    // Restore persisted statistics.
     if config.stats.persist {
         persist::load_stats(&paths.stats, &engine);
     }
 
-    // Warm the DNS cache from the last snapshot (after build_engine has applied
-    // the cache's TTL/stale config, so expiry is judged correctly).
     persist::load_cache(&paths.cache_snapshot, &engine);
 
-    // Open the disk-backed query-log store. When persistence is off we use an
-    // in-memory database so the log still works for the lifetime of the process.
     let store_path = if config.query_log.persist {
         paths.querylog_db.to_string_lossy().into_owned()
     } else {
@@ -84,18 +69,11 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("opening query-log store")?,
     );
-    // Wire the engine's hot-path sink to the background writer. Bounded so a slow
-    // writer sheds load instead of growing memory without limit.
     let (tx, rx) = tokio::sync::mpsc::channel(persist::QUERYLOG_CHANNEL_CAP);
     engine.log().set_sink(tx);
     persist::spawn_querylog_writer(store.clone(), rx);
 
-    // Upstream probe telemetry (opt-in). The store + writer are always wired so
-    // the feature can be toggled at runtime (writes are gated by `probe_log`'s
-    // enabled flag, updated on reload). Like the query log, `persist` decides
-    // disk vs in-memory and is fixed at startup: `persist=true` (the default)
-    // opens the disk store now so a later enable needs no restart; set it false
-    // to keep telemetry in-memory and leave no file behind.
+    // The always-wired sink lets telemetry be enabled without restarting.
     let probe_store_path = if config.upstream_log.persist {
         paths.upstream_log_db.to_string_lossy().into_owned()
     } else {
@@ -122,25 +100,20 @@ async fn main() -> anyhow::Result<()> {
         update_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
-    // Background tasks. (Upstream probing is self-driven: the pool spawns one
-    // probe task per upstream in `build_pool`, so there's no global loop here.)
     persist::spawn_stats_snapshotter(engine.clone(), paths.stats.clone(), config.clone());
     persist::spawn_cache_snapshotter(engine.clone(), paths.cache_snapshot.clone());
     persist::spawn_querylog_pruner(store.clone(), config.clone());
     persist::spawn_probe_pruner(probe_store.clone(), config.clone());
 
-    // Start DNS listeners.
     let dns_binds = config.read().await.server.dns_bind.clone();
     match bulwark_engine::server::spawn(engine.clone(), &dns_binds).await {
         Ok(_handles) => {}
         Err(e) => {
-            // Don't abort the whole server if e.g. :53 needs privileges — the
-            // web UI should still come up so the user can reconfigure.
+            // Keep the web UI available when a DNS bind fails.
             tracing::error!(error = %e, "failed to bind DNS listeners (web UI still starts)");
         }
     }
 
-    // Build the HTTP app.
     let http_bind = config.read().await.server.http_bind;
     let appy = api::router(state.clone())
         .merge(assets::router())
@@ -151,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding HTTP {http_bind}"))?;
     tracing::info!(%http_bind, "web UI + API listening");
 
-    // Serve with graceful shutdown.
     let shutdown_engine = engine.clone();
     let shutdown_paths = paths.clone();
     let shutdown_cfg = config.clone();
@@ -180,14 +152,7 @@ fn init_tracing() {
         .init();
 }
 
-/// Turn on jemalloc's background purge thread. By default it is off, so dirty
-/// pages freed by a big transient allocation — notably building/reloading the
-/// filter engine, which churns hundreds of MiB — are only returned to the OS
-/// when later allocations happen to drive decay. An idle resolver therefore sits
-/// at a much higher RSS than its live heap. Enabling the background thread purges
-/// them within the decay window regardless of allocation activity, roughly
-/// halving steady-state RSS on large blocklists. Best-effort: log and continue if
-/// the build doesn't support it.
+/// Enables jemalloc's background purge thread when supported.
 fn enable_jemalloc_background_purge() {
     if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
         tracing::warn!(error = %e, "could not enable jemalloc background_thread");

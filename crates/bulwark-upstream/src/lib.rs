@@ -1,10 +1,4 @@
-//! Bulwark upstream resolution: plain DNS, DoT, DoH, DoQ transports with
-//! single-flight de-duplication and fastest-upstream selection.
-//!
-//! The [`UpstreamPool`] routes each query to the single best healthy upstream
-//! and fails over **sequentially** — it never fans one query out to several
-//! upstreams at once. Identical concurrent queries are coalesced so duplicate
-//! client traffic doesn't multiply upstream load.
+//! DNS upstream transports, pooling, failover, and request coalescing.
 
 #![forbid(unsafe_code)]
 

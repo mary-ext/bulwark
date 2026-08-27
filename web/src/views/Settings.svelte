@@ -36,8 +36,6 @@
   let upstreamlog = $state<Required<UpstreamLogConfig> | null>(null);
   let stats = $state<Required<StatsConfig> | null>(null);
   let server = $state<Required<ServerConfig> | null>(null);
-  // Privacy lives in its own config section (it affects stats too), but its
-  // control is shown in the Query log card below.
   let privacy = $state<Required<PrivacyConfig> | null>(null);
 
   async function load() {
@@ -45,7 +43,6 @@
     try {
       c = await ok(api.getConfig());
     } catch (e) {
-      // Without this the page sticks on "Loading…" forever on a failed load.
       toaster.show(errMsg(e, "Failed to load settings"), true);
       return;
     }

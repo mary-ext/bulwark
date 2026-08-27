@@ -50,10 +50,6 @@ async fn mock_upstream(answer_ip: Ipv4Addr) -> (SocketAddr, Arc<AtomicU64>) {
     });
     (addr, count)
 }
-
-/// A mock upstream that answers every A query with a CNAME chain
-/// `<qname> -> <cname_target>` followed by an `A <answer_ip>` for the target,
-/// mimicking the CNAME-cloaked responses real trackers return.
 async fn mock_upstream_cname(cname_target: &str, answer_ip: Ipv4Addr) -> SocketAddr {
     let target = Name::from_str(cname_target).unwrap();
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -86,9 +82,6 @@ async fn mock_upstream_cname(cname_target: &str, answer_ip: Ipv4Addr) -> SocketA
     });
     addr
 }
-
-/// A mock upstream that answers HTTPS queries with a single HTTPS record
-/// carrying an `ipv4hint` listing every IP in `hints`.
 async fn mock_upstream_https(hints: Vec<Ipv4Addr>) -> SocketAddr {
     use hickory_proto::rr::rdata::svcb::{IpHint, SvcParamKey, SvcParamValue, SVCB};
     use hickory_proto::rr::rdata::HTTPS;
@@ -125,8 +118,6 @@ async fn mock_upstream_https(hints: Vec<Ipv4Addr>) -> SocketAddr {
     });
     addr
 }
-
-/// A mock upstream that answers every query with an `AAAA <answer_ip>` record.
 async fn mock_upstream_aaaa(answer_ip: Ipv6Addr) -> SocketAddr {
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = sock.local_addr().unwrap();
@@ -201,9 +192,6 @@ fn query(name: &str, rtype: RecordType) -> Message {
 fn local() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
-
-/// Encode a query and feed it through the real listener ingress path, so these
-/// tests exercise the same `wire::parse_query` fast path production uses.
 fn ingest(m: Message) -> Ingress {
     Ingress::parse(&m.to_vec().unwrap()).expect("query should be decodable")
 }
@@ -220,8 +208,6 @@ async fn forwards_and_caches() {
     assert_eq!(r1.metadata.response_code, ResponseCode::NoError);
     assert_eq!(r1.answers.len(), 1);
     assert_eq!(r1.metadata.id, 0xABCD);
-
-    // Second identical query should be served from cache (no new upstream hit).
     let r2 = engine
         .handle(ingest(query("good.com.", RecordType::A)), local())
         .await
@@ -235,13 +221,9 @@ async fn forwards_and_caches() {
 async fn cache_hit_serves_patched_wire() {
     let (up, count) = mock_upstream(Ipv4Addr::new(9, 8, 7, 6)).await;
     let engine = make_engine("", up).await;
-
-    // Prime the cache (forwarded, stored as wire bytes with TTL 300).
     let _ = engine
         .handle(ingest(query("hit.com.", RecordType::A)), local())
         .await;
-
-    // Second query with a *different* transaction id -> wire-byte cache hit.
     let mut q = query("hit.com.", RecordType::A);
     q.metadata.id = 0x4242;
     let r = engine.handle(ingest(q), local()).await.into_message();
@@ -255,15 +237,11 @@ async fn cache_hit_serves_patched_wire() {
     assert_eq!(r.metadata.message_type, MessageType::Response);
     assert_eq!(r.answers.len(), 1);
     assert!(matches!(&r.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(9, 8, 7, 6)));
-    // TTL was rewritten to the remaining lifetime (<= the stored 300, >= 1).
     assert!(r.answers[0].ttl >= 1 && r.answers[0].ttl <= 300);
 }
 
 #[tokio::test]
 async fn forwarded_miss_serves_wire_without_reencoding() {
-    // A clean cache miss must serve the bytes the cache just encoded (the `Wire`
-    // variant), not a `Message` the listener re-encodes. The served bytes must
-    // decode to the right answer with the client's transaction id intact.
     let (up, _count) = mock_upstream(Ipv4Addr::new(5, 6, 7, 8)).await;
     let engine = make_engine("", up).await;
 
@@ -275,20 +253,19 @@ async fn forwarded_miss_serves_wire_without_reencoding() {
         crate::EngineResponse::Wire(b) => b.clone(),
         crate::EngineResponse::Message(_) => panic!("forwarded miss should serve wire bytes"),
     };
-    // The served wire is self-consistent and carries the client id + answer.
     let decoded = Message::from_vec(&bytes).expect("served wire decodes");
     assert_eq!(decoded.metadata.id, 0xABCD);
     assert_eq!(decoded.metadata.response_code, ResponseCode::NoError);
     assert_eq!(decoded.answers.len(), 1);
-    assert!(matches!(&decoded.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(5, 6, 7, 8)));
+    assert!(
+        matches!(&decoded.answers[0].data, RData::A(A(ip)) if *ip == Ipv4Addr::new(5, 6, 7, 8))
+    );
 }
 
 #[tokio::test]
 async fn blocks_filtered_domain() {
     let (up, count) = mock_upstream(Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||ads.example.com^", up).await;
-
-    // Capture what gets handed to the writer for this query.
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     engine.log().set_sink(tx);
 
@@ -297,7 +274,6 @@ async fn blocks_filtered_domain() {
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::NXDomain);
-    // Blocked queries never touch the upstream.
     assert_eq!(count.load(Ordering::SeqCst), 0);
 
     let entry = rx.try_recv().expect("blocked query logged");
@@ -307,8 +283,6 @@ async fn blocks_filtered_domain() {
 
 #[tokio::test]
 async fn uncloaks_blocked_cname_target() {
-    // The query name is clean, but the upstream answer CNAMEs to a blocked
-    // tracker. Response-side filtering must catch the target and block.
     let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
 
@@ -331,8 +305,6 @@ async fn uncloaks_blocked_cname_target() {
 
 #[tokio::test]
 async fn uncloak_block_is_cached() {
-    // After uncloaking once, the synthesized block must be cached so the next
-    // identical query is served without a second upstream round-trip.
     let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
 
@@ -351,8 +323,6 @@ async fn uncloak_block_is_cached() {
 
 #[tokio::test]
 async fn blocks_response_by_resolved_ip() {
-    // The name is clean, but it resolves to a blocked IP. Response-side
-    // filtering must catch the A record's address and block.
     let (up, _count) = mock_upstream(Ipv4Addr::new(9, 9, 9, 9)).await;
     let engine = make_engine("||9.9.9.9^", up).await;
 
@@ -369,9 +339,6 @@ async fn blocks_response_by_resolved_ip() {
 
 #[tokio::test]
 async fn blocks_response_on_blocked_https_hint() {
-    // The HTTPS record hints at a blocklisted IP. As in AdGuard Home, a hinted
-    // blocked IP blocks the whole response (a hint is a way to reach the IP
-    // without a separate A lookup, so it must be treated like a blocked A).
     let up = mock_upstream_https(vec![Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(6, 6, 6, 6)]).await;
     let engine = make_engine("||6.6.6.6^", up).await;
 
@@ -388,14 +355,15 @@ async fn blocks_response_on_blocked_https_hint() {
 
 #[tokio::test]
 async fn aaaa_answer_is_forwarded_untouched() {
-    // Response-side filtering must never interfere with normal IPv6: an AAAA
-    // answer that matches no rule passes straight through.
     let v6 = Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111);
     let up = mock_upstream_aaaa(v6).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
 
     let r = engine
-        .handle(ingest(query("ipv6.example.com.", RecordType::AAAA)), local())
+        .handle(
+            ingest(query("ipv6.example.com.", RecordType::AAAA)),
+            local(),
+        )
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::NoError);
@@ -405,9 +373,6 @@ async fn aaaa_answer_is_forwarded_untouched() {
 
 #[tokio::test]
 async fn blocks_response_by_resolved_ipv6() {
-    // Symmetry with the v4 path (and parity with AdGuard Home, which blocks on a
-    // bare `1234::cdef` line): an AAAA answer resolving to a blocklisted v6
-    // address is blocked just like a blocklisted A.
     let v6 = Ipv6Addr::new(0x1234, 0, 0, 0, 0, 0, 0, 0xcdef);
     let up = mock_upstream_aaaa(v6).await;
     let engine = make_engine("1234::cdef", up).await;
@@ -425,7 +390,6 @@ async fn blocks_response_by_resolved_ipv6() {
 
 #[tokio::test]
 async fn clean_https_hint_is_forwarded() {
-    // An HTTPS record whose hints are all clean must pass through untouched.
     let up = mock_upstream_https(vec![Ipv4Addr::new(1, 1, 1, 1)]).await;
     let engine = make_engine("||6.6.6.6^", up).await;
 
@@ -440,7 +404,6 @@ async fn clean_https_hint_is_forwarded() {
 
 #[tokio::test]
 async fn clean_cname_chain_is_forwarded() {
-    // A CNAME chain whose target is *not* blocked must pass through untouched.
     let up = mock_upstream_cname("cdn.good.net.", Ipv4Addr::new(5, 6, 7, 8)).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
 
@@ -449,7 +412,6 @@ async fn clean_cname_chain_is_forwarded() {
         .await
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::NoError);
-    // CNAME + A both present, unmodified.
     assert_eq!(r.answers.len(), 2);
     assert!(r
         .answers
@@ -491,7 +453,6 @@ async fn records_statistics() {
 
 #[tokio::test]
 async fn servfail_when_no_upstream_answers() {
-    // Build an engine whose only upstream is a dead port.
     let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let engine = make_engine("", dead).await;
     let r = engine
@@ -500,9 +461,6 @@ async fn servfail_when_no_upstream_answers() {
         .into_message();
     assert_eq!(r.metadata.response_code, ResponseCode::ServFail);
 }
-
-/// An `EngineState` for reload / cross-client tests: compiles `rules`, reuses an
-/// existing `pool`, and uses the given client map. Mirrors `make_engine`'s knobs.
 fn state_with(rules: &str, pool: Arc<UpstreamPool>, clients: ClientMatcher) -> EngineState {
     EngineState {
         filter: Arc::new(compile_one(rules)),
@@ -518,10 +476,6 @@ fn state_with(rules: &str, pool: Arc<UpstreamPool>, clients: ClientMatcher) -> E
 
 #[tokio::test]
 async fn reload_unblocks_cached_cloaked_answer() {
-    // Bug A: a CNAME-cloaked answer is blocked, which caches the *raw* upstream
-    // answer with a Block verdict. Removing the rule (config reload) must
-    // invalidate that verdict by generation: the next query serves the cached raw
-    // answer clean, without going back upstream.
     let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
 
@@ -534,8 +488,6 @@ async fn reload_unblocks_cached_cloaked_answer() {
         ResponseCode::NXDomain,
         "blocked while the rule is active"
     );
-
-    // Reload with the rule gone (same pool, same cache).
     engine.swap_state(state_with("", engine.pool(), ClientMatcher::default()));
 
     let r2 = engine
@@ -562,8 +514,6 @@ async fn reload_unblocks_cached_cloaked_answer() {
 
 #[tokio::test]
 async fn reload_blocks_cached_clean_answer() {
-    // Bug A, the security-critical direction: an answer cached clean must start
-    // being blocked as soon as a reload adds a matching rule — not at entry expiry.
     let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("", up).await; // nothing blocked yet
 
@@ -601,14 +551,8 @@ async fn reload_blocks_cached_clean_answer() {
 
 #[tokio::test]
 async fn unfiltered_client_cache_does_not_leak_to_filtered_client() {
-    // Bug B: the cache key carries no client identity. An *unfiltered* client
-    // resolves and caches the raw cloaked answer; a *filtered* client hitting the
-    // same entry must still be blocked — the verdict is re-gated per client, never
-    // served raw from a cache populated by someone who opted out of filtering.
     let up = mock_upstream_cname("tracker.evil.net.", Ipv4Addr::new(1, 2, 3, 4)).await;
     let engine = make_engine("||tracker.evil.net^", up).await;
-
-    // 127.0.0.2 is a client with filtering disabled; 127.0.0.1 (default) is filtered.
     let clients = ClientMatcher::build(&[ClientConfig {
         id: "nofilter".into(),
         name: "nofilter".into(),
@@ -617,8 +561,6 @@ async fn unfiltered_client_cache_does_not_leak_to_filtered_client() {
         filtering_enabled: false,
     }]);
     engine.swap_state(state_with("||tracker.evil.net^", engine.pool(), clients));
-
-    // Unfiltered client resolves first and gets the raw cloaked answer (it opted out).
     let unfiltered: IpAddr = "127.0.0.2".parse().unwrap();
     let rb = engine
         .handle(ingest(query("data.brand.com.", RecordType::A)), unfiltered)
@@ -629,8 +571,6 @@ async fn unfiltered_client_cache_does_not_leak_to_filtered_client() {
         ResponseCode::NoError,
         "the unfiltered client is not filtered"
     );
-
-    // Filtered client hits the same cache entry and must be blocked.
     let ra = engine
         .handle(ingest(query("data.brand.com.", RecordType::A)), local())
         .await

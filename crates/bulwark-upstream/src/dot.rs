@@ -1,13 +1,4 @@
-//! DNS-over-TLS (RFC 7858).
-//!
-//! Maintains a single persistent TLS connection that is **pipelined**: many
-//! queries can be in flight at once over the one connection, each tagged with a
-//! distinct connection-local id, and a background reader demultiplexes responses
-//! back to the waiting callers by that id (RFC 7858 §3.3 — the server may answer
-//! out of order). This is what stops a burst of distinct names from queuing
-//! head-to-tail behind one another: previously the connection served one query
-//! at a time, so under load a query could wait out the pool timeout before ever
-//! reaching the wire and be wrongly counted as an upstream failure.
+//! Pipelined DNS-over-TLS (RFC 7858).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -35,12 +26,9 @@ use crate::transport::{
     encode, matches_query, Pending, PendingGuard, PendingState, Transport, UPSTREAM_IDLE_TIMEOUT,
 };
 
-/// One pipelined connection: a serialized write half, the pending-waiter table,
-/// the id allocator, and the reader task draining the read half.
+/// One pipelined TLS connection.
 struct Conn<S> {
-    /// Writes are serialized (frames must not interleave) but the lock is held
-    /// only for the brief write of one message — never across awaiting a
-    /// response — so queries still pipeline.
+    /// Serialized framed writes.
     write: Mutex<WriteHalf<S>>,
     pending: Pending,
     next_id: AtomicU16,
@@ -73,14 +61,10 @@ where
         self.pending.lock().dead
     }
 
-    /// Send one query and await its matching response. Assigns a connection-local
-    /// id for demuxing (the caller's id is restored on the way out, like DoH/DoQ
-    /// do with id 0), and validates the response against the sent question.
+    /// Exchanges a query using a connection-local demultiplexing id.
     async fn exchange(&self, query: &Message) -> Result<Message> {
         let original_id = query.metadata.id;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        // Patch the demux id directly into the wire header (first two bytes) rather
-        // than cloning the whole `Message` just to change it.
         let mut buf = encode(query)?;
         buf[..2].copy_from_slice(&id.to_be_bytes());
 
@@ -102,15 +86,9 @@ where
             write_tcp_bytes(&mut *w, &buf).await?;
         }
 
-        // The reader removed our id from the map before sending; if the
-        // connection died first it dropped our sender, surfacing here as a recv
-        // error that fails this query over to a fresh connection.
         let mut resp = rx
             .await
             .map_err(|_| UpstreamError::Io("DoT connection closed".into()))?;
-        // The reader already demuxed this response to us by its (connection-local)
-        // id, so restore the caller's id and validate the question against the
-        // original query — the id echo is guaranteed by the routing.
         resp.metadata.id = original_id;
         if !matches_query(query, &resp) {
             return Err(UpstreamError::Proto(
@@ -121,31 +99,13 @@ where
     }
 }
 
-/// Drain responses off a connection's read half and hand each to its waiter.
-/// On any read error the connection is dead: mark it so and drop every pending
-/// sender, which wakes all in-flight queries with a recv error so they fail over
-/// promptly instead of hanging until the pool timeout.
-///
-/// The read is bounded by `idle_timeout`: if no complete response arrives within
-/// it the connection has gone idle, so we close it, freeing the TLS read half +
-/// task rather than pinning them on a quiet box. Unlike connected UDP, a
-/// length-prefixed read is *not* cancel-safe — timing out mid-frame would
-/// desync the stream — so an idle timeout always tears the connection down
-/// (never resumes a partial read). That's safe here because a real DNS response
-/// completes in milliseconds, resetting the timer; only a genuinely idle (or
-/// stuck) connection ever reaches the timeout, and any waiter still parked on it
-/// has long since hit the much shorter pool query timeout and failed over.
+/// Demultiplexes responses and tears down on read error or idle timeout.
 async fn reader_loop<R: AsyncRead + Unpin>(mut read: R, pending: Pending, idle_timeout: Duration) {
-    // Loop while a complete response keeps arriving within the idle window. A read
-    // error/EOF (`Ok(Err)`) or an idle timeout (`Err`) both fall out of the
-    // `while let` and tear the connection down below — for an idle timeout that
-    // means closing rather than resuming a partial (non-cancel-safe) framed read.
     while let Ok(Ok(msg)) = tokio::time::timeout(idle_timeout, read_tcp_message(&mut read)).await {
         let waiter = pending.lock().map.remove(&msg.metadata.id);
         if let Some(tx) = waiter {
             let _ = tx.send(msg);
         }
-        // An id with no waiter (already cancelled, or unsolicited) is dropped.
     }
     let mut p = pending.lock();
     p.dead = true;
@@ -196,8 +156,7 @@ impl DotTransport {
         Err(last)
     }
 
-    /// The live pipelined connection, dialing (and replacing a dead one) under
-    /// the lock so concurrent callers share a single dial rather than storming.
+    /// Returns the shared live connection.
     async fn connection(&self) -> Result<Arc<Conn<TlsStream<TcpStream>>>> {
         let mut guard = self.conn.lock().await;
         if let Some(c) = guard.as_ref() {
@@ -210,9 +169,7 @@ impl DotTransport {
         Ok(conn)
     }
 
-    /// Drop the shared connection if it's still the one that just failed, so the
-    /// next `connection()` dials fresh. Guards against clobbering a replacement a
-    /// concurrent caller may already have installed.
+    /// Drops the shared connection if it matches the failed one.
     async fn invalidate(&self, dead: &Arc<Conn<TlsStream<TcpStream>>>) {
         let mut guard = self.conn.lock().await;
         if matches!(guard.as_ref(), Some(c) if Arc::ptr_eq(c, dead)) {
@@ -228,9 +185,6 @@ impl Transport for DotTransport {
             match conn.exchange(query).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
-                    // The reused connection may have broken: discard it and retry
-                    // once on a fresh one (a freshly-dialed connection that still
-                    // fails errors out).
                     self.invalidate(&conn).await;
                     tracing::debug!(upstream = %self.desc, error = %e, "DoT retry on fresh connection");
                     let fresh = self.connection().await?;
@@ -272,10 +226,6 @@ mod tests {
         resp.metadata.response_code = ResponseCode::NoError;
         resp
     }
-
-    /// A fake DoT server over a duplex pipe: read each framed query, build a
-    /// response, and write them back in `reorder`'s order once `hold` of them
-    /// have arrived (to force out-of-order delivery).
     async fn serve(mut server: DuplexStream, hold: usize, reorder: bool) {
         let mut pending = Vec::new();
         while pending.len() < hold {
@@ -294,9 +244,6 @@ mod tests {
 
     #[tokio::test]
     async fn pipelines_concurrent_queries_out_of_order() {
-        // Two queries in flight at once; the server answers them in reverse. Each
-        // caller must still receive the response to its own question, demuxed by
-        // the connection-local id.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve(server, 2, true));
         let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
@@ -307,7 +254,6 @@ mod tests {
 
         let ra = ra.unwrap();
         let rb = rb.unwrap();
-        // Caller ids are restored, and each response matches its own question.
         assert_eq!(ra.metadata.id, 0x1111);
         assert_eq!(ra.queries[0].name().to_ascii(), "a.test.");
         assert_eq!(rb.metadata.id, 0x2222);
@@ -316,22 +262,14 @@ mod tests {
 
     #[tokio::test]
     async fn second_query_not_blocked_by_first() {
-        // A slow first query (server holds both, answers #2's id first) must not
-        // delay the second — the whole point of pipelining. We model "slow" by
-        // having the server withhold the first response until the second is sent.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(serve(server, 2, true));
         let conn = Conn::new(client, UPSTREAM_IDLE_TIMEOUT);
-
-        // Fire both; if the connection serialized, this would deadlock against the
-        // server waiting for the 2nd query before answering. It completing proves
-        // both queries reached the wire before either was answered.
         let qa = query(1, "first.test.");
         let qb = query(2, "second.test.");
-        let res = tokio::time::timeout(
-            Duration::from_secs(2),
-            async { tokio::join!(conn.exchange(&qa), conn.exchange(&qb)) },
-        )
+        let res = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(conn.exchange(&qa), conn.exchange(&qb))
+        })
         .await
         .expect("pipelined queries must not deadlock");
         assert!(res.0.is_ok() && res.1.is_ok());
@@ -339,8 +277,6 @@ mod tests {
 
     #[tokio::test]
     async fn connection_close_wakes_waiters() {
-        // The server reads the query then drops the connection without answering.
-        // The waiter must error out (so the pool can fail over) rather than hang.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let mut server = server;
@@ -352,15 +288,15 @@ mod tests {
         let err = tokio::time::timeout(Duration::from_secs(2), conn.exchange(&query(7, "x.test.")))
             .await
             .expect("must not hang on a dropped connection");
-        assert!(err.is_err(), "a closed connection must wake the waiter with an error");
+        assert!(
+            err.is_err(),
+            "a closed connection must wake the waiter with an error"
+        );
         assert!(conn.is_dead(), "the connection should be marked dead");
     }
 
     #[tokio::test]
     async fn idle_connection_closes() {
-        // With nothing to read, the reader must self-close after the idle window
-        // (freeing the TLS read half + task) and mark the connection dead so the
-        // next query re-dials. The server keeps the pipe open but sends nothing.
         let (client, server) = tokio::io::duplex(64 * 1024);
         let _keepalive = server; // hold the far end open; just never write to it.
         let conn = Conn::new(client, Duration::from_millis(150));
@@ -375,13 +311,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_mismatched_response() {
-        // A response whose question doesn't match (but whose id the reader used to
-        // route it) must be rejected, not served.
         let (client, server) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
             let mut server = server;
             let q = read_tcp_message(&mut server).await.unwrap();
-            // Echo the assigned id but answer a different name.
             let mut resp = answer_for(&query(0, "evil.test."));
             resp.metadata.id = q.metadata.id;
             write_tcp_message(&mut server, &resp).await.unwrap();
@@ -391,9 +324,6 @@ mod tests {
         let r = conn.exchange(&query(5, "good.test.")).await;
         assert!(matches!(r, Err(UpstreamError::Proto(_))));
     }
-
-    // A round-trip through encode/decode keeps the helpers honest even when no
-    // test exercises the wire directly.
     #[test]
     fn answer_round_trips() {
         let q = query(0x4242, "rt.test.");

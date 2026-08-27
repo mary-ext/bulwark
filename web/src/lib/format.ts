@@ -6,21 +6,13 @@ export function pct(frac: number): string {
   return (frac * 100).toFixed(1) + "%";
 }
 
-/**
- * Round a list of `counts` to whole-percent shares of `denom` using the
- * largest-remainder (Hamilton) method, so the displayed integers add up to the
- * same total the exact shares would (100 when `denom` is the sum of `counts`,
- * less when `denom` is a larger grand total). Rounding each share independently
- * with `toFixed(0)` lets the column drift past 100%; this distributes the
- * leftover points to the rows with the largest fractional remainders instead.
- */
+/** Rounds shares with the largest-remainder method. */
 export function sharePcts(counts: number[], denom: number): number[] {
   if (denom <= 0) return counts.map(() => 0);
   const exact = counts.map((c) => (c / denom) * 100);
   const floors = exact.map(Math.floor);
   const target = Math.round(exact.reduce((s, v) => s + v, 0));
   let leftover = target - floors.reduce((s, v) => s + v, 0);
-  // Hand out the remaining whole points to the largest fractional parts first.
   const order = exact
     .map((v, i) => ({ i, frac: v - Math.floor(v) }))
     .sort((a, b) => b.frac - a.frac);
@@ -32,9 +24,7 @@ export function sharePcts(counts: number[], denom: number): number[] {
   return floors;
 }
 
-// Reused across every render; instantiating Intl.NumberFormat is comparatively
-// expensive, so keep one per (unit, precision) we display. `style: "unit"` lets
-// the formatter emit the locale-aware unit label ("ms", "μs", "s") for us.
+// Reuse locale-aware duration formatters.
 const unitFmt = (unit: string, max: number) =>
   new Intl.NumberFormat(undefined, {
     style: "unit",
@@ -47,11 +37,7 @@ const usFmt0 = unitFmt("microsecond", 0);
 const msFmt = unitFmt("millisecond", 1);
 const sFmt = unitFmt("second", 2);
 
-/**
- * Format a duration given in **milliseconds**, auto-scaling the unit so
- * sub-millisecond values (e.g. cache hits at ~0.001 ms) stay legible as
- * microseconds instead of collapsing to "0.00 ms".
- */
+/** Formats milliseconds with an appropriate unit. */
 export function duration(milliseconds: number | null | undefined): string {
   if (milliseconds == null) return "—";
   if (milliseconds <= 0) return msFmt.format(0);

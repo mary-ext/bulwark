@@ -1,6 +1,4 @@
-// Theme store: light default, persisted to localStorage, applied via the
-// `data-theme` attribute on <html>. Dark is the only non-default; absence of
-// the attribute also resolves to light (see tokens.css :root).
+// Persistent `data-theme` state; no attribute means light mode.
 
 export type Theme = "light" | "dark";
 const KEY = "bulwark-theme";

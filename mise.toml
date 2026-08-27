@@ -1,16 +1,12 @@
 [tools]
-# Rust toolchain — matches workspace.package.rust-version in Cargo.toml.
+# Rust toolchain.
 rust = { version = "1.94", components = "rustfmt,clippy" }
 
-# Web stack for the Vite + Svelte app under web/.
+# Web toolchain.
 node = "26"
 pnpm = "11.5.1"
 
-# Tasks. Run `mise tasks` to list, `mise run <name>` to execute.
-#
-# The Rust build and the web build are decoupled: `cargo build` embeds whatever
-# is already in `web/dist` and never runs pnpm. Build the front-end explicitly
-# (`mise run web`) before building a release binary, or use `mise run dist`.
+# Tasks. The Rust build embeds the existing `web/dist`; `dist` builds both.
 
 [tasks.install]
 description = "Install front-end dependencies."

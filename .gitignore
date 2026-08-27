@@ -6,10 +6,7 @@ Cargo.lock.orig
 # Node / web
 node_modules/
 .vite/
-# The built UI bundle is generated, not committed. The web build and the Rust
-# build are decoupled (see server/build.rs / README): `cargo build` embeds
-# whatever is in web/dist, and server/build.rs creates the directory (with a
-# .keep marker) if it's missing so the rust-embed `#[folder]` always compiles.
+# Generated web bundle.
 web/dist/
 
 # Editor / OS

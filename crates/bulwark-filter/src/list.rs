@@ -1,4 +1,4 @@
-//! Loading and compiling filter lists into a [`FilterEngine`].
+//! Filter-list compilation.
 
 use std::collections::HashSet;
 
@@ -49,8 +49,6 @@ impl Compiler {
                         rule.rule.list_id = list_id;
                         if rule.badfilter {
                             self.badfilter_sigs.insert(rule.signature.clone());
-                            // A badfilter rule only disables others; it is not
-                            // itself a matchable rule.
                             continue;
                         }
                         stats.rules += 1;
@@ -66,12 +64,7 @@ impl Compiler {
         stats
     }
 
-    /// Consume the compiler, producing the engine and the gathered stats.
-    ///
-    /// Rules cancelled by `$badfilter` are dropped, and exact-duplicate rules
-    /// (same signature — pattern + modifiers + action) are de-duplicated, which
-    /// matters a lot for overlapping blocklists. The first occurrence wins (so
-    /// its source list keeps the attribution).
+    /// Builds an engine after applying `$badfilter` and deduplication.
     pub fn build(self) -> (FilterEngine, Vec<ListStats>) {
         let Compiler {
             rules,
@@ -89,22 +82,8 @@ impl Compiler {
     }
 }
 
-/// Drop plain block rules already covered by a broader plain `||ancestor^`
-/// subdomain block — e.g. `||ads.doubleclick.net^` (or a hosts entry for the
-/// same host) when `||doubleclick.net^` is also blocked. Real merged blocklists
-/// carry a meaningful fraction of these.
-///
-/// Soundness: a rule is removed only when it is a **plain** (unmodified) `Block`
-/// *and* a plain **subdomain** `Block` exists for a strict ancestor (for an
-/// exact/hosts rule, also the same domain). The surviving subdomain rule matches
-/// the removed rule's domain and every subdomain of it, with the same action and
-/// no client/type narrowing, so the verdict is identical for every query and
-/// client. Anything that could differ — exceptions (`@@`), `$important`,
-/// rewrites, `$client`/`$ctag`/`$dnstype`/`$denyallow`, and the subsuming
-/// subdomain rules themselves — is never removed. The only observable change is
-/// that a removed rule's query-log attribution shifts to the broader survivor.
+/// Removes plain blocks covered by an unmodified ancestor subdomain block.
 fn prune_redundant(active: &mut Vec<BuildRule>) {
-    // Subsumers: the domains of plain subdomain Block rules.
     let subsumers: HashSet<&str> = active
         .iter()
         .filter_map(|br| {
@@ -119,8 +98,10 @@ fn prune_redundant(active: &mut Vec<BuildRule>) {
     if subsumers.is_empty() {
         return;
     }
-    // Mask first (borrows `active` immutably via `subsumers`), then prune.
-    let keep: Vec<bool> = active.iter().map(|br| !is_redundant(br, &subsumers)).collect();
+    let keep: Vec<bool> = active
+        .iter()
+        .map(|br| !is_redundant(br, &subsumers))
+        .collect();
     drop(subsumers);
     let mut i = 0;
     active.retain(|_| {
@@ -130,10 +111,6 @@ fn prune_redundant(active: &mut Vec<BuildRule>) {
     });
 }
 
-/// Is this a plain Block rule whose domain is already covered by a subsuming
-/// subdomain block in `subsumers`? Exact rules also test their own domain (a
-/// subdomain block of `d` covers the exact host `d`); subdomain rules test only
-/// strict ancestors (an equal-domain duplicate would already be deduped).
 fn is_redundant(br: &BuildRule, subsumers: &HashSet<&str>) -> bool {
     if br.rule.action != Action::Block || br.rule.mods.is_some() {
         return false;

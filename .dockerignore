@@ -1,12 +1,12 @@
-# Build artifacts — rebuilt inside the image
+# Build artifacts
 /target
 /web/node_modules
 /web/dist
 
-# Runtime state — must never be baked into the image
+# Runtime state
 /data
 
-# VCS / local clutter
+# VCS and local files
 /.git
 /.research
 **/*.log

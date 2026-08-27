@@ -12,16 +12,14 @@
   }: {
     items: Entry[];
     color?: string;
-    /** Optional grand total for the "% of total" label; defaults to the sum of items. */
+    /** Optional percentage denominator. */
     total?: number;
     empty?: string;
-    /** Body scrolls past this height so long lists don't grow the card. */
+    /** Optional scrolling threshold. */
     maxHeight?: number;
   } = $props();
 
   const max = $derived(Math.max(1, ...items.map((i) => i.count)));
-  // Largest-remainder rounding so the shares don't drift past their true total
-  // (100 when summing the items, less when `total` is a larger grand total).
   const shares = $derived(sharePcts(items.map((i) => i.count), total ?? items.reduce((s, i) => s + i.count, 0)));
 </script>
 

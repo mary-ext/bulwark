@@ -38,7 +38,6 @@
     }
   }
 
-  // Load once on mount — no background polling.
   $effect(() => {
     loadStats();
     loadCfg();

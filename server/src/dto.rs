@@ -1,10 +1,4 @@
-//! API-owned data-transfer objects for the engine/upstream read-models.
-//!
-//! These mirror the internal `bulwark-engine` / `bulwark-upstream` types on the
-//! wire, but live in the API layer so those crates stay free of `utoipa` and are
-//! free to evolve independently of the public HTTP contract. Config types are
-//! deliberately *not* duplicated here: `bulwark-config` is itself the public
-//! configuration contract (see its module docs) and derives `ToSchema` directly.
+//! API data-transfer objects for engine and upstream state.
 
 use std::collections::HashMap;
 
@@ -15,10 +9,6 @@ use bulwark_upstream::pool::UpstreamStat;
 use bulwark_upstream::spec::TransportKind;
 use serde::Serialize;
 use utoipa::ToSchema;
-
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
 
 /// A name + count pair for top-N lists.
 #[derive(Serialize, ToSchema)]
@@ -92,19 +82,13 @@ pub struct StatsResponse {
     pub upstream_latency_pct: HashMap<String, LatencyPercentilesDto>,
     pub series: Vec<SeriesPointDto>,
     pub cache_size: usize,
-    /// Total cache hits (fresh + stale) over the cache's lifetime (persisted in
-    /// `stats.json`, so it accumulates across restarts).
+    /// Lifetime fresh and stale cache hits.
     pub cache_hits: u64,
     /// Cache lookups that found nothing servable and went upstream.
     pub cache_misses: u64,
-    /// Subset of `cache_hits` served stale under optimistic caching. Each one is
-    /// a client-facing hit that also kicked off a background refresh, so the
-    /// client hit rate (`cache_hits/total`) overstates how little we touch
-    /// upstream by exactly this much.
+    /// Stale hits that triggered background refreshes.
     pub cache_stale_hits: u64,
-    /// Background refreshes dispatched upstream (intent; the pool may
-    /// single-flight concurrent identical ones). This is the upstream traffic the
-    /// client-facing hit rate hides.
+    /// Background refreshes dispatched upstream.
     pub cache_refreshes: u64,
     /// Background refreshes that failed to resolve upstream.
     pub cache_refresh_failures: u64,
@@ -145,16 +129,7 @@ impl StatsResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Query log
-// ---------------------------------------------------------------------------
-
-/// A query-log entry, flattened for the UI, plus the resolved filter-list name.
-///
-/// The internal `QueryAction` is an internally-tagged enum; here it is splayed
-/// into a plain `action` discriminator string and a few optional fields so the
-/// generated TypeScript type is a single flat row (rather than a discriminated
-/// union) that the query-log table can consume directly.
+/// Flattened query-log entry for the API.
 #[derive(Serialize, ToSchema)]
 pub struct LogEntryView {
     pub id: u64,
@@ -181,15 +156,13 @@ pub struct LogEntryView {
     /// Short summary of answer records (e.g. `["A 1.2.3.4"]`).
     pub answers: Vec<String>,
     pub elapsed_ms: f64,
-    /// Friendly name of the filter list responsible (absent unless the query was
-    /// blocked or rewritten by a known list; id 0 is the user's custom rules).
+    /// Matching filter-list name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub list_name: Option<String>,
 }
 
 impl LogEntryView {
-    /// `client_name` is resolved by the caller from the entry's IP against the
-    /// current client config, so it reflects renames/removals retroactively.
+    /// Builds a row using the client's current display name.
     pub fn new(e: QueryLogEntry, list_name: Option<String>, client_name: Option<String>) -> Self {
         let (action, upstream, rule, list_id) = match e.action {
             QueryAction::Forwarded { upstream } => ("forwarded", Some(upstream), None, None),
@@ -227,10 +200,6 @@ pub struct QueryLogResponse {
     /// Total entries matching the filter (across all pages), for pagination.
     pub total: usize,
 }
-
-// ---------------------------------------------------------------------------
-// Upstreams
-// ---------------------------------------------------------------------------
 
 /// The wire protocol used to reach an upstream.
 #[derive(Serialize, ToSchema)]

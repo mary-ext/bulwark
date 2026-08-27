@@ -1,5 +1,4 @@
-// Reactive matchMedia as a rune. Singletons are shared across all consumers so
-// we register one listener per query, not one per component.
+// Shared reactive media queries.
 
 class MediaQuery {
   matches = $state(false);
@@ -11,5 +10,5 @@ class MediaQuery {
   }
 }
 
-/** True below the shell/table breakpoint (sidebar → drawer, tables → cards). */
+/** Mobile layout breakpoint. */
 export const isMobile = new MediaQuery("(max-width: 768px)");

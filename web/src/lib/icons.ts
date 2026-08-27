@@ -1,5 +1,4 @@
-// Inline SVG icon set (Lucide path data, 24×24 stroke). Rendered by Icon.svelte.
-// Values are the inner markup of an <svg viewBox="0 0 24 24"> element.
+// Lucide-compatible SVG path markup.
 
 export const icons = {
   dashboard:

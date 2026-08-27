@@ -10,11 +10,11 @@
     maxHeight = 264,
   }: {
     upstreams: TopEntryDto[];
-    /** Per-upstream approximate latency percentiles, keyed by upstream name. */
+    /** Latency percentiles keyed by upstream name. */
     pct?: Record<string, LatencyPercentilesDto>;
     color?: string;
     empty?: string;
-    /** Body scrolls past this height so long lists don't grow the card. */
+    /** Optional scrolling threshold. */
     maxHeight?: number;
   } = $props();
 
@@ -26,12 +26,7 @@
     p99: number | null;
   };
 
-  // Join the query-count ranking with each upstream's median latency, then order
-  // by lowest p50 first. Median (not mean) is the headline: it's robust to the
-  // long latency tail, so a few slow responses don't make an otherwise-fast
-  // upstream look bad. Upstreams that have served no queries have no meaningful
-  // median, so they sort last regardless of count. The bar still encodes query
-  // share, so volume and typical speed are both legible at a glance.
+  // Rank by median latency; unsampled upstreams sort last.
   const rows = $derived<Row[]>(
     upstreams
       .map((u) => {
@@ -48,8 +43,6 @@
   );
 
   const max = $derived(Math.max(1, ...rows.map((r) => r.count)));
-  // Whole-percent query shares that always sum to 100, avoiding the per-row
-  // rounding drift that let the column read over 100%.
   const shares = $derived(sharePcts(rows.map((r) => r.count), rows.reduce((s, r) => s + r.count, 0)));
 
   const latTitle = (r: Row) => `p50 ${duration(r.p50)} · p90 ${duration(r.p90)} · p99 ${duration(r.p99)}`;

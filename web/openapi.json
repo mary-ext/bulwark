@@ -1357,14 +1357,14 @@
               "string",
               "null"
             ],
-            "description": "Argon2 password hash; `None` until the admin sets a password (setup flow).\nSkipped when absent so the redacted (`None`) value the API returns never\nrides the wire, and the YAML stays clean before setup."
+            "description": "Argon2 password hash; absent until setup completes."
           },
           "session_secret": {
             "type": [
               "string",
               "null"
             ],
-            "description": "HMAC secret (base64url) for signing session JWTs. Generated on first run\nif absent. Redacted from the config API like `password_hash`; deleting it\nfrom the YAML rotates the secret and invalidates all outstanding tokens."
+            "description": "Base64url HMAC secret for session JWTs."
           },
           "username": {
             "type": "string",
@@ -1404,7 +1404,7 @@
           "optimistic_max_age_secs": {
             "type": "integer",
             "format": "int32",
-            "description": "Optimistic caching (serve-stale): the maximum number of seconds **past\nexpiry** that a stale entry may be served immediately while a fresh\nresolve runs in the background. `0` disables serve-stale entirely; any\nvalue `> 0` enables it and bounds how stale an answer can be (entries are\nnever served unbounded).",
+            "description": "Maximum age past expiry for serve-stale; 0 disables it.",
             "minimum": 0
           },
           "size": {
@@ -1519,7 +1519,7 @@
       },
       "Config": {
         "type": "object",
-        "description": "The root configuration.",
+        "description": "Root configuration.",
         "properties": {
           "auth": {
             "$ref": "#/components/schemas/AuthConfig"
@@ -1776,7 +1776,7 @@
       },
       "LogEntryView": {
         "type": "object",
-        "description": "A query-log entry, flattened for the UI, plus the resolved filter-list name.\n\nThe internal `QueryAction` is an internally-tagged enum; here it is splayed\ninto a plain `action` discriminator string and a few optional fields so the\ngenerated TypeScript type is a single flat row (rather than a discriminated\nunion) that the query-log table can consume directly.",
+        "description": "Flattened query-log entry for the API.",
         "required": [
           "id",
           "time_ms",
@@ -1837,7 +1837,7 @@
               "string",
               "null"
             ],
-            "description": "Friendly name of the filter list responsible (absent unless the query was\nblocked or rewritten by a known list; id 0 is the user's custom rules)."
+            "description": "Matching filter-list name."
           },
           "qtype": {
             "type": "string"
@@ -1910,11 +1910,11 @@
       },
       "PrivacyConfig": {
         "type": "object",
-        "description": "Privacy-related toggles that span more than one subsystem.",
+        "description": "Privacy settings shared by logging and statistics.",
         "properties": {
           "anonymize_client_ips": {
             "type": "boolean",
-            "description": "When set, client IPs are dropped entirely from the query log (the stored\nand API-returned `client_ip` is blank) **and** from statistics (the\ndashboard's \"top clients\" panel is empty while on). The IP is still used\nto identify the client for filtering before logging/recording — only the\nretained/displayed copy is removed."
+            "description": "Omits client IPs from query logs and statistics."
           }
         }
       },
@@ -2082,7 +2082,7 @@
           "cache_hits": {
             "type": "integer",
             "format": "int64",
-            "description": "Total cache hits (fresh + stale) over the cache's lifetime (persisted in\n`stats.json`, so it accumulates across restarts).",
+            "description": "Lifetime fresh and stale cache hits.",
             "minimum": 0
           },
           "cache_misses": {
@@ -2100,7 +2100,7 @@
           "cache_refreshes": {
             "type": "integer",
             "format": "int64",
-            "description": "Background refreshes dispatched upstream (intent; the pool may\nsingle-flight concurrent identical ones). This is the upstream traffic the\nclient-facing hit rate hides.",
+            "description": "Background refreshes dispatched upstream.",
             "minimum": 0
           },
           "cache_size": {
@@ -2110,7 +2110,7 @@
           "cache_stale_hits": {
             "type": "integer",
             "format": "int64",
-            "description": "Subset of `cache_hits` served stale under optimistic caching. Each one is\na client-facing hit that also kicked off a background refresh, so the\nclient hit rate (`cache_hits/total`) overstates how little we touch\nupstream by exactly this much.",
+            "description": "Stale hits that triggered background refreshes.",
             "minimum": 0
           },
           "cached": {
@@ -2285,20 +2285,20 @@
       },
       "UpstreamLogConfig": {
         "type": "object",
-        "description": "Persistence of upstream **probe telemetry** — the background `NS .` RTT\nsamples and the health they drive — for maintenance and diagnostics (\"when\ndid this upstream flap down, is its latency creeping up\"). Distinct from the\nquery log: separate DB file, retention, and toggle.\n\n**Off by default.** `enabled` toggles live (no restart): the writer is always\nwired, so flipping it on starts persisting immediately. Only `persist` (disk\nvs in-memory) is fixed at startup, exactly as for the query log.",
+        "description": "Upstream probe telemetry settings.",
         "properties": {
           "enabled": {
             "type": "boolean",
-            "description": "Persist probe telemetry. Off by default; can be toggled at runtime."
+            "description": "Enables probe telemetry at runtime."
           },
           "persist": {
             "type": "boolean",
-            "description": "Persist to disk so it survives restarts. When off, an in-memory database\nis used for the lifetime of the process (and no file is created). Fixed at\nstartup — changing it takes effect on the next restart."
+            "description": "Persists telemetry across restarts. Applied at startup."
           },
           "retention_days": {
             "type": "integer",
             "format": "int32",
-            "description": "How many days of probe telemetry to retain. Probes are low-volume (one\nper upstream per minute), so a generous default is cheap. 0 disables\ntime-based pruning.",
+            "description": "Retention in days; 0 disables time-based pruning.",
             "minimum": 0
           }
         }
@@ -2364,7 +2364,7 @@
           },
           "servers": {
             "type": "string",
-            "description": "Freeform upstream list: one spec per line. Lines starting with `#` are\ncomments and blank lines are ignored — both are preserved verbatim so\nyou can annotate and toggle entries by commenting them out. e.g.\n`https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`."
+            "description": "Upstream specs, one per line. Blank and `#`-prefixed lines are ignored."
           },
           "timeout_secs": {
             "type": "integer",

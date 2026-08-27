@@ -1,34 +1,6 @@
-//! Per-transport benchmark + profiler for the upstream layer.
+//! Upstream transport benchmark and profiler.
 //!
-//! `bench_request` only ever talks to an in-process **UDP** mock, so the encrypted
-//! transports (DoT, DoH, DoQ) are never exercised in a controlled benchmark. This
-//! example stands up an in-process mock upstream for **every** transport bulwark
-//! speaks — plain UDP/TCP, DoT, DoH over HTTP/1.1+HTTP/2, DoH forced over HTTP/3,
-//! and DoQ — and drives bulwark's *real* client code against each one.
-//!
-//! To do that against a local mock (which can only present a self-signed cert) we
-//! generate a private CA, register it via `bulwark_upstream::add_trust_root` (the
-//! additive, feature-gated `test-trust-roots` hook), and give every mock a leaf
-//! cert with an IP SAN for `127.0.0.1`. Certificate verification still runs in
-//! full — it just chains to our private CA instead of the public web PKI.
-//!
-//! For each transport we measure:
-//!   * handshake / cold-start cost (first query, incl. TLS/QUIC handshake)
-//!   * warm steady-state per-query latency (pool level, unique names)
-//!   * concurrent throughput (q/s + percentiles) — exposes the serialized-DoT vs
-//!     multiplexed-DoQ/h2/h3 contrast
-//!   * whole-chain latency through the full engine with the **real** AdGuard SDNS
-//!     + OISD Big filter lists compiled and the cache enabled (forwarded miss)
-//!
-//! Run with:
-//!   cargo run --release --example bench_transports -p bulwark
-//!
-//! Knobs (env):
-//!   BENCH_N                 queries per measurement          (default 5000)
-//!   BENCH_UPSTREAM_DELAY_US simulated upstream RTT, µs       (default 0)
-//!   BENCH_CONCURRENCY       concurrent in-flight queries     (default 64)
-//!   BENCH_TRANSPORTS        comma list to restrict, e.g. "dot,doq"
-//!   BENCH_DATA_DIR          where to cache the filter lists
+//! Run with `cargo run --release --example bench_transports -p bulwark`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
@@ -59,13 +31,6 @@ fn env_usize(key: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
-
-// ---------------------------------------------------------------------------
-// Shared mock answer + DNS helpers.
-// ---------------------------------------------------------------------------
-
-/// Build the mock's reply to a query: `nx-*` names get NXDOMAIN (exercises the
-/// negative path); everything else gets `A 1.2.3.4`.
 fn answer(query: &Message) -> Message {
     let mut resp = query.clone();
     resp.metadata.message_type = MessageType::Response;
@@ -84,8 +49,6 @@ fn answer(query: &Message) -> Message {
     }
     resp
 }
-
-/// Decode a wire query, build the answer, re-encode it, applying the RTT delay.
 async fn respond(bytes: &[u8], delay: Duration) -> Option<Vec<u8>> {
     let query = Message::from_vec(bytes).ok()?;
     let resp = answer(&query);
@@ -95,8 +58,6 @@ async fn respond(bytes: &[u8], delay: Duration) -> Option<Vec<u8>> {
     }
     Some(out)
 }
-
-/// Read one 2-byte-length-prefixed DNS message (TCP/DoT/DoQ framing).
 async fn read_prefixed<R: AsyncReadExt + Unpin>(r: &mut R) -> Option<Vec<u8>> {
     let mut len = [0u8; 2];
     r.read_exact(&mut len).await.ok()?;
@@ -105,10 +66,6 @@ async fn read_prefixed<R: AsyncReadExt + Unpin>(r: &mut R) -> Option<Vec<u8>> {
     r.read_exact(&mut buf).await.ok()?;
     Some(buf)
 }
-
-/// Write one 2-byte-length-prefixed DNS message. Sends length+body as a single
-/// buffer and flushes, which matters over TLS (tokio-rustls buffers writes until
-/// flushed, and split small writes otherwise stall on Nagle + delayed-ACK).
 async fn write_prefixed<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &[u8]) -> std::io::Result<()> {
     let mut framed = Vec::with_capacity(msg.len() + 2);
     framed.extend_from_slice(&(msg.len() as u16).to_be_bytes());
@@ -135,10 +92,6 @@ fn local() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-// ---------------------------------------------------------------------------
-// Certificate generation (private CA + leaf with IP SAN 127.0.0.1).
-// ---------------------------------------------------------------------------
-
 struct Certs {
     ca_der: CertificateDer<'static>,
     chain: Vec<CertificateDer<'static>>,
@@ -150,8 +103,6 @@ fn generate_certs() -> Certs {
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose,
     };
-
-    // CA.
     let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
@@ -160,8 +111,6 @@ fn generate_certs() -> Certs {
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_key = KeyPair::generate().unwrap();
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-    // Leaf: SANs auto-detected as IP addresses by rcgen's `new`.
     let mut leaf_params =
         CertificateParams::new(vec!["127.0.0.1".to_string(), "::1".to_string()]).unwrap();
     leaf_params
@@ -178,9 +127,6 @@ fn generate_certs() -> Certs {
         key: PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
     }
 }
-
-/// A rustls server config presenting our leaf cert, with the given ALPN tokens.
-/// `tls13_only` is required for the QUIC-based servers (DoQ, HTTP/3).
 fn server_tls(certs: &Certs, alpn: &[&[u8]], tls13_only: bool) -> rustls::ServerConfig {
     let builder = if tls13_only {
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -195,11 +141,6 @@ fn server_tls(certs: &Certs, alpn: &[&[u8]], tls13_only: bool) -> rustls::Server
     cfg
 }
 
-// ---------------------------------------------------------------------------
-// Mock upstream servers (one per transport). Each binds 127.0.0.1:0 and returns
-// the spec string bulwark should use to reach it.
-// ---------------------------------------------------------------------------
-
 async fn mock_udp(delay: Duration) -> String {
     let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let addr = sock.local_addr().unwrap();
@@ -209,8 +150,6 @@ async fn mock_udp(delay: Duration) -> String {
             let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
                 break;
             };
-            // Handle each datagram in its own task so an upstream-RTT delay does
-            // not serialize the recv loop (bulwark sends UDP queries concurrently).
             let data = buf[..n].to_vec();
             let sock = sock.clone();
             tokio::spawn(async move {
@@ -267,8 +206,6 @@ async fn mock_dot(delay: Duration, certs: &Certs) -> String {
     });
     format!("tls://127.0.0.1:{}", addr.port())
 }
-
-/// quinn server endpoint with the given ALPN (shared by DoQ and HTTP/3).
 fn quic_endpoint(certs: &Certs, alpn: &[&[u8]]) -> (quinn::Endpoint, u16) {
     let tls = server_tls(certs, alpn, true);
     let qsc = quinn::crypto::rustls::QuicServerConfig::try_from(tls).expect("quic server config");
@@ -285,7 +222,6 @@ async fn mock_doq(delay: Duration, certs: &Certs) -> String {
         while let Some(incoming) = endpoint.accept().await {
             tokio::spawn(async move {
                 let Ok(conn) = incoming.await else { return };
-                // Each DoQ query is its own bidi stream (RFC 9250).
                 while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                     tokio::spawn(async move {
                         let Ok(data) = recv.read_to_end(64 * 1024).await else {
@@ -298,7 +234,6 @@ async fn mock_doq(delay: Duration, certs: &Certs) -> String {
                             let _ = send.write_all(&(out.len() as u16).to_be_bytes()).await;
                             let _ = send.write_all(&out).await;
                             let _ = send.finish();
-                            // Keep the stream alive until the peer has read.
                             let _ = send.stopped().await;
                         }
                     });
@@ -393,10 +328,6 @@ async fn mock_doh_h3(delay: Duration, certs: &Certs) -> String {
     format!("h3://127.0.0.1:{port}/dns-query")
 }
 
-// ---------------------------------------------------------------------------
-// Filter list loading (download-once + cache; shares bench_request's directory).
-// ---------------------------------------------------------------------------
-
 const ADGUARD_URL: &str = "https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt";
 const OISD_URL: &str = "https://big.oisd.nl/";
 
@@ -460,10 +391,6 @@ async fn build_filter() -> FilterEngine {
     engine
 }
 
-// ---------------------------------------------------------------------------
-// Measurement helpers.
-// ---------------------------------------------------------------------------
-
 fn report(label: &str, mut ns: Vec<u64>) {
     if ns.is_empty() {
         println!("    {label:<26} (no samples)");
@@ -501,13 +428,9 @@ async fn build_pool(spec: &str) -> Arc<UpstreamPool> {
         .unwrap_or_else(|e| panic!("build pool for {spec}: {e}")),
     )
 }
-
-/// Pool-level (transport-only) measurement: handshake, warm latency, throughput.
 async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize) {
     println!("\n-- {name}  ({spec}) --");
     let pool = build_pool(spec).await;
-
-    // Cold: first query pays the TLS/QUIC handshake + connect.
     let t = Instant::now();
     match pool
         .resolve(&query("cold-start.bench.example", RecordType::A))
@@ -523,9 +446,6 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
             return;
         }
     }
-
-    // Warm: sequential unique names defeat single-flight + any caching, so every
-    // query is a real round-trip on the established connection.
     let mut ns = Vec::with_capacity(n);
     for i in 0..n {
         let q = query(
@@ -538,9 +458,6 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
         }
     }
     report("warm (sequential)", ns);
-
-    // Concurrent: fire unique queries from `concurrency` workers. DoT serializes
-    // over one connection; DoQ/h2/h3 multiplex, so this is where they diverge.
     let idx = Arc::new(AtomicUsize::new(0));
     let lat = Arc::new(parking_lot::Mutex::new(Vec::<u64>::with_capacity(n)));
     let t0 = Instant::now();
@@ -580,10 +497,6 @@ async fn measure_transport(name: &str, spec: &str, n: usize, concurrency: usize)
     );
     report("concurrent latency", lat);
 }
-
-/// Whole-chain measurement: full engine pipeline (filter + cache + upstream) with
-/// the real lists compiled. Forwarded-miss workload, so the transport is on the
-/// hot path for every query.
 async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize) {
     let pool = build_pool(spec).await;
     let state = EngineState {
@@ -602,11 +515,7 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
         Arc::new(QueryLog::new(true, false)),
         Arc::new(Stats::new(true, 24, false)),
     );
-
-    // Encode a query through the real listener ingress (minimal fast path).
     let ingress = |m: Message| Ingress::parse(&m.to_vec().unwrap()).expect("decodable query");
-
-    // Warmup.
     for _ in 0..(n / 10).max(1) {
         let q = query(
             &format!("warm-{}.chain.example", rand::random::<u32>()),
@@ -620,8 +529,6 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
             &format!("u{i}-{}.chain.example", rand::random::<u32>()),
             RecordType::A,
         );
-        // Convert outside the timed region — the server receives bytes; `handle`
-        // is what we measure here.
         let ing = ingress(q);
         let t = Instant::now();
         let _ = engine.handle(ing, local()).await;
@@ -629,8 +536,6 @@ async fn whole_chain(name: &str, spec: &str, filter: Arc<FilterEngine>, n: usize
     }
     report(&format!("whole-chain [{name}]"), ns);
 }
-
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
@@ -641,28 +546,20 @@ async fn main() {
         .ok()
         .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).collect());
     let want = |name: &str| only.as_ref().is_none_or(|v| v.iter().any(|t| t == name));
-
-    // Optional tracing (set RUST_LOG, e.g. RUST_LOG=quinn=debug,h3=debug).
     if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .init();
     }
-
-    // Install the ring crypto provider for the mock servers' rustls configs.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     println!("== Bulwark per-transport benchmark ==");
     println!("  queries/measurement={n}  concurrency={concurrency}  upstream_delay={delay:?}");
-
-    // Private CA -> trust it in bulwark's real client code -> leaf for the mocks.
     let certs = generate_certs();
     bulwark_upstream::add_trust_root(certs.ca_der.clone());
 
     println!("\n== Loading filter lists ==");
     let filter = Arc::new(build_filter().await);
-
-    // (display name, spec) for each transport, built from its mock's address.
     let mut transports: Vec<(&str, String)> = Vec::new();
     if want("udp") {
         transports.push(("udp ", mock_udp(delay).await));

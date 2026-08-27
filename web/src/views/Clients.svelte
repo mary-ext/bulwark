@@ -18,7 +18,6 @@
 
   let clients = $state<Client[]>([]);
 
-  // Edit dialog state.
   let dialogOpen = $state(false);
   let editId = $state<string | null>(null); // null = adding a new client
   let draftName = $state("");

@@ -6,10 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-# Allows registering additional TLS trust anchors at runtime via
-# `add_trust_root`. Used only by benchmarks/tests to point the real encrypted
-# transports at a local mock with a self-signed cert; never enabled for the
-# shipped binary (the server crate pulls it in as a dev-dependency only).
+# Allow local trust roots in benchmarks and tests.
 test-trust-roots = []
 
 [dependencies]

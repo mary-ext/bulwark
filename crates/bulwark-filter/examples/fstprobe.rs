@@ -1,13 +1,6 @@
-//! Experiment: is an FST domain index smaller *and* fast enough to replace the
-//! hashmap index + domain arena + span verification?
+//! FST domain-index size and throughput experiment.
 //!
-//! Builds, from a real list's subdomain-rule domains, two equivalent structures
-//! and compares size + subdomain-match throughput:
-//!   A. current style — `domain_arena` (text) + `HashMap<u64,(range)>` + verify
-//!   B. FST over **reversed** domain labels (so shared suffixes become shared
-//!      prefixes), where subdomain matching is a single prefix-walk.
-//!
-//! Usage: `LISTS=a.txt[,b.txt] cargo run --release --example fstprobe -p bulwark-filter [ITERS]`
+//! Run with `LISTS=a.txt[,b.txt] cargo run --release --example fstprobe -p bulwark-filter [ITERS]`.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -18,8 +11,6 @@ use fst::raw::{Fst, Output};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-/// Extract a plain subdomain/exact domain from a list line (best effort).
 fn extract(line: &str) -> Option<String> {
     let l = line.trim();
     if l.is_empty() || l.starts_with('!') || l.starts_with('#') || l.starts_with('[') {
@@ -48,23 +39,17 @@ fn clean(s: &str) -> Option<String> {
     }
     Some(s.to_ascii_lowercase())
 }
-
-/// Reverse a domain's labels: `ads.example.com` -> `com.example.ads`.
 fn rev_labels(d: &str) -> String {
     let mut parts: Vec<&str> = d.split('.').collect();
     parts.reverse();
     parts.join(".")
 }
-
-/// FST subdomain match: collect rule ids for every rule domain that is a
-/// label-suffix of `q` (i.e. a label-prefix of reversed `q`).
 fn fst_match(fst: &Fst<Vec<u8>>, q: &str, out: &mut Vec<u64>) {
     let rq = rev_labels(q);
     let bytes = rq.as_bytes();
     let mut node = fst.root();
     let mut acc = Output::zero();
     for &b in bytes {
-        // At a label boundary ('.'), a final node = a matching ancestor domain.
         if b == b'.' && node.is_final() {
             out.push(acc.cat(node.final_output()).value());
         }
@@ -88,8 +73,6 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(5_000_000);
     let paths = std::env::var("LISTS").expect("set LISTS=path[,path]");
-
-    // Collect + dedup subdomain domains.
     let mut set: Vec<String> = Vec::new();
     for p in paths.split(',') {
         let text = std::fs::read_to_string(p).expect("read list");
@@ -103,8 +86,6 @@ fn main() {
     set.dedup();
     let n = set.len();
     println!("domains              = {n}");
-
-    // ---- A. current style: domain_arena + HashMap<u64,(range)> + verify ----
     let hasher = ahash::RandomState::new();
     let mut dom_text = String::new();
     let mut spans: Vec<(u32, u8)> = Vec::with_capacity(n);
@@ -131,8 +112,6 @@ fn main() {
         + map.capacity() * std::mem::size_of::<(u64, (u32, u32))>()
         + hits.capacity() * 4
         + spans.capacity() * std::mem::size_of::<(u32, u8)>();
-
-    // ---- B. FST over reversed domains ----
     let mut keyed: Vec<(String, u64)> = set
         .iter()
         .enumerate()
@@ -158,8 +137,6 @@ fn main() {
         fst_bytes as f64 / n as f64,
         hashmap_bytes as f64 / fst_bytes as f64
     );
-
-    // ---- workload: half real hits (a subdomain of a real domain), half miss ----
     const POOL: usize = 4096;
     let queries: Vec<String> = (0..POOL)
         .map(|j| {
@@ -171,8 +148,6 @@ fn main() {
             }
         })
         .collect();
-
-    // hashmap suffix-walk lookup (with span verification)
     let hashmap_lookup = |q: &str, out: &mut Vec<u32>| {
         let mut hay = q;
         loop {

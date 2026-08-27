@@ -35,13 +35,9 @@ export type OkResponse = {
     ok: boolean;
 };
 export type AuthConfig = {
-    /** Argon2 password hash; `None` until the admin sets a password (setup flow).
-    Skipped when absent so the redacted (`None`) value the API returns never
-    rides the wire, and the YAML stays clean before setup. */
+    /** Argon2 password hash; absent until setup completes. */
     password_hash?: string | null;
-    /** HMAC secret (base64url) for signing session JWTs. Generated on first run
-    if absent. Redacted from the config API like `password_hash`; deleting it
-    from the YAML rotates the secret and invalidates all outstanding tokens. */
+    /** Base64url HMAC secret for session JWTs. */
     session_secret?: string | null;
     /** Admin username. */
     username?: string;
@@ -52,11 +48,7 @@ export type CacheConfig = {
     max_ttl_secs?: number;
     /** Clamp lower bound for TTLs (seconds). */
     min_ttl_secs?: number;
-    /** Optimistic caching (serve-stale): the maximum number of seconds **past
-    expiry** that a stale entry may be served immediately while a fresh
-    resolve runs in the background. `0` disables serve-stale entirely; any
-    value `> 0` enables it and bounds how stale an answer can be (entries are
-    never served unbounded). */
+    /** Maximum age past expiry for serve-stale; 0 disables it. */
     optimistic_max_age_secs?: number;
     /** Maximum number of cached entries. */
     size?: number;
@@ -84,11 +76,7 @@ export type FilteringConfig = {
     lists?: FilterListConfig[];
 };
 export type PrivacyConfig = {
-    /** When set, client IPs are dropped entirely from the query log (the stored
-    and API-returned `client_ip` is blank) **and** from statistics (the
-    dashboard's "top clients" panel is empty while on). The IP is still used
-    to identify the client for filtering before logging/recording — only the
-    retained/displayed copy is removed. */
+    /** Omits client IPs from query logs and statistics. */
     anonymize_client_ips?: boolean;
 };
 export type QueryLogConfig = {
@@ -118,24 +106,17 @@ export type StatsConfig = {
     retention_days?: number;
 };
 export type UpstreamLogConfig = {
-    /** Persist probe telemetry. Off by default; can be toggled at runtime. */
+    /** Enables probe telemetry at runtime. */
     enabled?: boolean;
-    /** Persist to disk so it survives restarts. When off, an in-memory database
-    is used for the lifetime of the process (and no file is created). Fixed at
-    startup — changing it takes effect on the next restart. */
+    /** Persists telemetry across restarts. Applied at startup. */
     persist?: boolean;
-    /** How many days of probe telemetry to retain. Probes are low-volume (one
-    per upstream per minute), so a generous default is cheap. 0 disables
-    time-based pruning. */
+    /** Retention in days; 0 disables time-based pruning. */
     retention_days?: number;
 };
 export type UpstreamsConfig = {
     /** Plain-DNS bootstrap servers for resolving DoT/DoH/DoQ hostnames. */
     bootstrap?: string[];
-    /** Freeform upstream list: one spec per line. Lines starting with `#` are
-    comments and blank lines are ignored — both are preserved verbatim so
-    you can annotate and toggle entries by commenting them out. e.g.
-    `https://cloudflare-dns.com/dns-query`, `tls://one.one.one.one`. */
+    /** Upstream specs, one per line. Blank and `#`-prefixed lines are ignored. */
     servers?: string;
     /** Per-attempt query timeout (seconds). */
     timeout_secs?: number;
@@ -232,8 +213,7 @@ export type LogEntryView = {
     id: number;
     /** Filter list id responsible (blocked/rewritten queries only). */
     list_id?: number | null;
-    /** Friendly name of the filter list responsible (absent unless the query was
-    blocked or rewritten by a known list; id 0 is the user's custom rules). */
+    /** Matching filter-list name. */
     list_name?: string | null;
     qtype: string;
     question: string;
@@ -268,22 +248,16 @@ export type LatencyPercentilesDto = {
 export type StatsResponse = {
     block_rate: number;
     blocked: number;
-    /** Total cache hits (fresh + stale) over the cache's lifetime (persisted in
-    `stats.json`, so it accumulates across restarts). */
+    /** Lifetime fresh and stale cache hits. */
     cache_hits: number;
     /** Cache lookups that found nothing servable and went upstream. */
     cache_misses: number;
     /** Background refreshes that failed to resolve upstream. */
     cache_refresh_failures: number;
-    /** Background refreshes dispatched upstream (intent; the pool may
-    single-flight concurrent identical ones). This is the upstream traffic the
-    client-facing hit rate hides. */
+    /** Background refreshes dispatched upstream. */
     cache_refreshes: number;
     cache_size: number;
-    /** Subset of `cache_hits` served stale under optimistic caching. Each one is
-    a client-facing hit that also kicked off a background refresh, so the
-    client hit rate (`cache_hits/total`) overstates how little we touch
-    upstream by exactly this much. */
+    /** Stale hits that triggered background refreshes. */
     cache_stale_hits: number;
     cached: number;
     errors: number;

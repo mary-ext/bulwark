@@ -1,7 +1,6 @@
-/* Small global utility layer — layout helpers, buttons, cards, text.
-   Intentionally tiny; most styling lives in components. */
+/* Global utilities. */
 
-/* ── Layout ─────────────────────────────────────────── */
+/* Layout */
 .row {
   display: flex;
   align-items: center;
@@ -45,7 +44,7 @@
   }
 }
 
-/* ── Text ───────────────────────────────────────────── */
+/* Text */
 .muted {
   color: var(--text-dim);
 }
@@ -75,7 +74,7 @@
   border: 0;
 }
 
-/* ── Card ───────────────────────────────────────────── */
+/* Card */
 .card {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -91,7 +90,7 @@
   gap: var(--sp-2);
 }
 
-/* ── Buttons ────────────────────────────────────────── */
+/* Buttons */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -107,8 +106,6 @@
   color: var(--text);
   cursor: pointer;
   white-space: nowrap;
-  /* Element-agnostic: when applied to an <a> (e.g. a download link), suppress
-     the global anchor underline, including on hover. */
   text-decoration: none;
   transition: background 0.12s, border-color 0.12s, color 0.12s, box-shadow 0.12s;
 }
@@ -163,14 +160,14 @@
   color: var(--bad);
 }
 
-/* Right-aligned cluster of row action buttons (table cells / cards). */
+/* Row actions */
 .row-actions {
   display: flex;
   gap: var(--sp-1);
   justify-content: flex-end;
 }
 
-/* ── Page header ────────────────────────────────────── */
+/* Page header */
 .page-head {
   display: flex;
   align-items: center;
@@ -196,7 +193,7 @@
   margin-bottom: var(--sp-4);
 }
 
-/* ── Forms ──────────────────────────────────────────── */
+/* Forms */
 .field {
   display: flex;
   flex-direction: column;
@@ -213,7 +210,7 @@
   color: var(--text-faint);
 }
 
-/* ── Tables (global so snippet-authored cells get styled) ── */
+/* Tables (global so snippet-authored cells get styled) */
 .table-wrap {
   width: 100%;
   overflow-x: auto;
@@ -256,7 +253,7 @@ table.bw-table {
   color: var(--text-dim);
 }
 
-/* ── Tag / pill ─────────────────────────────────────── */
+/* Tag / pill */
 .tag {
   display: inline-flex;
   align-items: center;

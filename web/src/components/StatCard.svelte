@@ -12,10 +12,10 @@
     label: string;
     value: string | number;
     sub?: string;
-    /** Optional second sub line rendered below {sub}. */
+    /** Optional secondary detail. */
     sub2?: string;
     tone?: "default" | "good" | "bad" | "accent";
-    /** Optional trend visual rendered flush to the bottom of the card. */
+    /** Optional bottom-aligned trend. */
     spark?: Snippet;
   } = $props();
 </script>
@@ -32,14 +32,13 @@
   .stat {
     padding: var(--sp-4) var(--sp-5);
   }
-  /* Reserve room so the bottom-bled sparkline never overlaps the text. */
+  /* Reserve space for the sparkline. */
   .stat.has-spark {
     display: flex;
     flex-direction: column;
     padding-bottom: 0;
   }
   .stat-spark {
-    /* Bleed to the card's left/right edges and sit flush on the bottom. */
     margin: var(--sp-3) calc(var(--sp-5) * -1) 0;
   }
   .stat-label {

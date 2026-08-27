@@ -1,10 +1,4 @@
-//! Bootstrap resolver.
-//!
-//! DoT/DoH/DoQ upstreams are often specified by hostname (e.g. `dns.google`).
-//! Resolving that hostname must not go through Bulwark itself (which could loop,
-//! since Bulwark may be the system resolver). The bootstrap resolver sends plain
-//! DNS queries directly to a small set of well-known plain-DNS servers and
-//! caches the answers.
+//! Plain-DNS bootstrap resolution for encrypted upstreams.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -28,8 +22,7 @@ struct Entry {
     at: Instant,
 }
 
-/// Resolves hostnames to IPs via plain-DNS bootstrap servers, with a short
-/// in-memory cache.
+/// Resolves hostnames through bootstrap servers with a short cache.
 pub struct Bootstrap {
     servers: Vec<SocketAddr>,
     cache: Mutex<HashMap<String, Entry>>,
@@ -60,7 +53,6 @@ impl Bootstrap {
         }
 
         let mut ips = Vec::new();
-        // Prefer A; also try AAAA so v6-only deployments work.
         for rtype in [RecordType::A, RecordType::AAAA] {
             if let Ok(found) = self.lookup(host, rtype).await {
                 ips.extend(found);
@@ -90,12 +82,7 @@ impl Bootstrap {
     }
 
     async fn lookup(&self, host: &str, rtype: RecordType) -> Result<Vec<IpAddr>> {
-        // Bootstrap hosts are absolute DNS names, so mark the name fully
-        // qualified. `Name::from_str` leaves a dotless host relative, and a
-        // relative name's `to_ascii()` has no trailing dot — it would never
-        // match the FQDN question echoed back in the response, so the reply
-        // would be rejected and the query would hang until timeout. The on-wire
-        // bytes are unchanged either way (names always emit a root terminator).
+        // Echoed response questions are fully qualified.
         let mut name = Name::from_str(host).map_err(|e| UpstreamError::Proto(e.to_string()))?;
         name.set_fqdn(true);
         let mut msg = Message::new(rand::rng().random(), MessageType::Query, OpCode::Query);

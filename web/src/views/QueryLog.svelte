@@ -27,8 +27,7 @@
   let detail = $state<LogEntryView | null>(null);
   let sheetOpen = $state(false);
 
-  // Monotonic request id: a slow response from an old filter/search must not
-  // overwrite results for the controls the user is now looking at.
+  // Ignore stale search responses.
   let loadSeq = 0;
 
   async function load() {
@@ -61,7 +60,7 @@
     client;
     blockedOnly;
     offset;
-    // Debounce so typing in the search/client fields doesn't fire a request per keystroke.
+    // Debounce text filters.
     const t = setTimeout(load, 250);
     return () => clearTimeout(t);
   });
@@ -100,7 +99,7 @@
     return e.allowlisted ? "allowed" : e.action;
   }
 
-  // Match AdGuard Home: allow => @@||host^$important, block => ||host^$important.
+  // Emit AdGuard-compatible rules.
   async function addRule(e: LogEntryView, allow: boolean) {
     const domain = bareDomain(e.question);
     const rule = `${allow ? "@@" : ""}||${domain}^$important`;
@@ -326,13 +325,11 @@
     white-space: nowrap;
   }
 
-  /* Desktop table cells (~5 columns — no horizontal scroll) */
+  /* Desktop table */
   .clickable {
     cursor: pointer;
   }
-  /* Let Domain absorb all leftover width; the other columns size to content.
-     width:100% + max-width:0 makes the cell take the slack while the inner
-     text truncates instead of stretching the row. */
+  /* Give Domain remaining width while preserving truncation. */
   .domain-col {
     width: 100%;
     max-width: 0;
@@ -354,8 +351,7 @@
     font-family: var(--font-mono);
     color: var(--text-faint);
   }
-  /* Size the Response column to its content (don't let the greedy Domain
-     column squeeze it narrower than its widest row, which clipped latency). */
+  /* Keep Response wide enough for its content. */
   .resp-col {
     width: 1%;
     white-space: nowrap;
@@ -365,7 +361,6 @@
     align-items: center;
     gap: var(--sp-2);
   }
-  /* Plain-text status (no badge pill); a subtle color keeps the verdict scannable. */
   .status {
     flex-shrink: 0;
     font-size: 0.82rem;
@@ -385,8 +380,7 @@
   .status-neutral {
     color: var(--text-dim);
   }
-  /* Response time, right-aligned within the cell so the values form a tidy
-     column; td padding keeps it clear of the actions column. */
+  /* Align response times. */
   .resp-latency {
     flex-shrink: 0;
     margin-left: auto;

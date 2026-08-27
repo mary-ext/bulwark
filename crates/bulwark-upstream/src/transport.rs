@@ -1,4 +1,4 @@
-//! The [`Transport`] trait and shared query-key / wire helpers.
+//! Transport interface and shared wire helpers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,27 +12,10 @@ use tokio::sync::oneshot;
 
 use crate::error::{Result, UpstreamError};
 
-/// How long a persistent upstream connection may sit idle before it's torn down,
-/// shared across every connection-oriented transport (connected UDP, DoT, DoQ,
-/// DoH) so they reclaim idle resources on the same schedule.
-///
-/// A home/SBC deployment runs ~1 query/s with long idle gaps, so holding a
-/// socket + reader task + buffers (or a TLS/QUIC session) resident around the
-/// clock is the wrong trade. This window is comfortably longer than any
-/// inter-query gap a browsing burst produces — so an active resolver keeps its
-/// warm connection and pays no per-query reconnect — but short enough that a
-/// quiet box stops holding the connection at rest. UDP and DoT enforce it via a
-/// reader read-timeout, DoQ via QUIC `max_idle_timeout`, DoH via reqwest's
-/// connection-pool idle timeout.
+/// Shared idle timeout for persistent upstream connections.
 pub(crate) const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Waiters for in-flight queries on a pipelined connection, keyed by
-/// connection-local id, plus a `dead` flag. The flag and the map are guarded
-/// together so registering a new waiter and tearing the connection down are
-/// mutually exclusive: a registration either wins (its sender ends up in the map
-/// and is dropped by teardown, waking the waiter) or loses (it sees `dead` and
-/// errors at once). Shared by the DoT and connected-UDP transports, which both
-/// multiplex many queries over one socket and demux replies by id.
+/// In-flight waiters and connection liveness under one lock.
 #[derive(Default)]
 pub(crate) struct PendingState {
     pub(crate) map: HashMap<u16, oneshot::Sender<Message>>,
@@ -41,9 +24,7 @@ pub(crate) struct PendingState {
 
 pub(crate) type Pending = Arc<SyncMutex<PendingState>>;
 
-/// Deregisters an in-flight query if its future is dropped (cancelled or errored)
-/// before the reader delivers a response — so a cancelled query can't leak a
-/// pending slot. A no-op once the reader has already removed the id.
+/// Removes a cancelled in-flight query.
 pub(crate) struct PendingGuard {
     pub(crate) pending: Pending,
     pub(crate) id: u16,
@@ -55,15 +36,9 @@ impl Drop for PendingGuard {
     }
 }
 
-/// A single upstream transport (UDP, TCP, DoT, DoH, or DoQ).
-///
-/// Implementations send exactly one query and return one response. They do
-/// **not** retry across servers — that is the pool's job — but a transport may
-/// internally fall back (e.g. UDP → TCP on truncation).
+/// A single upstream transport.
 pub trait Transport: Send + Sync {
-    /// Send `query` and await the response. The implementation must not mutate
-    /// the caller's message; if it needs a different id (e.g. DoQ requires id
-    /// 0) it clones internally.
+    /// Sends one query without mutating it.
     fn query<'a>(&'a self, query: &'a Message) -> BoxFuture<'a, Result<Message>>;
 
     /// Human-readable description for logs.
@@ -77,14 +52,9 @@ pub struct QueryKey {
     pub name: String,
     pub rtype: RecordType,
     pub class: DNSClass,
-    /// EDNS DNSSEC-OK (DO) bit. A DO query gets RRSIGs and can receive different
-    /// answers, so it must not share a cache / single-flight entry with a non-DO
-    /// query for the same name/type/class — otherwise a DNSSEC response could be
-    /// served to a client that didn't ask for one, or a stripped (non-DO)
-    /// response to a validating client, breaking validation.
+    /// EDNS DNSSEC-OK bit.
     pub dnssec_ok: bool,
-    /// Header CD (checking-disabled) bit. A CD=1 query may receive data a
-    /// validating (CD=0) query would not, so it is keyed separately too.
+    /// Header checking-disabled bit.
     pub checking_disabled: bool,
 }
 
@@ -107,30 +77,10 @@ pub fn dnssec_ok(msg: &Message) -> bool {
     msg.edns.as_ref().is_some_and(|e| e.flags().dnssec_ok)
 }
 
-/// Largest EDNS UDP payload size we advertise to upstreams. A connected-UDP
-/// upstream sizes its fixed receive buffer to this (see `plain::udp_reader_loop`),
-/// so we must never tell an upstream it may send us more than we can receive —
-/// otherwise the reply would be silently truncated at the socket (which is *not*
-/// the EDNS TC→TCP path). Clamping here also keeps large replies from arriving as
-/// fragmented UDP: anything bigger comes back with TC set and is refetched over
-/// TCP. 4096 is the classic safe EDNS buffer size and covers the overwhelming
-/// majority of answers in a single datagram.
+/// Maximum advertised EDNS UDP payload.
 pub(crate) const MAX_UDP_PAYLOAD: u16 = 4096;
 
-/// Strip EDNS options we neither honour nor key on before forwarding a query
-/// upstream, keeping only the DNSSEC-OK bit (which the cache / single-flight
-/// [`QueryKey`] *does* distinguish), and clamp the advertised UDP payload to
-/// [`MAX_UDP_PAYLOAD`].
-///
-/// The proxy forwards the client's message essentially verbatim, and two queries
-/// that differ only in an option like EDNS Client Subnet, COOKIE, or NSID share
-/// one cache / single-flight key. Without this, a client's subnet-tailored answer
-/// could be cross-served to another client, and client identifiers would leak to
-/// the upstream. Dropping those options makes the forwarded query — and thus the
-/// answer cached under that key — independent of them. The payload clamp keeps a
-/// client that advertises an oversized buffer from making an upstream send a
-/// datagram our fixed receive buffer couldn't hold. A query with no OPT record is
-/// left untouched; one with no options and an in-range payload needs no change.
+/// Drops unkeyed EDNS options and clamps the advertised payload.
 pub fn normalize_upstream_edns(msg: &mut Message) {
     let Some(edns) = msg.edns.as_ref() else {
         return;
@@ -158,8 +108,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message> {
     Message::from_vec(bytes).map_err(|e| UpstreamError::Proto(e.to_string()))
 }
 
-/// Validate that a response plausibly answers a query: matching id and first
-/// question. Guards against off-path spoofing on UDP and mismatched demuxing.
+/// Checks a response id and first question against its query.
 pub fn matches_query(query: &Message, response: &Message) -> bool {
     if query.metadata.id != response.metadata.id {
         return false;
@@ -168,16 +117,8 @@ pub fn matches_query(query: &Message, response: &Message) -> bool {
         (Some(q), Some(r)) => {
             q.query_type() == r.query_type()
                 && q.query_class() == r.query_class()
-                // Compare by DNS labels (case-insensitive), ignoring the
-                // FQDN/relative distinction. A response decoded off the wire is
-                // always FQDN; an internally built query (e.g. the bootstrap
-                // resolver) may be relative. `eq_ignore_ascii_case` on
-                // `to_ascii()` would treat "a.com" and "a.com." as different and
-                // wrongly reject the reply.
                 && q.name().eq_ignore_root(r.name())
         }
-        // A response with no question section (rare but legal for some errors)
-        // is accepted as long as the id matched.
         (Some(_), None) => true,
         _ => false,
     }
@@ -189,9 +130,6 @@ mod tests {
     use hickory_proto::op::{Message, MessageType, OpCode, Query};
     use hickory_proto::rr::{DNSClass, Name, RecordType};
     use std::str::FromStr;
-
-    /// Build a query the way the bootstrap resolver does: a dotless host parsed
-    /// with `Name::from_str`, then sent over the wire.
     fn query(id: u16, host: &str, fqdn: bool, rtype: RecordType) -> Message {
         let mut name = Name::from_str(host).unwrap();
         name.set_fqdn(fqdn);
@@ -201,17 +139,12 @@ mod tests {
         msg.queries.push(q);
         msg
     }
-
-    /// Round-trip a message through wire encode/decode. The decoded question is
-    /// always FQDN, mirroring a real upstream response.
     fn wire_roundtrip(msg: &Message) -> Message {
         decode(&encode(msg).unwrap()).unwrap()
     }
 
     #[test]
     fn bootstrap_relative_query_matches_fqdn_response() {
-        // Reproduces the bootstrap bug: a relative query name must still match
-        // the FQDN question echoed back in the decoded response.
         let q = query(0x1234, "cloudflare-dns.com", false, RecordType::A);
         assert!(!q.queries[0].name().is_fqdn(), "query should be relative");
         let resp = wire_roundtrip(&q);
@@ -258,12 +191,12 @@ mod tests {
         edns.set_version(0);
         edns.set_max_payload(1232);
         edns.set_dnssec_ok(true);
-        // A client-supplied ECS option and an opaque COOKIE-like option.
-        edns.options_mut().insert(EdnsOption::Subnet(ClientSubnet::new(
-            Ipv4Addr::new(192, 0, 2, 0).into(),
-            24,
-            0,
-        )));
+        edns.options_mut()
+            .insert(EdnsOption::Subnet(ClientSubnet::new(
+                Ipv4Addr::new(192, 0, 2, 0).into(),
+                24,
+                0,
+            )));
         edns.options_mut()
             .insert(EdnsOption::Unknown(10, vec![1, 2, 3, 4, 5, 6, 7, 8]));
         msg.set_edns(edns);
@@ -272,7 +205,10 @@ mod tests {
         normalize_upstream_edns(&mut msg);
 
         let e = msg.edns.as_ref().expect("EDNS envelope is kept");
-        assert!(e.options().options.is_empty(), "client options must be stripped");
+        assert!(
+            e.options().options.is_empty(),
+            "client options must be stripped"
+        );
         assert!(e.flags().dnssec_ok, "the DO bit must be preserved");
         assert_eq!(e.max_payload(), 1232, "payload size must be preserved");
     }
@@ -282,16 +218,15 @@ mod tests {
         let mut msg = query(1, "a.com", true, RecordType::A);
         assert!(msg.edns.is_none());
         normalize_upstream_edns(&mut msg);
-        assert!(msg.edns.is_none(), "a query with no OPT record is untouched");
+        assert!(
+            msg.edns.is_none(),
+            "a query with no OPT record is untouched"
+        );
     }
 
     #[test]
     fn normalize_clamps_oversized_payload_even_without_options() {
         use hickory_proto::op::Edns;
-
-        // A client advertising a 65535-byte buffer and *no* options must still get
-        // its payload clamped, so an upstream can't be told to send us more than
-        // our fixed UDP receive buffer (MAX_UDP_PAYLOAD) can hold.
         let mut msg = query(1, "a.com", true, RecordType::A);
         let mut edns = Edns::new();
         edns.set_version(0);
@@ -302,7 +237,11 @@ mod tests {
         normalize_upstream_edns(&mut msg);
 
         let e = msg.edns.as_ref().expect("EDNS envelope is kept");
-        assert_eq!(e.max_payload(), MAX_UDP_PAYLOAD, "oversized payload is clamped");
+        assert_eq!(
+            e.max_payload(),
+            MAX_UDP_PAYLOAD,
+            "oversized payload is clamped"
+        );
         assert!(e.flags().dnssec_ok, "the DO bit must be preserved");
     }
 

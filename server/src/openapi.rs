@@ -1,7 +1,4 @@
-//! The OpenAPI document describing the Bulwark REST API.
-//!
-//! Emitted to JSON by the `gen-openapi` binary; the front-end client is
-//! generated from that JSON (see the README / `justfile`).
+//! Bulwark REST API schema.
 
 use utoipa::OpenApi;
 
@@ -51,7 +48,6 @@ use crate::{api, dto};
         api::test_upstream,
     ),
     components(schemas(
-        // Server-owned request/response shapes.
         api::ErrorResponse,
         api::OkResponse,
         api::StatusResponse,
@@ -70,7 +66,6 @@ use crate::{api, dto};
         api::TestUpstream,
         api::TestResult,
         api::ClientInput,
-        // Engine/upstream read-model DTOs.
         dto::StatsResponse,
         dto::TopEntryDto,
         dto::SeriesPointDto,
@@ -79,7 +74,6 @@ use crate::{api, dto};
         dto::LogEntryView,
         dto::UpstreamStatDto,
         dto::TransportKindDto,
-        // The public configuration contract.
         bulwark_config::Config,
         bulwark_config::ServerConfig,
         bulwark_config::UpstreamsConfig,

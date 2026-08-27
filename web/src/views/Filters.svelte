@@ -72,7 +72,6 @@
     } catch (err) {
       toaster.show(errMsg(err, "Failed to update list"), true);
     }
-    // Reload either way so the UI reflects the server's actual state.
     await load();
   }
 

@@ -1,26 +1,9 @@
-//! Disk-backed store for upstream probe telemetry (embedded SQLite via Turso).
-//!
-//! A sibling of the query-log [`store`](crate::store), kept deliberately
-//! separate: it's an opt-in maintenance/diagnostics feature with its own DB
-//! file, retention, and enable toggle, so it never touches the query log's hot
-//! path or schema. The background probe loop sends [`ProbeEvent`]s to an
-//! `mpsc` channel, a background writer batches them into transactions here, and
-//! retention prunes the oldest. See [`crate::persist`] for the writer/pruner.
-//!
-//! Every Turso type stays confined to this module, mirroring [`store`].
-//!
-//! [`store`]: crate::store
+//! SQLite-backed upstream probe telemetry.
 
 use bulwark_upstream::{ProbeErrorKind, ProbeEvent, ProbeOutcome, TransportKind};
 use turso::{params::Params, Builder, Connection, Value};
 
-/// The schema. `rtt_ms`, `first_rtt_ms`, `ewma_ms`, `detail`, `error_kind`,
-/// `live_ewma_ms`, and `rank` are NULL when they don't apply (a failed probe has
-/// no RTT; a probe whose first shot failed has no first RTT either; an upstream
-/// with no successful probe yet has no EWMA; a clean answer has no detail/error
-/// kind; an upstream with no live traffic has no live EWMA; an unranked one has
-/// no rank). `up` and `lead_held` are precomputed boolean flags; `live_queries`/
-/// `live_failures` are cumulative real-traffic counters at probe time.
+/// Probe schema. Inapplicable metrics are nullable.
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS probes (
         id                   INTEGER PRIMARY KEY,
@@ -46,44 +29,30 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_probes_upstream ON probes(upstream);
 ";
 
-// `id` is omitted so SQLite assigns the rowid, which persists on disk: after a
-// restart the log keeps growing above existing rows. Plain `INSERT` so a
-// (never-expected) id collision surfaces as an error rather than an overwrite.
+// SQLite assigns the persistent row ID.
 const INSERT_SQL: &str = "INSERT INTO probes
     (time_ms, upstream, name, kind, outcome, rtt_ms, first_rtt_ms, ewma_ms, up, \
      consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, live_failures, rank, \
      lead_held)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
-/// The columns the reader/writer depend on, in row order. Shared by the export
-/// and `recent` reads and the schema-compatibility probe so they can't drift.
+/// Shared column order for reads and schema validation.
 const COLUMNS: &str = "time_ms, upstream, name, kind, outcome, rtt_ms, first_rtt_ms, ewma_ms, up, \
     consecutive_failures, detail, error_kind, live_ewma_ms, live_queries, live_failures, \
     rank, lead_held";
 
-/// Columns added after the table's first release, applied to a pre-existing DB
-/// before the compatibility probe runs. Each is `ALTER TABLE … ADD COLUMN`, whose
-/// error on an already-current table is expected and ignored — that is what makes
-/// this idempotent. Without it, an added column would fail [`SCHEMA_PROBE`] and
-/// route [`ProbeStore::open`] to wipe the file; the log's whole value is the
-/// months of history that would destroy.
-///
-/// Only additive, nullable columns belong here. A change the reader can't take
-/// (a dropped or retyped column) should still fall through to the recreate path.
+/// Additive nullable migrations. Already-applied statements may fail harmlessly.
 const MIGRATIONS: &[&str] = &["ALTER TABLE probes ADD COLUMN first_rtt_ms REAL"];
 
 pub struct ProbeStore {
-    /// All writes funnel through one connection so there is a single writer.
+    /// Serialized write connection.
     write: tokio::sync::Mutex<Connection>,
-    /// Reads use their own connection; WAL lets them run concurrently.
+    /// Concurrent read connection.
     read: Connection,
 }
 
 impl ProbeStore {
-    /// Open (creating if needed) the store at `path`. Pass `":memory:"` for a
-    /// non-persistent log. Like the query store, an unusable on-disk DB (corrupt
-    /// or schema-incompatible) is wiped and recreated rather than failing startup
-    /// — probe telemetry is pure diagnostics, never a reason to refuse to boot.
+    /// Opens a store, recreating an unusable on-disk database.
     pub async fn open(path: &str) -> turso::Result<Self> {
         match Self::try_open(path).await {
             Ok(store) => Ok(store),
@@ -100,13 +69,9 @@ impl ProbeStore {
         let db = Builder::new_local(path).build().await?;
         let write = db.connect()?;
         write.execute_batch(SCHEMA).await?;
-        // Bring an older table up to the current columns. Each statement errors
-        // if it has already been applied, which is the idempotency check.
         for sql in MIGRATIONS {
             let _ = write.execute(*sql, ()).await;
         }
-        // Probe that the table really resolves every column the reader needs,
-        // built from the same list the reads use so the two can't drift.
         let compat = format!("SELECT id, {COLUMNS} FROM probes LIMIT 0");
         write.query(&compat, ()).await?;
         let read = db.connect()?;
@@ -116,9 +81,7 @@ impl ProbeStore {
         })
     }
 
-    /// Insert a batch of events in one transaction, reusing one prepared
-    /// statement. On any failure the whole transaction rolls back, so a bad batch
-    /// never leaves the writer connection stuck in an open, failed transaction.
+    /// Inserts a batch atomically.
     pub async fn insert_batch(&self, events: &[ProbeEvent]) -> turso::Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -152,10 +115,7 @@ impl ProbeStore {
         Ok(())
     }
 
-    /// Every event as newline-delimited JSON, oldest first — the natural log-file
-    /// order for an export/download. Probe telemetry is low-volume (≈ one row per
-    /// upstream per minute), so materializing the whole table as one string is
-    /// fine for the deployments this runs on.
+    /// Exports all events as oldest-first JSONL.
     pub async fn export_jsonl(&self) -> turso::Result<String> {
         let sql = format!("SELECT {COLUMNS} FROM probes ORDER BY id ASC");
         let mut rows = self.read.query(&sql, ()).await?;
@@ -180,18 +140,18 @@ impl ProbeStore {
         .await
     }
 
-    /// The most recent `limit` events, newest first, optionally only those at or
-    /// after `since_ms`. The reading half of the export: a caller serializes the
-    /// returned events to JSONL (or charts them) however it likes.
-    pub async fn recent(&self, since_ms: Option<i64>, limit: usize) -> turso::Result<Vec<ProbeEvent>> {
+    /// Returns recent events newest-first, optionally bounded by time.
+    pub async fn recent(
+        &self,
+        since_ms: Option<i64>,
+        limit: usize,
+    ) -> turso::Result<Vec<ProbeEvent>> {
         let (where_sql, params): (&str, Vec<Value>) = match since_ms {
             Some(ms) => (" WHERE time_ms >= ?1", vec![Value::Integer(ms)]),
             None => ("", Vec::new()),
         };
         let n = params.len() + 1;
-        let sql = format!(
-            "SELECT {COLUMNS} FROM probes{where_sql} ORDER BY id DESC LIMIT ?{n}"
-        );
+        let sql = format!("SELECT {COLUMNS} FROM probes{where_sql} ORDER BY id DESC LIMIT ?{n}");
         let mut params = params;
         params.push(Value::Integer(limit as i64));
         let mut rows = self.read.query(&sql, Params::Positional(params)).await?;
@@ -223,7 +183,9 @@ fn insert_params(e: &ProbeEvent) -> Params {
         e.live_ewma_ms.map(Value::Real).unwrap_or(Value::Null),
         Value::Integer(e.live_queries as i64),
         Value::Integer(e.live_failures as i64),
-        e.rank.map(|r| Value::Integer(r as i64)).unwrap_or(Value::Null),
+        e.rank
+            .map(|r| Value::Integer(r as i64))
+            .unwrap_or(Value::Null),
         Value::Integer(e.lead_held as i64),
     ])
 }
@@ -255,8 +217,7 @@ fn row_to_event(row: &turso::Row) -> turso::Result<ProbeEvent> {
 fn opt_real(v: Value) -> Option<f64> {
     match v {
         Value::Real(r) => Some(r),
-        // We only ever write REAL/NULL, but tolerate an INTEGER (e.g. a
-        // hand-edited DB) rather than silently dropping it to None.
+        // Accept INTEGER values in externally modified databases.
         Value::Integer(i) => Some(i as f64),
         _ => None,
     }
@@ -276,8 +237,7 @@ fn opt_int(v: Value) -> Option<i64> {
     }
 }
 
-/// Remove a SQLite DB file and its WAL/journal sidecars so a corrupt or
-/// incompatible probe-log DB can be recreated clean. Best-effort.
+/// Removes a database and its sidecars, best effort.
 fn reset_db_files(path: &str) {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
@@ -297,7 +257,6 @@ mod tests {
             kind: TransportKind::Udp,
             outcome,
             rtt_ms: rtt,
-            // The first shot pays the handshake the second one skips.
             first_rtt_ms: rtt.map(|r| r + 30.0),
             ewma_ms: rtt,
             up: answered,
@@ -327,23 +286,21 @@ mod tests {
         let all = store.recent(None, 100).await.unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].time_ms, 3, "newest first");
-        // A failed probe round-trips with NULL rtt, a populated detail, and a
-        // structured error kind.
-        let timeout = all.iter().find(|e| e.outcome == ProbeOutcome::Timeout).unwrap();
+        let timeout = all
+            .iter()
+            .find(|e| e.outcome == ProbeOutcome::Timeout)
+            .unwrap();
         assert!(timeout.rtt_ms.is_none());
         assert!(timeout.first_rtt_ms.is_none());
         assert!(!timeout.up);
         assert_eq!(timeout.detail.as_deref(), Some("Timeout"));
         assert_eq!(timeout.error_kind, Some(ProbeErrorKind::Timeout));
-        // A clean answer keeps its RTT/EWMA and has no detail/error kind.
         let answer = &all[0];
         assert_eq!(answer.rtt_ms, Some(15.0));
-        // Both shots round-trip, so analysis can recover the setup cost.
         assert_eq!(answer.first_rtt_ms, Some(45.0));
         assert_eq!(answer.kind, TransportKind::Udp);
         assert!(answer.detail.is_none());
         assert!(answer.error_kind.is_none());
-        // The live-traffic snapshot and selection fields survive the round-trip.
         assert_eq!(answer.live_ewma_ms, Some(30.0));
         assert_eq!(answer.live_queries, 42);
         assert_eq!(answer.live_failures, 2);
@@ -353,19 +310,16 @@ mod tests {
 
     #[tokio::test]
     async fn added_column_migrates_without_discarding_history() {
-        // A probe DB written before `first_rtt_ms` existed must survive the
-        // upgrade. The log's whole value is its months of history, so an added
-        // column has to migrate in place rather than fall through to the
-        // wipe-and-recreate path that `open` keeps for genuinely unreadable DBs.
         let dir = std::env::temp_dir().join(format!("bulwark-probe-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("probes.db");
         let path_str = path.to_str().unwrap();
         reset_db_files(path_str);
-
-        // Build the pre-migration table by hand, minus the new column.
         let old_schema = SCHEMA.replace("first_rtt_ms         REAL,\n", "");
-        assert!(!old_schema.contains("first_rtt_ms"), "old schema lacks the column");
+        assert!(
+            !old_schema.contains("first_rtt_ms"),
+            "old schema lacks the column"
+        );
         let db = Builder::new_local(path_str).build().await.unwrap();
         let conn = db.connect().unwrap();
         conn.execute_batch(&old_schema).await.unwrap();
@@ -379,21 +333,27 @@ mod tests {
         .unwrap();
         drop(conn);
         drop(db);
-
-        // Reopening with the current code migrates rather than recreating.
         let store = ProbeStore::open(path_str).await.unwrap();
         let all = store.recent(None, 100).await.unwrap();
         assert_eq!(all.len(), 1, "the pre-migration row survived the upgrade");
         assert_eq!(all[0].time_ms, 7);
         assert_eq!(all[0].rtt_ms, Some(12.0));
-        assert!(all[0].first_rtt_ms.is_none(), "rows predating the column read as NULL");
-
-        // New rows carry the column, and a second open is a no-op.
-        store.insert_batch(&[event(8, ProbeOutcome::Answer, Some(20.0))]).await.unwrap();
+        assert!(
+            all[0].first_rtt_ms.is_none(),
+            "rows predating the column read as NULL"
+        );
+        store
+            .insert_batch(&[event(8, ProbeOutcome::Answer, Some(20.0))])
+            .await
+            .unwrap();
         drop(store);
         let store = ProbeStore::open(path_str).await.unwrap();
         let all = store.recent(None, 100).await.unwrap();
-        assert_eq!(all.len(), 2, "reopening an already-migrated DB keeps both rows");
+        assert_eq!(
+            all.len(),
+            2,
+            "reopening an already-migrated DB keeps both rows"
+        );
         assert_eq!(all[0].first_rtt_ms, Some(50.0));
         reset_db_files(path_str);
     }
@@ -409,12 +369,8 @@ mod tests {
             ])
             .await
             .unwrap();
-
-        // `since` keeps only events at or after the cutoff.
         let recent = store.recent(Some(20), 100).await.unwrap();
         assert_eq!(recent.len(), 2);
-
-        // Retention drops events strictly older than the cutoff.
         let removed = store.delete_older_than(20).await.unwrap();
         assert_eq!(removed, 1);
         assert_eq!(store.recent(None, 100).await.unwrap().len(), 2);

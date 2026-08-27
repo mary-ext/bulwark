@@ -1,9 +1,4 @@
 //! DNS-over-QUIC (RFC 9250).
-//!
-//! Each query is sent on its own bidirectional QUIC stream (streams are cheap),
-//! so queries are naturally concurrent over one connection. Per RFC 9250 the
-//! DNS message id MUST be 0 on the wire; we restore the caller's id on the
-//! response.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -51,13 +46,6 @@ impl DoqTransport {
                 let crypto = QuicClientConfig::try_from((*doq_config()).clone())
                     .map_err(|e| UpstreamError::Tls(e.to_string()))?;
                 let mut client_config = ClientConfig::new(Arc::new(crypto));
-                // Close the connection after the shared idle window so a quiet box
-                // doesn't keep the QUIC session resident. We leave keep_alive_interval
-                // at its default (None), so we never ping the connection alive — an
-                // idle connection genuinely idles out and closes, after which
-                // `connection()` re-dials on the next query. The handshake that costs
-                // is exactly what persistence is worth paying for on a burst after
-                // idle; holding it open around the clock is not.
                 let mut transport = TransportConfig::default();
                 transport.max_idle_timeout(Some(
                     IdleTimeout::try_from(UPSTREAM_IDLE_TIMEOUT)
@@ -74,7 +62,6 @@ impl DoqTransport {
     async fn connection(&self) -> Result<Connection> {
         let mut guard = self.conn.lock().await;
         if let Some(conn) = guard.as_ref() {
-            // close_reason is Some once the connection is gone.
             if conn.close_reason().is_none() {
                 return Ok(conn.clone());
             }
@@ -100,9 +87,6 @@ impl DoqTransport {
     }
 
     async fn query_inner(&self, query: &Message) -> Result<Message> {
-        // RFC 9250 carries id 0 on the wire; restore the caller's id on the
-        // response. Patch the id directly into the encoded header rather than
-        // cloning the whole `Message` to zero it.
         let original_id = query.metadata.id;
         let mut body = encode(query)?;
         if body.len() > u16::MAX as usize {
@@ -123,10 +107,6 @@ impl DoqTransport {
             return Err(UpstreamError::Proto("short DoQ response".into()));
         }
         let mut msg = decode(&data[2..])?;
-        // The response carries id 0 on the wire (RFC 9250); restore the caller's
-        // id, then verify the response actually answers our question
-        // (name/type/class) before trusting it — a hostile or buggy upstream must
-        // not get its answer cached under our key.
         msg.metadata.id = original_id;
         if !matches_query(query, &msg) {
             return Err(UpstreamError::Proto(
@@ -143,7 +123,6 @@ impl Transport for DoqTransport {
             match self.query_inner(query).await {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
-                    // Drop a dead connection so the next attempt redials.
                     *self.conn.lock().await = None;
                     tracing::debug!(upstream = %self.desc, error = %e, "DoQ query failed");
                     Err(e)

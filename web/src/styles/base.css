@@ -1,5 +1,4 @@
-/* Reset + element defaults. Component-specific styling lives in the Svelte
-   components (scoped) or, for bits-ui portalled parts, in components.css. */
+/* Reset and element defaults. */
 
 *,
 *::before,
@@ -63,7 +62,7 @@ button {
   border-radius: var(--radius-sm);
 }
 
-/* Inputs / selects / textareas — the baseline look, refined per-component. */
+/* Form controls */
 input,
 select,
 textarea {
@@ -104,7 +103,7 @@ textarea {
   color: var(--accent-active);
 }
 
-/* Scrollbars — subtle, themed. */
+/* Scrollbars */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;

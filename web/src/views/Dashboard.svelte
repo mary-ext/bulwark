@@ -25,29 +25,23 @@
     }
   }
 
-  // Load once on mount — no background polling.
   $effect(() => {
     load();
   });
 
-  // Cache view, derived from the cache's lifetime counters (seeded from
-  // stats.json on start, so they persist across restarts). The client-facing
-  // hit rate alone is misleading: a stale serve is a hit *and* a background
-  // upstream refresh, so the rate at which we actually skip upstream is lower.
-  // We surface both.
+  // Separate client hits from upstream avoidance.
   const cache = $derived.by(() => {
     if (!stats) return null;
     const hits = stats.cache_hits;
     const lookups = hits + stats.cache_misses;
     const fresh = Math.max(0, hits - stats.cache_stale_hits);
     return {
-      // What the client experiences vs. what actually avoided upstream.
       hitRate: lookups > 0 ? hits / lookups : 0,
       upstreamAvoided: lookups > 0 ? fresh / lookups : 0,
     };
   });
 
-  // Hourly trend, oldest → newest, for the stat-card sparklines.
+  // Oldest-first hourly trend.
   const series = $derived([...(stats?.series ?? [])].sort((a, b) => a.hour - b.hour));
   const fmtStamp = (hour: number) =>
     new Date(hour * 3_600_000).toLocaleString(undefined, {

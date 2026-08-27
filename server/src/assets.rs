@@ -1,4 +1,4 @@
-//! Embedded web UI assets with SPA fallback.
+//! Embedded web assets and SPA fallback.
 
 use axum::body::Body;
 use axum::extract::Path;
@@ -50,13 +50,10 @@ async fn index() -> Response {
 }
 
 async fn asset(Path(path): Path<String>) -> Response {
-    // The wildcard captures the part after `/assets/`; embedded keys are
-    // relative to the dist root, so restore the prefix.
     serve_path(&format!("assets/{path}"))
 }
 
 async fn fallback(uri: Uri) -> Response {
-    // Any unmatched non-API route falls back to the SPA.
     if uri.path().starts_with("/api") {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }

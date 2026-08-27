@@ -1,7 +1,4 @@
-//! Client identification & naming.
-//!
-//! Maps a source IP to a configured client (name + tags + per-client filtering
-//! toggle), matching by exact IP or CIDR range.
+//! Client identification by IP or CIDR.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -12,14 +9,12 @@ use ipnet::IpNet;
 
 struct ClientEntry {
     name: Arc<str>,
-    /// CIDR ranges only; exact-host ids live in [`ClientMatcher::hosts`].
     nets: Vec<IpNet>,
     tags: Arc<[String]>,
     filtering_enabled: bool,
 }
 
-/// A resolved client for a request. Name and tags are shared (`Arc`) with the
-/// matcher, so identifying a client is refcount bumps rather than allocations.
+/// Client settings resolved for a request.
 #[derive(Debug, Clone)]
 pub struct ResolvedClient {
     pub ip: IpAddr,
@@ -30,7 +25,7 @@ pub struct ResolvedClient {
 }
 
 impl ResolvedClient {
-    /// Display label: the configured name, else the IP string.
+    /// Returns the configured name or IP address.
     pub fn label(&self) -> String {
         match &self.name {
             Some(name) => name.to_string(),
@@ -39,16 +34,12 @@ impl ResolvedClient {
     }
 }
 
-/// Matches source IPs to configured clients.
+/// Matches source IPs to client configuration.
 #[derive(Default)]
 pub struct ClientMatcher {
-    /// Exact-host ids (`/32`, `/128`) indexed for O(1) lookup. A host match is
-    /// always the longest possible prefix, so it wins outright without scanning
-    /// the CIDR entries. Earliest-configured entry wins on duplicate hosts.
+    /// Exact `/32` and `/128` matches.
     hosts: HashMap<IpAddr, usize>,
     entries: Vec<ClientEntry>,
-    /// Shared empty tag list returned for unknown clients, so the per-query miss
-    /// path clones an `Arc` instead of allocating.
     empty_tags: Arc<[String]>,
 }
 
@@ -62,7 +53,6 @@ impl ClientMatcher {
             let mut nets = Vec::new();
             for id in &c.ids {
                 if let Ok(ip) = id.parse::<IpAddr>() {
-                    // Bare IP -> exact host. First entry to claim it keeps it.
                     hosts.entry(ip).or_insert(idx);
                 } else if let Ok(net) = id.parse::<IpNet>() {
                     nets.push(net);
@@ -82,13 +72,8 @@ impl ClientMatcher {
         }
     }
 
-    /// The entry whose most-specific (longest-prefix) net contains `ip`, if any.
-    /// Longest-prefix wins so a specific host/subnet overrides a broader CIDR
-    /// regardless of config order (e.g. a `/32` beats a `10.0.0.0/8` listed
-    /// first). Ties on prefix length go to the earlier-configured entry.
+    /// Finds the longest-prefix CIDR match; config order breaks ties.
     fn best_match(&self, ip: IpAddr) -> Option<&ClientEntry> {
-        // An exact-host id is a /32 (or /128): the longest prefix possible, so a
-        // hit short-circuits the CIDR scan entirely.
         if let Some(&idx) = self.hosts.get(&ip) {
             return Some(&self.entries[idx]);
         }
@@ -128,16 +113,12 @@ impl ClientMatcher {
         }
     }
 
-    /// The configured name for `ip`, if it matches a client. Borrows from the
-    /// matcher (no allocation). Used to resolve display names at read time so a
-    /// rename or removal in the client config applies retroactively.
+    /// Returns the configured name for an IP.
     pub fn name_for(&self, ip: IpAddr) -> Option<&str> {
         self.best_match(ip).map(|e| e.name.as_ref())
     }
 
-    /// Resolve a stored client-IP string to its current configured name, if any.
-    /// Convenience over [`name_for`](Self::name_for) for data (stats, query log)
-    /// that holds the client IP as a string.
+    /// Returns the configured name for a stored IP string.
     pub fn name_for_str(&self, ip: &str) -> Option<&str> {
         ip.parse::<IpAddr>().ok().and_then(|ip| self.name_for(ip))
     }
@@ -177,19 +158,15 @@ mod tests {
     #[test]
     fn longest_prefix_wins_over_config_order() {
         let m = ClientMatcher::build(&[
-            // Broad range listed first, with filtering off...
             ClientConfig {
                 filtering_enabled: false,
                 ..cfg("lan", &["10.0.0.0/8"], &["broad"])
             },
-            // ...and a specific host listed second, with filtering on.
             cfg("server", &["10.1.2.3"], &["specific"]),
         ]);
-        // 10.1.2.3 matches both; the /32 host must win despite being listed last.
         let c = m.identify("10.1.2.3".parse().unwrap());
         assert_eq!(c.name.as_deref(), Some("server"));
         assert!(c.filtering_enabled, "specific entry's policy applies");
-        // A different 10.x address still falls to the broad client.
         assert_eq!(
             m.identify("10.9.9.9".parse().unwrap()).name.as_deref(),
             Some("lan")

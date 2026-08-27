@@ -1,6 +1,4 @@
-/* Design tokens. Light is the default; dark overrides under [data-theme="dark"].
-   Every color in the app should resolve to one of these vars — no hardcoded
-   hex outside this file (charts read the --chart-* vars at runtime). */
+/* Theme and layout tokens. */
 
 :root {
   color-scheme: light;
@@ -30,7 +28,7 @@
   --accent-border: #ddd6fe;
   --accent-ring: rgba(124, 58, 237, 0.35);
 
-  /* Status — semantic triplets (fg on bg within border) */
+  /* Status */
   --good: #16a34a;
   --good-fg: #15803d;
   --good-bg: #f0fdf4;
@@ -51,7 +49,7 @@
   --info-bg: #eff6ff;
   --info-border: #bfdbfe;
 
-  /* Chart palette (themed) */
+  /* Charts */
   --chart-1: #7c3aed;
   --chart-2: #2563eb;
   --chart-3: #16a34a;
@@ -75,7 +73,7 @@
   --shadow: 0 4px 14px rgba(20, 20, 45, 0.08), 0 1px 3px rgba(20, 20, 45, 0.06);
   --shadow-lg: 0 14px 40px rgba(20, 20, 45, 0.16);
 
-  /* Spacing scale */
+  /* Spacing */
   --sp-1: 4px;
   --sp-2: 8px;
   --sp-3: 12px;

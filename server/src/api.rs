@@ -1,8 +1,4 @@
-//! The HTTP REST API (Axum), annotated for OpenAPI via `utoipa`.
-//!
-//! Handlers use concrete request/response types (rather than ad-hoc
-//! `serde_json::Value`) so the generated OpenAPI spec — and the front-end client
-//! generated from it — stay in lockstep with the server.
+//! Axum HTTP API and OpenAPI schema.
 
 use std::time::Duration;
 
@@ -55,10 +51,6 @@ type ApiResult<T> = Result<T, ApiError>;
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::Internal(e.to_string())
 }
-
-// ---------------------------------------------------------------------------
-// Shared response shapes
-// ---------------------------------------------------------------------------
 
 /// Generic success acknowledgement: `{ "ok": true }`.
 #[derive(Serialize, ToSchema)]
@@ -113,29 +105,25 @@ pub fn router(state: AppState) -> Router {
 
     public
         .merge(protected)
-        // Cross-origin protection on every /api route. Safe methods pass through;
-        // unsafe ones must look same-origin (or be a non-browser client).
         .layer(middleware::from_fn(cross_origin_protection))
         .with_state(state)
 }
 
-/// Reject state-changing cross-origin browser requests, mirroring Go's
-/// `http.CrossOriginProtection`. Safe methods (GET/HEAD/OPTIONS) are exempt. For
-/// the rest we trust `Sec-Fetch-Site: same-origin` (and `none`, a direct
-/// navigation); `same-site`/`cross-site` are rejected. Older browsers and
-/// non-browser clients omit `Sec-Fetch-Site`, so we fall back to requiring any
-/// `Origin` header to match `Host` (a missing `Origin` — e.g. curl — is allowed,
-/// since it isn't a browser cross-site request). This is the CSRF defense:
-/// `SameSite=Lax` alone doesn't cover same-site-but-cross-origin.
-async fn cross_origin_protection(request: axum::extract::Request, next: middleware::Next) -> Response {
-    if matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+/// Rejects unsafe cross-origin browser requests.
+///
+/// `Sec-Fetch-Site` takes precedence; otherwise `Origin` must match `Host`.
+async fn cross_origin_protection(
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) {
         return next.run(request).await;
     }
     let headers = request.headers();
-    let allowed = match headers
-        .get("sec-fetch-site")
-        .and_then(|v| v.to_str().ok())
-    {
+    let allowed = match headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         Some("same-origin") | Some("none") => true,
         Some(_) => false,
         None => origin_matches_host(headers),
@@ -147,8 +135,7 @@ async fn cross_origin_protection(request: axum::extract::Request, next: middlewa
     }
 }
 
-/// Whether any `Origin` header matches the `Host` header (host[:port]). A missing
-/// `Origin` returns true — it's a non-browser request, not a cross-site one.
+/// Accepts missing origins and origins matching `Host`.
 fn origin_matches_host(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
         return true;
@@ -157,10 +144,6 @@ fn origin_matches_host(headers: &HeaderMap) -> bool {
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
     matches!((origin_host, host), (Some(o), Some(h)) if o.eq_ignore_ascii_case(h))
 }
-
-// ---------------------------------------------------------------------------
-// Auth
-// ---------------------------------------------------------------------------
 
 fn cookie_token(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get(header::COOKIE)?.to_str().ok()?;
@@ -183,8 +166,6 @@ async fn require_auth(
     match verdict {
         SessionVerdict::Invalid => ApiError::Unauthorized.into_response(),
         SessionVerdict::Valid => next.run(request).await,
-        // Slide the session: run the request, then attach a freshly issued
-        // cookie so an active user's token never lapses.
         SessionVerdict::Refresh => {
             let mut resp = next.run(request).await;
             let cookie = session_cookie(&state.sessions.issue(), is_https(&headers));
@@ -244,10 +225,7 @@ fn session_cookie(token: &str, secure: bool) -> String {
     c
 }
 
-/// Whether the request reached us over HTTPS, per a reverse proxy's
-/// `X-Forwarded-Proto`. The `Secure` cookie flag is added only then: Bulwark
-/// also serves plain HTTP (e.g. inside a tailnet), where `Secure` would stop the
-/// browser from ever sending the session cookie back.
+/// Detects HTTPS from `X-Forwarded-Proto` for cookie security flags.
 fn is_https(headers: &HeaderMap) -> bool {
     headers
         .get("x-forwarded-proto")
@@ -340,9 +318,6 @@ pub async fn login(
     responses((status = 200, body = OkResponse, description = "Session cleared"))
 )]
 pub async fn logout() -> Response {
-    // Tokens are stateless signed JWTs, so there's nothing server-side to drop:
-    // clearing the cookie ends the session for this client. An already-issued
-    // token stays valid until its `exp`; rotate the config secret to revoke all.
     let mut out = HeaderMap::new();
     out.insert(
         header::SET_COOKIE,
@@ -352,10 +327,6 @@ pub async fn logout() -> Response {
     );
     (out, OkResponse::ok()).into_response()
 }
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     get,
@@ -466,8 +437,6 @@ pub async fn put_server(
     Json(body): Json<ServerConfig>,
 ) -> ApiResult<Json<ServerUpdateResponse>> {
     let (mut cfg, _update) = state.begin_update().await;
-    // Only the listen binds need a restart to take effect; everything else
-    // (e.g. rate limit) applies live, so only flag a restart when a bind moved.
     let restart_required =
         cfg.server.dns_bind != body.dns_bind || cfg.server.http_bind != body.http_bind;
     cfg.server = body;
@@ -556,10 +525,6 @@ pub async fn put_privacy(
     Ok(OkResponse::ok())
 }
 
-// ---------------------------------------------------------------------------
-// Filters
-// ---------------------------------------------------------------------------
-
 /// The filtering overview: lists, custom rules, and current mode.
 #[derive(Serialize, ToSchema)]
 pub struct FiltersResponse {
@@ -642,7 +607,6 @@ pub async fn add_custom_rule(
         return Err(ApiError::BadRequest("empty rule".into()));
     }
     let (mut cfg, _update) = state.begin_update().await;
-    // Idempotent: don't append a rule that's already present as a line.
     let already = cfg.filtering.custom_rules.lines().any(|l| l.trim() == rule);
     if !already {
         if !cfg.filtering.custom_rules.is_empty() && !cfg.filtering.custom_rules.ends_with('\n') {
@@ -719,8 +683,7 @@ pub async fn add_list(
     State(state): State<AppState>,
     Json(body): Json<NewList>,
 ) -> ApiResult<Json<AddListResponse>> {
-    // Obtain the list content (remote or inline) before taking the update lock —
-    // a remote fetch can be slow and must not serialize other config updates.
+    // Do not hold the update lock during network I/O.
     let text = if let Some(url) = &body.url {
         fetch_list(url).await?
     } else {
@@ -728,8 +691,7 @@ pub async fn add_list(
     };
 
     let (mut cfg, _update) = state.begin_update().await;
-    // Allocate the id under the update lock so two concurrent adds can't collide
-    // on the same id (and clobber each other's list file).
+    // Allocate IDs under the update lock.
     let id = cfg.next_list_id();
     write_list_text(&state.paths, id, &text).map_err(internal)?;
     cfg.filtering.lists.push(FilterListConfig {
@@ -870,9 +832,7 @@ pub struct CheckResponse {
     pub list_name: Option<String>,
 }
 
-/// Build the `list_id -> friendly name` map used to attribute a match to its
-/// source list. A block (or rewrite) is one winning rule from one list; id 0 is
-/// the user's own custom rules.
+/// Maps list IDs to display names; ID 0 is custom rules.
 fn list_names(cfg: &Config) -> std::collections::HashMap<u32, String> {
     let mut m: std::collections::HashMap<u32, String> = cfg
         .filtering
@@ -910,7 +870,6 @@ pub async fn check_domain(
         list_name: names.get(&info.list_id).cloned(),
     };
     let resp = match verdict {
-        // Attribute whatever rule matched; only a bare allow has no list.
         Verdict::Allow { rule: Some(info) } => attribute(info, "allow"),
         Verdict::Allow { rule: None } => CheckResponse {
             action: "allow".into(),
@@ -922,10 +881,6 @@ pub async fn check_domain(
     };
     Json(resp)
 }
-
-// ---------------------------------------------------------------------------
-// Clients
-// ---------------------------------------------------------------------------
 
 #[utoipa::path(
     get,
@@ -1052,10 +1007,6 @@ pub async fn delete_client(
     Ok(OkResponse::ok())
 }
 
-// ---------------------------------------------------------------------------
-// Stats, query log, upstreams
-// ---------------------------------------------------------------------------
-
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct TopQuery {
@@ -1093,9 +1044,6 @@ pub async fn get_stats(
 )]
 pub async fn reset_stats(State(state): State<AppState>) -> Json<OkResponse> {
     state.engine.stats().reset();
-    // The cache's lifetime counters are part of the same analytics surface, so
-    // clear them too — otherwise the optimistic-caching tile would survive a
-    // "reset statistics" with stale numbers.
     state.engine.cache().reset_counters();
     OkResponse::ok()
 }
@@ -1145,16 +1093,12 @@ pub async fn get_querylog(
         .await
         .map_err(internal)?;
 
-    // Resolve list ids to friendly names so the UI can show which list (and
-    // which rule) was responsible.
     let names = list_names(&*state.config.read().await);
     let entries: Vec<LogEntryView> = page
         .entries
         .into_iter()
         .map(|entry| {
             let list_name = entry.list_id().and_then(|id| names.get(&id).cloned());
-            // Resolve the client's friendly name from its IP against the current
-            // config, so renames/removals show retroactively.
             let client_name = clients.name_for_str(&entry.client_ip).map(str::to_string);
             LogEntryView::new(entry, list_name, client_name)
         })
@@ -1253,7 +1197,6 @@ pub async fn test_upstream(
     State(state): State<AppState>,
     Json(body): Json<TestUpstream>,
 ) -> ApiResult<Json<TestResult>> {
-    // Validate spec first for a clear error.
     UpstreamSpec::parse(&body.spec).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let bootstrap = state.engine.pool().bootstrap().clone();
     match test_spec(&body.spec, bootstrap, Duration::from_secs(8)).await {
@@ -1294,14 +1237,11 @@ mod tests {
 
     #[test]
     fn origin_host_fallback() {
-        // No Origin -> a non-browser client (e.g. curl), allowed.
         assert!(origin_matches_host(&hm(&[("host", "bulwark.local")])));
-        // Origin matching Host -> same-origin, allowed.
         assert!(origin_matches_host(&hm(&[
             ("host", "bulwark.local"),
             ("origin", "http://bulwark.local"),
         ])));
-        // Origin from a different site -> blocked.
         assert!(!origin_matches_host(&hm(&[
             ("host", "bulwark.local"),
             ("origin", "http://evil.example"),

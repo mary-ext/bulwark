@@ -1,4 +1,4 @@
-//! Default-value helper functions for serde `#[serde(default = "...")]`.
+//! Serde default helpers.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -61,7 +61,6 @@ pub(crate) fn default_block_ipv6() -> Ipv6Addr {
     Ipv6Addr::UNSPECIFIED
 }
 
-// Used by UpstreamsConfig::default via struct construction; kept for symmetry.
 #[allow(dead_code)]
 pub(crate) fn default_upstreams_config() -> UpstreamsConfig {
     UpstreamsConfig::default()

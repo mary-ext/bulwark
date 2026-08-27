@@ -1,9 +1,4 @@
-//! Bulwark server library: the REST API, app wiring, embedded UI assets, auth,
-//! persistence, the API DTOs, and the generated OpenAPI document.
-//!
-//! Exposed as a library (alongside the `bulwark` binary) so the `gen-openapi`
-//! binary can emit the OpenAPI spec without running the server — keeping the
-//! Rust build independent of the front-end build.
+//! REST API, server wiring, persistence, and embedded assets.
 
 pub mod api;
 pub mod app;

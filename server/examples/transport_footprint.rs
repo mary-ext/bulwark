@@ -1,33 +1,6 @@
-//! Transport idle-footprint + burst-latency probe.
+//! Transport idle-footprint and burst-latency probe.
 //!
-//! The per-transport persistent-connection work (a connected UDP socket per
-//! upstream behind a reader task with a 64 KiB buffer; a held-open TLS/QUIC
-//! connection for DoT/DoQ/DoH) optimises for sustained concurrent traffic. A
-//! home/SBC deployment runs ~1 query/s with long idle gaps, so the figures of
-//! merit are different:
-//!
-//!   1. How much resident memory does a transport *retain while idle* after it
-//!      has served at least one miss? (That's what an idle-close timer would
-//!      reclaim — or what reverting to per-query connections would never hold.)
-//!   2. When a fresh site fans out to many uncached domains at once (a burst of
-//!      cache misses), how fast is that burst? This is where a persistent,
-//!      already-handshaked connection earns its keep — but only for transports
-//!      that *have* a handshake. Plain UDP has none, so persistence saves it
-//!      essentially nothing (a local bind+connect, no round-trip).
-//!
-//! This probe isolates one transport (no filter lists loaded, so RSS deltas are
-//! attributable to the transport layer, not 100+ MB of compiled rules) and walks
-//! it through: baseline -> pool built -> first miss (dials the connection) ->
-//! a burst of unique misses -> idle. It samples RSS at each step.
-//!
-//! Run (outside the sandbox — it binds loopback UDP/TCP):
-//!   cargo run --release --example transport_footprint -p bulwark
-//!
-//! Knobs (env):
-//!   FOOT_TRANSPORT   udp | tcp                         (default udp)
-//!   FOOT_BURST       misses fired back-to-back in the burst (default 50)
-//!   FOOT_IDLE_SECS   seconds to idle before the final RSS sample (default 5)
-//!   FOOT_DELAY_US    simulated upstream RTT, microseconds (default 0)
+//! Run with `cargo run --release --example transport_footprint -p bulwark`.
 
 use std::net::Ipv4Addr;
 use std::str::FromStr;
@@ -37,10 +10,6 @@ use std::time::{Duration, Instant};
 
 use bulwark_upstream::{PoolEntry, PoolSettings, UpstreamPool};
 
-// Match production's allocator (server/src/main.rs) so RSS reclaim is
-// representative: glibc keeps a freed 64 KiB buffer on its arena free-list, but
-// jemalloc with the background purge thread returns it to the OS on decay — which
-// is what an idle-close actually buys an SBC.
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
@@ -55,10 +24,6 @@ fn env_usize(key: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
-
-/// Resident set size, in bytes, from `/proc/self/statm` (field 2 = resident
-/// pages). Linux-only; returns 0 elsewhere so the probe still runs (latency
-/// numbers stay valid, RSS deltas just read as 0).
 fn rss_bytes() -> u64 {
     let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
         return 0;
@@ -74,16 +39,6 @@ fn rss_bytes() -> u64 {
 fn kib(bytes: u64) -> String {
     format!("{:.0} KiB", bytes as f64 / 1024.0)
 }
-
-/// Print an RSS checkpoint with the delta from the previous sample.
-///
-/// RSS is allocator-gated: a freed 64 KiB buffer is below jemalloc's purge
-/// granularity and gets reused/retained, so an idle-close won't always show as
-/// an immediate RSS drop here — what RSS *does* show cleanly is that, before
-/// idle-close, a persistent transport's footprint stays resident across idle
-/// forever. That the reader actually closes the socket on idle (freeing the
-/// buffer + task) is asserted deterministically by the unit test
-/// `udp_socket_idle_closes_then_redials` in the upstream crate.
 fn mark(label: &str, prev: &mut u64) {
     let now = rss_bytes();
     let delta = now as i64 - *prev as i64;
@@ -233,15 +188,14 @@ async fn main() {
     let burst = env_usize("FOOT_BURST", 50);
     let idle_secs = env_usize("FOOT_IDLE_SECS", 5) as u64;
     let delay = Duration::from_micros(env_usize("FOOT_DELAY_US", 0) as u64);
-
-    // Turn on jemalloc's background purge thread (off by default) so freed pages
-    // are returned to the OS on decay, the same as the real server does.
     if let Err(e) = tikv_jemalloc_ctl::background_thread::write(true) {
         eprintln!("  (could not enable jemalloc background_thread: {e})");
     }
 
     println!("== transport footprint probe ==");
-    println!("  transport={transport}  burst={burst}  idle={idle_secs}s  upstream_delay={delay:?}\n");
+    println!(
+        "  transport={transport}  burst={burst}  idle={idle_secs}s  upstream_delay={delay:?}\n"
+    );
 
     let mut rss = rss_bytes();
     mark("baseline", &mut rss);
@@ -258,13 +212,15 @@ async fn main() {
 
     let pool = build_pool(&spec).await;
     mark("pool built (not yet dialed)", &mut rss);
-
-    // First miss: this is what lazily dials the persistent connection + spawns
-    // its reader task + allocates its receive buffer.
     let t = Instant::now();
-    let cold = pool.resolve(&query("cold-start.probe.example", RecordType::A)).await;
+    let cold = pool
+        .resolve(&query("cold-start.probe.example", RecordType::A))
+        .await;
     if cold.is_err() {
-        eprintln!("  cold resolve FAILED ({:?}) — are loopback sockets allowed here?", cold.err());
+        eprintln!(
+            "  cold resolve FAILED ({:?}) — are loopback sockets allowed here?",
+            cold.err()
+        );
         return;
     }
     println!(
@@ -272,10 +228,6 @@ async fn main() {
         t.elapsed().as_nanos() as f64 / 1000.0
     );
     mark("after first miss (dialed)", &mut rss);
-
-    // Burst: a fresh site fanning out to `burst` uncached domains at once. Unique
-    // names defeat single-flight, so each is a real upstream round-trip — fired
-    // concurrently, the way a browser opens them.
     let idx = Arc::new(AtomicUsize::new(0));
     let lat = Arc::new(parking_lot::Mutex::new(Vec::<u64>::with_capacity(burst)));
     let t0 = Instant::now();
@@ -306,16 +258,9 @@ async fn main() {
     }
     let burst_elapsed = t0.elapsed();
     let lat = Arc::try_unwrap(lat).unwrap().into_inner();
-    println!(
-        "  burst of {burst} misses in {:?}",
-        burst_elapsed
-    );
+    println!("  burst of {burst} misses in {:?}", burst_elapsed);
     report("burst per-miss latency", lat);
     mark("after burst", &mut rss);
-
-    // Idle: the deployment's normal state. Whatever RSS is still held here, with
-    // zero traffic, is what a persistent transport retains — the memory an
-    // idle-close timer (or per-query connections) would give back to an SBC.
     println!("\n  idling {idle_secs}s with zero traffic ...");
     tokio::time::sleep(Duration::from_secs(idle_secs)).await;
     mark("after idle (retained)", &mut rss);

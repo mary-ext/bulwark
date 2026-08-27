@@ -1,10 +1,6 @@
-/* Global styling for bits-ui parts. bits-ui is headless and portals overlay
-   content (Dialog/Select/DropdownMenu/Tooltip) to <body>, so these must be
-   global (scoped component styles wouldn't reach the portal). We attach
-   explicit `bw-*` classes to each bits-ui part in the wrapper components and
-   style them here; animation keys off bits-ui's data-state attribute. */
+/* Global styles for portalled bits-ui elements. */
 
-/* ── Overlay (Dialog / Sheet backdrop) ──────────────── */
+/* Overlay (Dialog / Sheet backdrop) */
 .bw-overlay {
   position: fixed;
   inset: 0;
@@ -19,7 +15,7 @@
   animation: bw-fade-out 0.15s ease;
 }
 
-/* ── Centered dialog/modal ──────────────────────────── */
+/* Centered dialog/modal */
 .bw-dialog {
   position: fixed;
   z-index: var(--z-dialog);
@@ -43,7 +39,7 @@
   animation: bw-zoom-out 0.15s ease;
 }
 
-/* ── Bottom sheet (mobile detail) ───────────────────── */
+/* Bottom sheet (mobile detail) */
 .bw-sheet {
   position: fixed;
   z-index: var(--z-dialog);
@@ -75,7 +71,7 @@
   animation: bw-slide-down 0.18s ease;
 }
 
-/* ── Left nav drawer (mobile) ───────────────────────── */
+/* Left nav drawer (mobile) */
 .bw-drawer {
   position: fixed;
   z-index: var(--z-drawer);
@@ -106,7 +102,7 @@
   margin-top: var(--sp-1);
 }
 
-/* ── Dropdown menu (desktop row actions) ────────────── */
+/* Dropdown menu (desktop row actions) */
 .bw-menu {
   z-index: var(--z-menu);
   min-width: 200px;
@@ -159,7 +155,7 @@
   margin: var(--sp-1) 0;
 }
 
-/* ── Select ─────────────────────────────────────────── */
+/* Select */
 .bw-select-trigger {
   display: inline-flex;
   align-items: center;
@@ -214,7 +210,7 @@
   color: var(--accent);
 }
 
-/* ── Switch ─────────────────────────────────────────── */
+/* Switch */
 .bw-switch {
   display: inline-flex;
   flex-shrink: 0;
@@ -252,7 +248,7 @@
   transform: translateX(18px);
 }
 
-/* ── Tooltip ────────────────────────────────────────── */
+/* Tooltip */
 .bw-tooltip {
   z-index: var(--z-menu);
   background: var(--text);
@@ -265,7 +261,7 @@
 }
 
 
-/* ── Animations ─────────────────────────────────────── */
+/* Animations */
 @keyframes bw-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }

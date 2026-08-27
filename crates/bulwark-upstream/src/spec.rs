@@ -1,17 +1,4 @@
-//! Parsing of upstream server specifications.
-//!
-//! Accepted forms (AdGuard-compatible):
-//! * `8.8.8.8`, `8.8.8.8:53`            — plain DNS over UDP (TCP fallback)
-//! * `udp://1.1.1.1`                     — plain DNS over UDP
-//! * `tcp://1.1.1.1`                     — plain DNS over TCP
-//! * `tls://dns.google`                  — DNS-over-TLS (default port 853)
-//! * `https://dns.google/dns-query`      — DNS-over-HTTPS; HTTP/1.1 + HTTP/2,
-//!   auto-upgrading to HTTP/3 via Alt-Svc
-//! * `h3://dns.google/dns-query`         — DNS-over-HTTPS forced over HTTP/3
-//! * `quic://dns.adguard.com`            — DNS-over-QUIC (default port 853)
-//!
-//! The host may be an IP literal or a hostname; hostnames are resolved via the
-//! bootstrap resolver at connection time.
+//! Upstream specification parsing.
 
 use std::fmt;
 use std::net::IpAddr;
@@ -95,9 +82,7 @@ pub struct UpstreamSpec {
     pub port: u16,
     /// HTTP path for DoH (e.g. `/dns-query`).
     pub path: String,
-    /// Force DoH over HTTP/3 (the `h3://` scheme). When false, a `https://`
-    /// upstream uses HTTP/1.1 + HTTP/2 and may auto-upgrade to HTTP/3 via
-    /// Alt-Svc. Only meaningful when `kind == TransportKind::Https`.
+    /// Forces DoH over HTTP/3 for `h3://` specs.
     pub force_http3: bool,
     /// The original spec string, used for display.
     pub display: String,
@@ -151,19 +136,19 @@ impl UpstreamSpec {
         self.host.to_string()
     }
 
-    /// A canonical identity for the endpoint this spec resolves to, independent
-    /// of cosmetic spelling — `8.8.8.8`, `udp://8.8.8.8`, and `8.8.8.8:53` all
-    /// share one identity. Used to match the same upstream across config reloads
-    /// so its accumulated health/stats carry over even if the line was retyped.
+    /// Returns a canonical endpoint identity for reload matching.
     pub fn identity(&self) -> String {
         let host = match &self.host {
-            // Bracket IPv6 so its colons can't blur the host/port boundary.
             Host::Ip(ip @ IpAddr::V6(_)) => format!("[{ip}]"),
-            // Hostnames are case-insensitive; IPv4 is unaffected by lowercasing.
             h => h.to_string().to_lowercase(),
         };
         let h3 = if self.force_http3 { "+h3" } else { "" };
-        format!("{}://{host}:{}{}{h3}", self.kind.as_str(), self.port, self.path)
+        format!(
+            "{}://{host}:{}{}{h3}",
+            self.kind.as_str(),
+            self.port,
+            self.path
+        )
     }
 }
 
@@ -192,7 +177,6 @@ fn split_host_port(s: &str, default_port: u16) -> Result<(Host, u16), UpstreamEr
         return Ok((Host::Ip(ip), port));
     }
 
-    // If it parses cleanly as a bare IP (incl. unbracketed IPv6), no port given.
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok((Host::Ip(ip), default_port));
     }
@@ -255,7 +239,6 @@ mod tests {
     #[test]
     fn parse_doh3_forced() {
         let s = UpstreamSpec::parse("h3://dns.google/dns-query").unwrap();
-        // h3:// is DoH (HTTPS transport) but pinned to HTTP/3.
         assert_eq!(s.kind, TransportKind::Https);
         assert_eq!(s.port, 443);
         assert_eq!(s.path, "/dns-query");
@@ -286,19 +269,15 @@ mod tests {
     #[test]
     fn identity_ignores_cosmetic_spelling() {
         let id = |s: &str| UpstreamSpec::parse(s).unwrap().identity();
-        // Same endpoint, three spellings → one identity.
         assert_eq!(id("8.8.8.8"), id("udp://8.8.8.8"));
         assert_eq!(id("8.8.8.8"), id("udp://8.8.8.8:53"));
-        // Hostnames compare case-insensitively.
         assert_eq!(id("tls://Dns.Google"), id("tls://dns.google"));
-        // DoH default path is implied.
         assert_eq!(id("https://dns.google"), id("https://dns.google/dns-query"));
     }
 
     #[test]
     fn identity_distinguishes_real_differences() {
         let id = |s: &str| UpstreamSpec::parse(s).unwrap().identity();
-        // Transport, port, path, and HTTP/3 pinning are all part of identity.
         assert_ne!(id("udp://8.8.8.8"), id("tcp://8.8.8.8"));
         assert_ne!(id("8.8.8.8"), id("8.8.8.8:5353"));
         assert_ne!(id("https://dns.google/a"), id("https://dns.google/b"));
@@ -307,8 +286,6 @@ mod tests {
 
     #[test]
     fn transport_kind_label_round_trips() {
-        // The probe store persists `as_str` and reads back via `from_label`, so
-        // every variant must survive the round trip.
         for k in [
             TransportKind::Udp,
             TransportKind::Tcp,

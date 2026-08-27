@@ -1,8 +1,6 @@
-// throwaway: measure filter build + lookup at scale
 use bulwark_filter::{compile_one, ClientInfo};
 use std::time::Instant;
 fn main() {
-    // ~200k mixed rules: mostly ||domain^ + hosts, some wildcards.
     let mut text = String::new();
     for i in 0..180_000 {
         text.push_str(&format!("||ads{i}.example{}.com^\n", i % 997));
