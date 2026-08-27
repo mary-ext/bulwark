@@ -28,6 +28,7 @@ enum Behaviour {
     Code(ResponseCode),
     Drop,
     SlowFirst(Ipv4Addr, u64),
+    ColdShotOnly(Ipv4Addr),
 }
 
 async fn spawn_mock(behaviour: Behaviour) -> Mock {
@@ -57,6 +58,12 @@ async fn spawn_mock(behaviour: Behaviour) -> Mock {
                 }
                 Behaviour::Answer(ip, delay) => (ip, delay),
                 Behaviour::SlowFirst(ip, delay) => (ip, if seen > 1 { 0 } else { delay }),
+                Behaviour::ColdShotOnly(ip) => {
+                    if seen.is_multiple_of(2) {
+                        continue;
+                    }
+                    (ip, 0)
+                }
             };
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -209,6 +216,54 @@ async fn failed_probe_emits_failure_event() {
     assert!(ev.detail.is_some());
     assert!(!ev.up);
     assert_eq!(ev.consecutive_failures, 1);
+}
+
+#[tokio::test]
+async fn warm_shot_failure_leaves_liveness_alone() {
+    let mock = spawn_mock(Behaviour::ColdShotOnly(Ipv4Addr::new(1, 2, 3, 4))).await;
+    let (pool, mut rx) = pool_with_probe_log(mock.addr).await;
+
+    pool.probe_all().await;
+
+    let ev = rx.try_recv().expect("a probe event was emitted");
+    assert_eq!(ev.outcome, ProbeOutcome::MeasureFail);
+    assert!(
+        ev.first_rtt_ms.is_some(),
+        "the cold shot answered and proved reachability"
+    );
+    assert!(ev.rtt_ms.is_none(), "the warm shot produced no sample");
+    assert!(
+        ev.ewma_ms.is_none(),
+        "an unusable cycle must not seed the routing EWMA"
+    );
+    assert!(ev.up, "a reachable upstream stays up");
+    assert_eq!(
+        ev.consecutive_failures, 0,
+        "the cold shot answered, so nothing counts against liveness"
+    );
+    assert!(
+        ev.detail.is_some(),
+        "the warm-shot error is still reported for diagnostics"
+    );
+}
+
+#[tokio::test]
+async fn repeated_warm_shot_failures_never_mark_an_upstream_down() {
+    let mock = spawn_mock(Behaviour::ColdShotOnly(Ipv4Addr::new(1, 2, 3, 4))).await;
+    let pool = UpstreamPool::build(&[entry(mock.addr)], settings())
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        pool.probe_all().await;
+    }
+
+    let stat = &pool.stats()[0];
+    assert!(stat.up, "warm-shot failures alone never demote an upstream");
+    assert!(
+        stat.avg_rtt_ms.is_none(),
+        "no cycle yielded a usable latency sample"
+    );
 }
 
 #[tokio::test]

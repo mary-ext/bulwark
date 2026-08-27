@@ -22,6 +22,8 @@ pub(crate) fn now_ms() -> i64 {
 pub enum ProbeOutcome {
     /// A usable answer to `NS .` — counts as a latency success and feeds the EWMA.
     Answer,
+    /// Reachable, but without a latency sample.
+    MeasureFail,
     /// Reachable but refused the query (REFUSED/NOTIMP): an upstream-level fault.
     Reject,
     /// A SERVFAIL or FORMERR response.
@@ -36,6 +38,7 @@ impl ProbeOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             ProbeOutcome::Answer => "answer",
+            ProbeOutcome::MeasureFail => "measure_fail",
             ProbeOutcome::Reject => "reject",
             ProbeOutcome::SoftFail => "soft_fail",
             ProbeOutcome::Timeout => "timeout",
@@ -47,6 +50,7 @@ impl ProbeOutcome {
     pub fn from_label(s: &str) -> Self {
         match s {
             "answer" => ProbeOutcome::Answer,
+            "measure_fail" => ProbeOutcome::MeasureFail,
             "reject" => ProbeOutcome::Reject,
             "soft_fail" => ProbeOutcome::SoftFail,
             "timeout" => ProbeOutcome::Timeout,
@@ -249,6 +253,7 @@ mod tests {
     fn outcome_label_round_trips() {
         for o in [
             ProbeOutcome::Answer,
+            ProbeOutcome::MeasureFail,
             ProbeOutcome::Reject,
             ProbeOutcome::SoftFail,
             ProbeOutcome::Timeout,

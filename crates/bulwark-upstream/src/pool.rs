@@ -54,15 +54,28 @@ impl Default for PoolSettings {
     }
 }
 
-/// Healthy probe cadence. Routing uses the second probe to exclude reconnect cost;
-/// a six-minute replay added 0.7 ms mean regret, so five minutes leaves headroom.
-const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(300);
+/// Probe cadence for routing candidates.
+const LEAD_PROBE_WINDOW: Duration = Duration::from_secs(180);
+
+/// Probe cadence for failover candidates.
+const BENCH_PROBE_WINDOW: Duration = Duration::from_secs(900);
+
+/// Ranks probed at the leader cadence.
+const LEAD_PROBE_RANKS: u16 = 2;
+
+/// Returns the probe cadence for a rank.
+fn healthy_probe_window(rank: Option<u16>) -> Duration {
+    match rank {
+        Some(r) if r >= LEAD_PROBE_RANKS => BENCH_PROBE_WINDOW,
+        _ => LEAD_PROBE_WINDOW,
+    }
+}
 
 /// Initial recovery probe delay.
 const DOWN_PROBE_BASE: Duration = Duration::from_secs(5);
 
 /// Maximum recovery probe delay.
-const DOWN_PROBE_MAX: Duration = Duration::from_secs(300);
+const DOWN_PROBE_MAX: Duration = Duration::from_secs(60);
 
 /// Calculates the capped exponential recovery delay.
 fn retry_backoff(consecutive_failures: u32) -> Duration {
@@ -213,11 +226,23 @@ impl Upstream {
         h.probe_ewma_ms = ewma(h.probe_samples, h.probe_ewma_ms, ms, alpha);
         h.probe_samples += 1;
         h.probe_at = Some(Instant::now());
+        self.fold_probe_alive(&mut h);
+        h.snapshot()
+    }
+
+    /// Records reachability without updating latency.
+    fn record_probe_alive(&self, err: &UpstreamError) -> ProbeSnapshot {
+        let mut h = self.health.lock();
+        self.fold_probe_alive(&mut h);
+        h.last_error = Some(err.to_string());
+        h.snapshot()
+    }
+
+    fn fold_probe_alive(&self, h: &mut Health) {
         h.consecutive_failures = 0;
         h.up = true;
         h.last_error = None;
-        h.next_probe_at = Some(Instant::now() + jitter(HEALTHY_PROBE_WINDOW));
-        h.snapshot()
+        h.next_probe_at = Some(Instant::now() + jitter(healthy_probe_window(h.last_rank)));
     }
 
     /// Records a hard live-query failure.
@@ -537,29 +562,29 @@ async fn probe_shot(up: &Upstream, query: &Message, timeout: Duration) -> Shot {
         Err(_) => Shot::Failed(ProbeOutcome::Timeout, UpstreamError::Timeout),
     }
 }
+/// Uses the first shot for liveness and the second for latency.
 async fn probe_once(up: &Upstream, query: &Message, settings: &PoolSettings, probe_log: &ProbeLog) {
-    let (first_rtt_ms, shot) = match probe_shot(up, query, settings.query_timeout).await {
-        Shot::Answered(first) => (
-            Some(first.as_secs_f64() * 1000.0),
-            probe_shot(up, query, settings.query_timeout).await,
-        ),
-        failed => (None, failed),
-    };
-    let (outcome, rtt_ms, snap, err) = match shot {
-        Shot::Answered(rtt) => {
-            let snap = up.record_probe_success(rtt, settings.ewma_alpha);
-            (
-                ProbeOutcome::Answer,
-                Some(rtt.as_secs_f64() * 1000.0),
-                snap,
-                None,
-            )
-        }
-        Shot::Failed(outcome, e) => {
-            let snap = up.record_probe_failure(&e, settings.failure_threshold);
-            (outcome, None, snap, Some(e))
-        }
-    };
+    let (outcome, first_rtt_ms, rtt_ms, snap, err) =
+        match probe_shot(up, query, settings.query_timeout).await {
+            Shot::Answered(first) => {
+                let first_ms = Some(first.as_secs_f64() * 1000.0);
+                match probe_shot(up, query, settings.query_timeout).await {
+                    Shot::Answered(warm) => {
+                        let snap = up.record_probe_success(warm, settings.ewma_alpha);
+                        let ms = warm.as_secs_f64() * 1000.0;
+                        (ProbeOutcome::Answer, first_ms, Some(ms), snap, None)
+                    }
+                    Shot::Failed(_, e) => {
+                        let snap = up.record_probe_alive(&e);
+                        (ProbeOutcome::MeasureFail, first_ms, None, snap, Some(e))
+                    }
+                }
+            }
+            Shot::Failed(outcome, e) => {
+                let snap = up.record_probe_failure(&e, settings.failure_threshold);
+                (outcome, None, None, snap, Some(e))
+            }
+        };
     if probe_log.is_enabled() {
         let error_kind = err.as_ref().map(ProbeErrorKind::from_error);
         probe_log.push(ProbeEvent {
@@ -731,6 +756,27 @@ mod backoff_tests {
             let j = jitter(base);
             assert!(j >= base.mul_f64(0.75) && j <= base.mul_f64(1.25), "{j:?}");
         }
+    }
+
+    #[test]
+    fn recovery_is_always_more_eager_than_resampling() {
+        assert!(
+            DOWN_PROBE_MAX < LEAD_PROBE_WINDOW,
+            "a down upstream must be retried sooner than a healthy one is resampled"
+        );
+    }
+
+    #[test]
+    fn cadence_follows_rank() {
+        assert_eq!(healthy_probe_window(Some(0)), LEAD_PROBE_WINDOW);
+        assert_eq!(healthy_probe_window(Some(1)), LEAD_PROBE_WINDOW);
+        assert_eq!(healthy_probe_window(Some(2)), BENCH_PROBE_WINDOW);
+        assert_eq!(healthy_probe_window(Some(7)), BENCH_PROBE_WINDOW);
+        assert_eq!(
+            healthy_probe_window(None),
+            LEAD_PROBE_WINDOW,
+            "an unranked upstream converges at the leader cadence"
+        );
     }
 
     #[test]
