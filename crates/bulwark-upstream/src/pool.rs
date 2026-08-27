@@ -54,8 +54,9 @@ impl Default for PoolSettings {
     }
 }
 
-/// Healthy probe cadence. Routing uses the second probe to exclude reconnect cost.
-const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(180);
+/// Healthy probe cadence. Routing uses the second probe to exclude reconnect cost;
+/// a six-minute replay added 0.7 ms mean regret, so five minutes leaves headroom.
+const HEALTHY_PROBE_WINDOW: Duration = Duration::from_secs(300);
 
 /// Initial recovery probe delay.
 const DOWN_PROBE_BASE: Duration = Duration::from_secs(5);
